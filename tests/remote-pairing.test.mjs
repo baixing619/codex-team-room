@@ -47,3 +47,22 @@ test("outbound bridge dispatches queued work and applies one-time approvals", as
   assert.ok(calls.every((call) => call.options.headers["x-team-room-device-secret"] === "device-secret"));
   assert.ok(calls.every((call) => call.options.headers["OAI-Sites-Authorization"] === "Bearer bypass-token"));
 });
+
+test("Windows-native request fallback handles a Cloudflare block without exposing a second API", async () => {
+  const nativeCalls = [];
+  const bridge = new RemotePairingBridge({
+    runtime: {},
+    fetchImpl: async () => new Response("blocked", { status: 403, headers: { "content-type": "text/html" } }),
+    nativeRequestImpl: async (url, options) => {
+      nativeCalls.push({ url, options });
+      return Response.json({ task: null });
+    },
+  });
+  bridge.config = { siteUrl: "https://private.example", deviceSecret: "device-secret", siwcBypassToken: "bypass-token" };
+
+  const value = await bridge.request("/api/device/tasks");
+
+  assert.deepEqual(value, { task: null });
+  assert.equal(nativeCalls.length, 1);
+  assert.equal(nativeCalls[0].options.headers["x-team-room-device-secret"], "device-secret");
+});

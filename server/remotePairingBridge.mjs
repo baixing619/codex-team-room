@@ -1,9 +1,66 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 
 const POLL_INTERVAL_MS = 1_500;
 const HEARTBEAT_INTERVAL_MS = 10_000;
+
+const POWERSHELL_REQUEST_SCRIPT = `
+$payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$headers = @{}
+$payload.headers.PSObject.Properties | ForEach-Object { $headers[$_.Name] = [string]$_.Value }
+$params = @{
+  Uri = [string]$payload.url
+  Method = [string]$payload.method
+  Headers = $headers
+  UseBasicParsing = $true
+  TimeoutSec = 30
+}
+if ($null -ne $payload.body) {
+  $params.Body = [string]$payload.body
+  $params.ContentType = 'application/json'
+}
+try {
+  $response = Invoke-WebRequest @params
+  [pscustomobject]@{ status = [int]$response.StatusCode; body = [string]$response.Content } | ConvertTo-Json -Compress
+} catch {
+  $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 599 }
+  [pscustomobject]@{ status = $status; body = [string]$_.Exception.Message } | ConvertTo-Json -Compress
+}
+`;
+
+export function windowsNativeRequest(url, options = {}) {
+  if (process.platform !== "win32") return Promise.reject(new Error("native_http_fallback_unavailable"));
+  return new Promise((resolve, reject) => {
+    const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", POWERSHELL_REQUEST_SCRIPT], {
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code !== 0) return reject(new Error(stderr.trim() || `native_http_fallback_${code}`));
+      try {
+        const value = JSON.parse(stdout.trim());
+        resolve(new Response(value.body || "", { status: value.status, headers: { "content-type": "application/json" } }));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    child.stdin.end(JSON.stringify({
+      url,
+      method: options.method || "GET",
+      headers: options.headers || {},
+      body: options.body ?? null,
+    }));
+  });
+}
 
 function readConfig(configPath) {
   try {
@@ -40,10 +97,11 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
 }
 
 export class RemotePairingBridge {
-  constructor({ runtime, configPath = path.resolve(".team-room", "pairing.json"), fetchImpl = fetch, timers = globalThis } = {}) {
+  constructor({ runtime, configPath = path.resolve(".team-room", "pairing.json"), fetchImpl = fetch, nativeRequestImpl = windowsNativeRequest, timers = globalThis } = {}) {
     this.runtime = runtime;
     this.configPath = configPath;
     this.fetchImpl = fetchImpl;
+    this.nativeRequestImpl = nativeRequestImpl;
     this.timers = timers;
     this.config = null;
     this.interval = null;
@@ -82,7 +140,8 @@ export class RemotePairingBridge {
   }
 
   async request(pathname, options = {}) {
-    const response = await this.fetchImpl(`${this.config.siteUrl}${pathname}`, {
+    const url = `${this.config.siteUrl}${pathname}`;
+    const requestOptions = {
       ...options,
       headers: {
         "content-type": "application/json",
@@ -90,7 +149,11 @@ export class RemotePairingBridge {
         "x-team-room-device-secret": this.config.deviceSecret,
         ...(options.headers || {}),
       },
-    });
+    };
+    let response = await this.fetchImpl(url, requestOptions);
+    if (response.status === 403 && response.headers.get("content-type")?.includes("text/html")) {
+      response = await this.nativeRequestImpl(url, requestOptions);
+    }
     const value = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(value.error || `remote_pairing_http_${response.status}`);
     return value;
