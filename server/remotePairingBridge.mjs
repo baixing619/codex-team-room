@@ -97,8 +97,9 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
 }
 
 export class RemotePairingBridge {
-  constructor({ runtime, configPath = path.resolve(".team-room", "pairing.json"), fetchImpl = fetch, nativeRequestImpl = windowsNativeRequest, timers = globalThis } = {}) {
+  constructor({ runtime, indexProvider = null, configPath = path.resolve(".team-room", "pairing.json"), fetchImpl = fetch, nativeRequestImpl = windowsNativeRequest, timers = globalThis } = {}) {
     this.runtime = runtime;
+    this.indexProvider = indexProvider;
     this.configPath = configPath;
     this.fetchImpl = fetchImpl;
     this.nativeRequestImpl = nativeRequestImpl;
@@ -159,6 +160,15 @@ export class RemotePairingBridge {
     return value;
   }
 
+  async optionalRequest(pathname, emptyValue) {
+    try {
+      return await this.request(pathname);
+    } catch (error) {
+      if (error instanceof Error && ["not_found", "remote_pairing_http_404"].includes(error.message)) return emptyValue;
+      throw error;
+    }
+  }
+
   async heartbeat() {
     await this.request("/api/device/heartbeat", {
       method: "POST",
@@ -170,7 +180,12 @@ export class RemotePairingBridge {
   async processTask(task) {
     this.lastTaskId = task.id;
     try {
-      await this.runtime.connect({ cwd: this.config.cwd, agents: task.agents, confirmed: true });
+      const cwd = task.cwd || this.config.cwd;
+      const projects = this.indexProvider?.listProjects?.() || [];
+      const knownProject = cwd.toLowerCase() === this.config.cwd.toLowerCase()
+        || projects.some((project) => project.exists !== false && String(project.path).toLowerCase() === cwd.toLowerCase());
+      if (!knownProject) throw new Error("remote_project_not_found");
+      await this.runtime.connect({ cwd, agents: task.agents, confirmed: true });
       await this.runtime.dispatch({ text: task.text, decisions: task.decisions, messageId: task.message_id });
       await this.request(`/api/device/tasks/${encodeURIComponent(task.id)}/result`, { method: "POST", body: JSON.stringify({ ok: true }) });
     } catch (error) {
@@ -208,17 +223,49 @@ export class RemotePairingBridge {
     }
   }
 
+  async processIndexRequest(indexRequest) {
+    if (!this.indexProvider) throw new Error("local_index_unavailable");
+    let result;
+    if (indexRequest.request_type === "projects") {
+      result = { projects: this.indexProvider.listProjects() };
+    } else if (indexRequest.request_type === "threads") {
+      result = { threads: this.indexProvider.listThreads(indexRequest.request?.projectPath || "") };
+    } else if (indexRequest.request_type === "messages") {
+      result = this.indexProvider.readVisibleMessages(indexRequest.request?.threadId || "");
+      if (!result) throw new Error("thread_not_found");
+    } else {
+      throw new Error("unsupported_index_request");
+    }
+
+    await this.request(`/api/device/index-requests/${encodeURIComponent(indexRequest.id)}/result`, {
+      method: "POST",
+      body: JSON.stringify({ ok: true, result }),
+    });
+  }
+
   async tick() {
     if (this.busy || !this.config) return;
     this.busy = true;
     try {
       if (Date.now() - this.lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) await this.heartbeat();
-      const [{ task }, { approval }] = await Promise.all([
+      const [{ task }, { approval }, { indexRequest }] = await Promise.all([
         this.request("/api/device/tasks"),
         this.request("/api/device/approvals"),
+        this.optionalRequest("/api/device/index-requests", { indexRequest: null }),
       ]);
       if (task) await this.processTask(task);
       if (approval) await this.processApproval(approval);
+      if (indexRequest) {
+        try {
+          await this.processIndexRequest(indexRequest);
+        } catch (error) {
+          await this.request(`/api/device/index-requests/${encodeURIComponent(indexRequest.id)}/result`, {
+            method: "POST",
+            body: JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+          });
+          throw error;
+        }
+      }
       await this.uploadEvents();
       this.lastError = null;
     } catch (error) {

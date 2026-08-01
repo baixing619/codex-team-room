@@ -31,21 +31,61 @@ test("outbound bridge dispatches queued work and applies one-time approvals", as
   const fetchImpl = async (url, options = {}) => {
     const pathname = new URL(url).pathname;
     calls.push({ pathname, options });
-    if (pathname === "/api/device/tasks") return Response.json({ task: { id: "task-1", text: "开始", message_id: "message-1", decisions: [{ agentId: "coordinator", decision: "speak" }], agents: [{ id: "coordinator" }] } });
+    if (pathname === "/api/device/tasks") return Response.json({ task: { id: "task-1", cwd: "G:\\project-two", text: "开始", message_id: "message-1", decisions: [{ agentId: "coordinator", decision: "speak" }], agents: [{ id: "coordinator" }] } });
     if (pathname === "/api/device/approvals") return Response.json({ approval: { id: "approval-1", request_id: "42", decision: "accept" } });
+    if (pathname === "/api/device/index-requests") return Response.json({ error: "not_found" }, { status: 404 });
     return Response.json({ ok: true });
   };
-  const bridge = new RemotePairingBridge({ runtime, fetchImpl });
+  const bridge = new RemotePairingBridge({
+    runtime,
+    fetchImpl,
+    indexProvider: { listProjects: () => [{ path: "G:\\project-two", exists: true }] },
+  });
   bridge.config = { siteUrl: "https://private.example", deviceSecret: "device-secret", siwcBypassToken: "bypass-token", cwd: "G:\\project", deviceId: "device-1", deviceLabel: "工作电脑" };
 
   await bridge.tick();
 
   assert.equal(runtime.connectCalls[0].confirmed, true);
+  assert.equal(runtime.connectCalls[0].cwd, "G:\\project-two");
   assert.equal(runtime.dispatchCalls[0].text, "开始");
   assert.deepEqual(runtime.approvalCalls, [{ requestId: 42, decision: "accept" }]);
   assert.ok(calls.some((call) => call.pathname === "/api/device/events"));
   assert.ok(calls.every((call) => call.options.headers["x-team-room-device-secret"] === "device-secret"));
   assert.ok(calls.every((call) => call.options.headers["OAI-Sites-Authorization"] === "Bearer bypass-token"));
+  assert.equal(bridge.lastError, null);
+});
+
+test("paired bridge reads project metadata only when the private site requests it", async () => {
+  let uploadedResult = null;
+  const fetchImpl = async (url, options = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/api/device/tasks") return Response.json({ task: null });
+    if (pathname === "/api/device/approvals") return Response.json({ approval: null });
+    if (pathname === "/api/device/index-requests") {
+      return Response.json({ indexRequest: { id: "index-1", request_type: "projects", request: {} } });
+    }
+    if (pathname === "/api/device/index-requests/index-1/result") {
+      uploadedResult = JSON.parse(options.body);
+      return Response.json({ ok: true });
+    }
+    return Response.json({ ok: true });
+  };
+  const bridge = new RemotePairingBridge({
+    runtime: { listEvents: () => [] },
+    fetchImpl,
+    indexProvider: {
+      listProjects: () => [{ name: "动画项目", path: "G:\\animation", threadCount: 3, exists: true }],
+      listThreads: () => [],
+      readVisibleMessages: () => null,
+    },
+  });
+  bridge.config = { siteUrl: "https://private.example", deviceSecret: "device-secret", siwcBypassToken: "bypass-token", cwd: "G:\\project", deviceId: "device-1", deviceLabel: "工作电脑" };
+  bridge.lastHeartbeatAt = Date.now();
+
+  await bridge.tick();
+
+  assert.equal(uploadedResult.ok, true);
+  assert.deepEqual(uploadedResult.result.projects, [{ name: "动画项目", path: "G:\\animation", threadCount: 3, exists: true }]);
 });
 
 test("Windows-native request fallback handles a Cloudflare block without exposing a second API", async () => {

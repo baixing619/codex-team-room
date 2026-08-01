@@ -13,6 +13,7 @@ export const remoteTasks = sqliteTable("remote_tasks", {
   userId: text("user_id").notNull(),
   roomId: text("room_id").notNull(),
   messageId: text("message_id").notNull(),
+  cwd: text("cwd"),
   text: text("text").notNull(),
   decisionsJson: text("decisions_json").notNull(),
   agentsJson: text("agents_json").notNull(),
@@ -44,3 +45,16 @@ export const remoteApprovals = sqliteTable("remote_approvals", {
   claimedAt: text("claimed_at"),
   completedAt: text("completed_at"),
 }, (table) => [index("idx_remote_approvals_status_created").on(table.status, table.createdAt)]);
+
+export const remoteIndexRequests = sqliteTable("remote_index_requests", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull(),
+  requestType: text("request_type").notNull(),
+  requestJson: text("request_json").notNull(),
+  status: text("status").notNull().default("pending"),
+  resultJson: text("result_json"),
+  error: text("error"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  claimedAt: text("claimed_at"),
+  completedAt: text("completed_at"),
+}, (table) => [index("idx_remote_index_requests_status_created").on(table.status, table.createdAt)]);

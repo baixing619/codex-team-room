@@ -3,6 +3,49 @@ import { access } from "node:fs/promises";
 import test from "node:test";
 import worker from "../worker/index.js";
 
+function createIndexRequestDb() {
+  const rows = new Map();
+  return {
+    batch: async () => [],
+    prepare(sql) {
+      let values = [];
+      return {
+        bind(...next) { values = next; return this; },
+        async run() {
+          if (sql.startsWith("INSERT INTO remote_index_requests")) {
+            const [id, user_id, request_type, request_json] = values;
+            rows.set(id, { id, user_id, request_type, request_json, status: "pending", result_json: null, error: null, created_at: "2026-08-01 00:00:00", completed_at: null });
+            return { meta: { changes: 1 } };
+          }
+          if (sql.startsWith("UPDATE remote_index_requests SET status = 'claimed'")) {
+            const row = rows.get(values[0]);
+            if (!row || row.status !== "pending") return { meta: { changes: 0 } };
+            row.status = "claimed";
+            return { meta: { changes: 1 } };
+          }
+          if (sql.startsWith("UPDATE remote_index_requests SET status = ?")) {
+            const [status, result_json, error, id] = values;
+            const row = rows.get(id);
+            if (row?.status === "claimed") Object.assign(row, { status, result_json, error, completed_at: "2026-08-01 00:00:01" });
+            return { meta: { changes: row ? 1 : 0 } };
+          }
+          return { meta: { changes: 0 } };
+        },
+        async first() {
+          if (sql.includes("FROM remote_index_requests WHERE status = 'pending'")) {
+            return Array.from(rows.values()).find((row) => row.status === "pending") || null;
+          }
+          if (sql.includes("FROM remote_index_requests WHERE id = ? AND user_id = ?")) {
+            const row = rows.get(values[0]);
+            return row?.user_id === values[1] ? row : null;
+          }
+          return null;
+        },
+      };
+    },
+  };
+}
+
 test("serves existing static assets without a fallback", async () => {
   const calls = [];
   const response = await worker.fetch(new Request("https://example.test/assets/app.js"), {
@@ -72,6 +115,36 @@ test("reports a recently seen paired device to the authenticated owner", async (
   assert.equal(status.paired, true);
   assert.equal(status.online, true);
   assert.equal(status.device.label, "工作电脑");
+});
+
+test("relays an owner index request through the authenticated paired device", async () => {
+  const env = { DB: createIndexRequestDb(), TEAM_ROOM_DEVICE_SECRET: "device-secret" };
+  const created = await worker.fetch(new Request("https://example.test/api/remote/index-requests", {
+    method: "POST",
+    headers: { origin: "https://example.test", "content-type": "application/json" },
+    body: JSON.stringify({ type: "projects" }),
+  }), env);
+  assert.equal(created.status, 201);
+  const requestId = (await created.json()).indexRequest.id;
+
+  const claimed = await worker.fetch(new Request("https://example.test/api/device/index-requests", {
+    headers: { "x-team-room-device-secret": "device-secret" },
+  }), env);
+  const claimedBody = await claimed.json();
+  assert.equal(claimedBody.indexRequest.id, requestId);
+  assert.equal(claimedBody.indexRequest.request_type, "projects");
+
+  const completed = await worker.fetch(new Request(`https://example.test/api/device/index-requests/${requestId}/result`, {
+    method: "POST",
+    headers: { "x-team-room-device-secret": "device-secret", "content-type": "application/json" },
+    body: JSON.stringify({ ok: true, result: { projects: [{ name: "现有项目", path: "G:\\project", threadCount: 2 }] } }),
+  }), env);
+  assert.equal(completed.status, 200);
+
+  const status = await worker.fetch(new Request(`https://example.test/api/remote/index-requests/${requestId}`), env);
+  const statusBody = await status.json();
+  assert.equal(statusBody.indexRequest.status, "completed");
+  assert.equal(statusBody.indexRequest.result.projects[0].name, "现有项目");
 });
 
 test("keeps every source input required by Sites packaging", async () => {

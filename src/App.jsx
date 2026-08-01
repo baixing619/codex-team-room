@@ -71,6 +71,22 @@ async function postJson(url, body) {
   return value;
 }
 
+async function requestRemoteIndex(type, body = {}) {
+  const created = await postJson("/api/remote/index-requests", { type, ...body });
+  const requestId = created.indexRequest?.id;
+  if (!requestId) throw new Error("无法创建本地索引请求");
+
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+    const response = await fetch(`/api/remote/index-requests/${encodeURIComponent(requestId)}`);
+    const value = await response.json();
+    if (!response.ok) throw new Error(value.message || value.error || "读取本地索引失败");
+    if (value.indexRequest?.status === "completed") return value.indexRequest.result;
+    if (value.indexRequest?.status === "failed") throw new Error(value.indexRequest.error || "本机索引读取失败");
+  }
+  throw new Error("等待本机索引超时，请确认电脑仍在线");
+}
+
 function AgentAvatar({ agent, size = "medium" }) {
   return (
     <img
@@ -821,9 +837,14 @@ export function App() {
 
   const fetchThreads = async (room) => {
     try {
-      const response = await fetch(`/api/threads?project=${encodeURIComponent(room.path)}`);
-      if (!response.ok) throw new Error("无法读取对话索引");
-      const data = await response.json();
+      let data;
+      if (privateCloud) {
+        data = await requestRemoteIndex("threads", { projectPath: room.path });
+      } else {
+        const response = await fetch(`/api/threads?project=${encodeURIComponent(room.path)}`);
+        if (!response.ok) throw new Error("无法读取对话索引");
+        data = await response.json();
+      }
       const nextThreads = [
         { id: "global", title: "项目全局对话", time: "现在", kind: "room" },
         ...data.threads.map((thread) => ({ ...thread, time: formatRelativeDate(thread.updatedAt), kind: "codex" })),
@@ -857,9 +878,13 @@ export function App() {
     if (thread.id === "global" || thread.kind === "demo") return;
     setHistoryLoading(true);
     try {
-      const response = await fetch(`/api/threads/${encodeURIComponent(thread.id)}/messages`);
-      if (!response.ok) throw new Error("无法读取这个历史对话");
-      setHistory(await response.json());
+      if (privateCloud) {
+        setHistory(await requestRemoteIndex("messages", { threadId: thread.id }));
+      } else {
+        const response = await fetch(`/api/threads/${encodeURIComponent(thread.id)}/messages`);
+        if (!response.ok) throw new Error("无法读取这个历史对话");
+        setHistory(await response.json());
+      }
     } catch (error) {
       setHistoryError(error instanceof Error ? error.message : "读取失败");
     } finally {
@@ -871,9 +896,15 @@ export function App() {
     setProjectsLoading(true);
     setProjectsError("");
     try {
-      const response = await fetch("/api/projects");
-      if (!response.ok) throw new Error("本地索引暂不可用");
-      const data = await response.json();
+      let data;
+      if (privateCloud) {
+        if (!pairing?.online) throw new Error("配对电脑当前离线");
+        data = await requestRemoteIndex("projects");
+      } else {
+        const response = await fetch("/api/projects");
+        if (!response.ok) throw new Error("本地索引暂不可用");
+        data = await response.json();
+      }
       setProjects(data.projects || []);
     } catch (error) {
       setProjectsError(error instanceof Error ? error.message : "扫描失败");
@@ -960,7 +991,7 @@ export function App() {
         setToast("这台私人站点还没有和电脑配对");
         return;
       }
-      postJson("/api/remote/tasks", { text, decisions, agents: state.agents, roomId: activeRoom.id, messageId: userMessage.id })
+      postJson("/api/remote/tasks", { text, decisions, agents: state.agents, roomId: activeRoom.id, messageId: userMessage.id, cwd: activeRoom.path })
         .then(() => {
           setState((current) => ({
             ...current,

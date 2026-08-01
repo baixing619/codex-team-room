@@ -26,7 +26,10 @@ export function codexBridgePlugin() {
   return {
     name: "codex-team-room-local-bridge",
     configureServer(server) {
-      const remotePairing = new RemotePairingBridge({ runtime: teamRoomRuntime });
+      const remotePairing = new RemotePairingBridge({
+        runtime: teamRoomRuntime,
+        indexProvider: { listProjects, listThreads, readVisibleMessages },
+      });
       remotePairing.start();
       server.httpServer?.once("close", () => remotePairing.stop());
       server.middlewares.use((request, response, next) => {
