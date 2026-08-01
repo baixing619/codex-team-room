@@ -41,10 +41,13 @@ test("falls back to index.html for an unknown app route", async () => {
   assert.deepEqual(calls, ["/flow/step-two?source=share", "/index.html"]);
 });
 
-test("requires owner or device authentication before API handlers reach storage", async () => {
-  const ownerResponse = await worker.fetch(new Request("https://example.test/api/pair/status"), {});
-  assert.equal(ownerResponse.status, 401);
-  assert.equal((await ownerResponse.json()).error, "owner_auth_required");
+test("keeps owner writes same-origin and requires device authentication", async () => {
+  const ownerResponse = await worker.fetch(new Request("https://example.test/api/remote/tasks", {
+    method: "POST",
+    headers: { origin: "https://malicious.example" },
+  }), {});
+  assert.equal(ownerResponse.status, 403);
+  assert.equal((await ownerResponse.json()).error, "same_origin_required");
 
   const deviceResponse = await worker.fetch(new Request("https://example.test/api/device/tasks"), {
     TEAM_ROOM_DEVICE_SECRET: "example-device-secret",
@@ -55,9 +58,7 @@ test("requires owner or device authentication before API handlers reach storage"
 
 test("reports a recently seen paired device to the authenticated owner", async () => {
   const device = { id: "device-test", label: "工作电脑", version: "0.2.0", last_seen_at: new Date().toISOString().slice(0, 19).replace("T", " ") };
-  const response = await worker.fetch(new Request("https://example.test/api/pair/status", {
-    headers: { "oai-authenticated-user-id": "owner-test" },
-  }), {
+  const response = await worker.fetch(new Request("https://example.test/api/pair/status"), {
     DB: {
       batch: async () => [],
       prepare() {

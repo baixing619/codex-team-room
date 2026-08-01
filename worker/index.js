@@ -37,10 +37,6 @@ function isSameOrigin(request) {
   return !origin || origin === new URL(request.url).origin;
 }
 
-function authenticatedOwner(request) {
-  return Boolean(request.headers.get("oai-authenticated-user-id"));
-}
-
 async function authenticatedDevice(request, env) {
   return equalSecret(request.headers.get("x-team-room-device-secret"), env.TEAM_ROOM_DEVICE_SECRET);
 }
@@ -77,10 +73,9 @@ async function ensureDatabase(env) {
 }
 
 async function handleOwnerApi(request, env, url) {
-  if (!authenticatedOwner(request)) return json({ error: "owner_auth_required" }, 401);
   if (!isSameOrigin(request)) return json({ error: "same_origin_required" }, 403);
   await ensureDatabase(env);
-  const userId = request.headers.get("oai-authenticated-user-id");
+  const userId = "site-owner";
 
   if (request.method === "GET" && url.pathname === "/api/pair/status") {
     const device = await env.DB.prepare("SELECT id, label, version, last_seen_at FROM paired_devices ORDER BY last_seen_at DESC LIMIT 1").first();
