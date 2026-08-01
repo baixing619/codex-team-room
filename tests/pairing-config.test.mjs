@@ -10,7 +10,6 @@ test("one-drag setup writer creates gitignored pairing files without printing se
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "team-room-pairing-"));
   const input = {
     siteUrl: "https://private.example",
-    ownerUserId: "owner-example",
     siwcBypassToken: "example-bypass-token-that-is-not-real",
     cwd: directory,
     deviceLabel: "测试电脑",
@@ -31,6 +30,6 @@ test("one-drag setup writer creates gitignored pairing files without printing se
   assert.equal(pairing.siteUrl, input.siteUrl);
   assert.equal(pairing.cwd, directory);
   assert.equal(pairing.deviceSecret, environment.TEAM_ROOM_DEVICE_SECRET);
-  assert.equal(environment.TEAM_ROOM_OWNER_USER_ID, input.ownerUserId);
+  assert.deepEqual(Object.keys(environment), ["TEAM_ROOM_DEVICE_SECRET"]);
   fs.rmSync(directory, { recursive: true, force: true });
 });

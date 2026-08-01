@@ -15,11 +15,10 @@ const input = await new Promise((resolve, reject) => {
 });
 
 const siteUrl = String(input.siteUrl || "").replace(/\/$/, "");
-const ownerUserId = String(input.ownerUserId || "");
 const siwcBypassToken = String(input.siwcBypassToken || "");
 const cwd = path.resolve(String(input.cwd || ""));
-if (!siteUrl.startsWith("https://") || !ownerUserId || siwcBypassToken.length < 24 || !fs.existsSync(cwd)) {
-  throw new Error("siteUrl, ownerUserId, siwcBypassToken, and an existing cwd are required");
+if (!siteUrl.startsWith("https://") || siwcBypassToken.length < 24 || !fs.existsSync(cwd)) {
+  throw new Error("siteUrl, siwcBypassToken, and an existing cwd are required");
 }
 
 const directory = process.env.TEAM_ROOM_CONFIG_DIR ? path.resolve(process.env.TEAM_ROOM_CONFIG_DIR) : path.join(root, ".team-room");
@@ -36,7 +35,6 @@ fs.writeFileSync(configPath, `${JSON.stringify({
   deviceLabel: String(input.deviceLabel || process.env.COMPUTERNAME || "个人电脑").slice(0, 120),
 }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 fs.writeFileSync(environmentPath, `${JSON.stringify({
-  TEAM_ROOM_OWNER_USER_ID: ownerUserId,
   TEAM_ROOM_DEVICE_SECRET: deviceSecret,
 }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 

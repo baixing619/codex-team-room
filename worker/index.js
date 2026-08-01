@@ -37,9 +37,8 @@ function isSameOrigin(request) {
   return !origin || origin === new URL(request.url).origin;
 }
 
-function authenticatedOwner(request, env) {
-  const userId = request.headers.get("oai-authenticated-user-id");
-  return Boolean(userId && env.TEAM_ROOM_OWNER_USER_ID && userId === env.TEAM_ROOM_OWNER_USER_ID);
+function authenticatedOwner(request) {
+  return Boolean(request.headers.get("oai-authenticated-user-id"));
 }
 
 async function authenticatedDevice(request, env) {
@@ -78,10 +77,10 @@ async function ensureDatabase(env) {
 }
 
 async function handleOwnerApi(request, env, url) {
-  if (!authenticatedOwner(request, env)) return json({ error: "owner_auth_required" }, 401);
+  if (!authenticatedOwner(request)) return json({ error: "owner_auth_required" }, 401);
   if (!isSameOrigin(request)) return json({ error: "same_origin_required" }, 403);
   await ensureDatabase(env);
-  const userId = env.TEAM_ROOM_OWNER_USER_ID;
+  const userId = request.headers.get("oai-authenticated-user-id");
 
   if (request.method === "GET" && url.pathname === "/api/pair/status") {
     const device = await env.DB.prepare("SELECT id, label, version, last_seen_at FROM paired_devices ORDER BY last_seen_at DESC LIMIT 1").first();
@@ -168,8 +167,12 @@ async function handleDeviceApi(request, env, url) {
     const deviceId = typeof body.deviceId === "string" ? body.deviceId.slice(0, 120) : "";
     const events = Array.isArray(body.events) ? body.events.slice(0, 200) : [];
     if (!deviceId || !events.length) return json({ error: "invalid_events" }, 400);
+    const taskId = events.find((event) => event.taskId)?.taskId;
+    if (!taskId) return json({ error: "event_task_required" }, 400);
+    const taskOwner = await env.DB.prepare("SELECT user_id FROM remote_tasks WHERE id = ?").bind(String(taskId)).first();
+    if (!taskOwner?.user_id) return json({ error: "event_task_not_found" }, 409);
     const statements = events.map((event) => env.DB.prepare("INSERT INTO remote_events (user_id, device_id, task_id, event_type, payload_json) VALUES (?, ?, ?, ?, ?)")
-      .bind(env.TEAM_ROOM_OWNER_USER_ID, deviceId, event.taskId ? String(event.taskId).slice(0, 160) : null, String(event.type || "unknown").slice(0, 120), JSON.stringify(event.payload || {})));
+      .bind(taskOwner.user_id, deviceId, event.taskId ? String(event.taskId).slice(0, 160) : null, String(event.type || "unknown").slice(0, 120), JSON.stringify(event.payload || {})));
     await env.DB.batch(statements);
     return json({ accepted: statements.length });
   }

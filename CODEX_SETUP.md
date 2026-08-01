@@ -41,11 +41,11 @@
    - 构建成功后保存版本，优先使用私有部署；不得改成公开访问。
    - 私有部署完成后核对访问策略只有当前所有者，没有用户组或外部访客。
 8. 创建安全设备配对：
-   - 从 Sites 当前访问策略读取唯一所有者的 `account_user_id`；若站点不是仅本人可访问，停止配对。
+   - 从 Sites 当前访问策略确认只有唯一所有者、没有用户组和外部访客；若不是仅本人可访问，停止配对。
    - 本文件代表用户请求启用跨设备配对；在生成 SIWC 绕过令牌前，仍需明确告诉用户“将创建一枚只供这台电脑访问私人站点的令牌”，并得到肯定答复。
    - 用户肯定后，调用 Sites 的 SIWC 绕过令牌能力。令牌只存本机，不打印、不提交、不写入 Sites 环境变量。
-   - 将 `siteUrl`、所有者 ID、令牌、确认的项目目录和设备名称以 JSON 从标准输入传给 `npm run pair:configure`。脚本会生成 `.team-room/pairing.json` 和临时的 `.team-room/sites-environment.json`，且不会打印密钥。
-   - 读取临时环境文件，把 `TEAM_ROOM_OWNER_USER_ID` 和 `TEAM_ROOM_DEVICE_SECRET` 作为 secret 写入 Sites 生产环境；写入成功后删除这个临时文件。不得删除 `pairing.json`。
+   - 将 `siteUrl`、令牌、确认的项目目录和设备名称以 JSON 从标准输入传给 `npm run pair:configure`。脚本会生成 `.team-room/pairing.json` 和临时的 `.team-room/sites-environment.json`，且不会打印密钥。
+   - 读取临时环境文件，把 `TEAM_ROOM_DEVICE_SECRET` 作为 secret 写入 Sites 生产环境；写入成功后删除这个临时文件。不得删除 `pairing.json`。浏览器身份使用 Sites 转发的站点内用户 ID，不得拿访问策略里的账号 ID代替。
    - 重新构建、保存并私有部署站点；重启本地 Team Room，让本机代理开始主动轮询。
 9. 验收配对：确认本地 `/api/pair/local-status` 返回 `configured: true`、`running: true` 且无错误；确认站点设备心跳成功；让用户在已登录的手机站点看到“本机在线”。再用一条不执行命令的测试消息验证：私人队列收到任务、本机真实 Codex 回复、回复回到手机。不要为验收自动批准任何命令。
 10. 最终交付电脑本地地址和个人私有 Sites 地址，并说明：本地地址直接连接本机 Codex；私有 Sites 通过加密出站配对通道连接本机。电脑关机时，手机任务会留在私人队列等待。

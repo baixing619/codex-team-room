@@ -58,7 +58,6 @@ test("reports a recently seen paired device to the authenticated owner", async (
   const response = await worker.fetch(new Request("https://example.test/api/pair/status", {
     headers: { "oai-authenticated-user-id": "owner-test" },
   }), {
-    TEAM_ROOM_OWNER_USER_ID: "owner-test",
     DB: {
       batch: async () => [],
       prepare() {
