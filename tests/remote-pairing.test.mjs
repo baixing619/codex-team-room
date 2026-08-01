@@ -162,11 +162,14 @@ test("outbound bridge dispatches queued work and applies one-time approvals", as
 
 test("paired bridge reads project metadata only when the private site requests it", async () => {
   let uploadedResult = null;
+  let indexClaims = 0;
   const fetchImpl = async (url, options = {}) => {
     const pathname = new URL(url).pathname;
     if (pathname === "/api/device/tasks") return Response.json({ task: null });
     if (pathname === "/api/device/approvals") return Response.json({ approval: null });
     if (pathname === "/api/device/index-requests") {
+      indexClaims += 1;
+      if (indexClaims > 1) return Response.json({ indexRequest: null });
       return Response.json({ indexRequest: { id: "index-1", request_type: "projects", request: {} } });
     }
     if (pathname === "/api/device/index-requests/index-1/result") {
@@ -191,6 +194,7 @@ test("paired bridge reads project metadata only when the private site requests i
 
   assert.equal(uploadedResult.ok, true);
   assert.deepEqual(uploadedResult.result.projects, [{ name: "动画项目", path: "G:\\animation", threadCount: 3, exists: true }]);
+  assert.equal(indexClaims, 2);
 });
 
 test("paired bridge refuses existing thread bindings that are not part of the requested project", async () => {

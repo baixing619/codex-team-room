@@ -161,9 +161,18 @@ async function handleOwnerApi(request, env, url) {
     if ((requestType === "threads" && !requestValue.projectPath) || (requestType === "messages" && !requestValue.threadId)) {
       return json({ error: "invalid_index_request" }, 400);
     }
+    const requestJson = JSON.stringify(requestValue);
+    const active = await env.DB.prepare("SELECT id, request_type, status, result_json, error, created_at, completed_at FROM remote_index_requests WHERE user_id = ? AND request_type = ? AND request_json = ? AND status IN ('pending', 'claimed') ORDER BY created_at DESC LIMIT 1")
+      .bind(userId, requestType, requestJson).first();
+    if (active) return json({ indexRequest: parseRow(active), reused: true });
+    if (body.force !== true) {
+      const cached = await env.DB.prepare("SELECT id, request_type, status, result_json, error, created_at, completed_at FROM remote_index_requests WHERE user_id = ? AND request_type = ? AND request_json = ? AND status = 'completed' AND completed_at >= datetime('now', '-5 minutes') ORDER BY completed_at DESC LIMIT 1")
+        .bind(userId, requestType, requestJson).first();
+      if (cached) return json({ indexRequest: parseRow(cached), cached: true });
+    }
     const id = crypto.randomUUID();
     await env.DB.prepare("INSERT INTO remote_index_requests (id, user_id, request_type, request_json) VALUES (?, ?, ?, ?)")
-      .bind(id, userId, requestType, JSON.stringify(requestValue)).run();
+      .bind(id, userId, requestType, requestJson).run();
     return json({ indexRequest: { id, status: "pending" } }, 201);
   }
 
@@ -225,11 +234,15 @@ async function handleOwnerApi(request, env, url) {
 async function reclaimExpiredClaim(env, table) {
   if (!DEVICE_CLAIM_TABLES.has(table)) throw new Error("invalid_claim_table");
   await env.DB.prepare(`UPDATE ${table} SET status = 'pending', claimed_at = NULL, error = 'device_request_lease_expired' WHERE status = 'claimed' AND claimed_at < datetime('now', '-${CLAIM_LEASE_SECONDS} seconds')`).run();
+  if (table === "remote_index_requests") {
+    await env.DB.prepare("UPDATE remote_index_requests SET status = 'failed', error = 'index_request_expired', completed_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND created_at < datetime('now', '-2 minutes')").run();
+  }
 }
 
 async function claimNext(env, table, selectColumns) {
   await reclaimExpiredClaim(env, table);
-  const row = await env.DB.prepare(`SELECT ${selectColumns} FROM ${table} WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1`).first();
+  const order = table === "remote_index_requests" ? "DESC" : "ASC";
+  const row = await env.DB.prepare(`SELECT ${selectColumns} FROM ${table} WHERE status = 'pending' ORDER BY created_at ${order} LIMIT 1`).first();
   if (!row) return null;
   const result = await env.DB.prepare(`UPDATE ${table} SET status = 'claimed', claimed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'`).bind(row.id).run();
   return result.meta?.changes === 1 ? parseRow(row) : null;

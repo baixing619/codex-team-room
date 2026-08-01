@@ -94,7 +94,7 @@ export const DEFAULT_KNOWLEDGE = [];
 
 export function createInitialState() {
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     rooms: [DEFAULT_ROOM],
     activeRoomId: DEFAULT_ROOM.id,
     agentsByRoom: { [DEFAULT_ROOM.id]: DEFAULT_AGENTS.map((agent) => ({ ...agent })) },
@@ -102,6 +102,7 @@ export function createInitialState() {
     commandsByRoom: { [DEFAULT_ROOM.id]: DEFAULT_COMMANDS },
     knowledgeByRoom: { [DEFAULT_ROOM.id]: DEFAULT_KNOWLEDGE },
     threadCache: { [DEFAULT_ROOM.id]: DEFAULT_THREADS },
+    historyCacheByThread: {},
     writeLocksByRoom: { [DEFAULT_ROOM.id]: null },
   };
 }

@@ -83,11 +83,14 @@ async function postJson(url, body) {
 
 async function requestRemoteIndex(type, body = {}) {
   const created = await postJson("/api/remote/index-requests", { type, ...body });
-  const requestId = created.indexRequest?.id;
+  const initial = created.indexRequest;
+  if (initial?.status === "completed") return initial.result;
+  if (initial?.status === "failed") throw new Error(initial.error || "本机索引读取失败");
+  const requestId = initial?.id;
   if (!requestId) throw new Error("无法创建本地索引请求");
 
-  for (let attempt = 0; attempt < 120; attempt += 1) {
-    await new Promise((resolve) => window.setTimeout(resolve, 500));
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, attempt < 4 ? 350 : 750));
     const response = await fetch(`/api/remote/index-requests/${encodeURIComponent(requestId)}`);
     const value = await response.json();
     if (!response.ok) throw new Error(value.message || value.error || "读取本地索引失败");
@@ -550,7 +553,7 @@ function ChatView({
   );
 }
 
-function HistoryView({ history, loading, error, onAttach }) {
+function HistoryView({ history, loading, error, onAttach, onRefresh }) {
   if (loading) return <div className="center-state"><ArrowsClockwise className="spin" size={28} />正在读取公开消息…</div>;
   if (error) return <div className="center-state center-state--error"><WarningCircle size={28} />{error}</div>;
   if (!history) return <div className="center-state"><ChatCircle size={28} />选择一个历史对话查看。</div>;
@@ -559,7 +562,10 @@ function HistoryView({ history, loading, error, onAttach }) {
     <div className="history-view">
       <div className="history-banner">
         <div><ShieldCheck size={20} /><span>只读历史：查看不会修改原对话；挂入后会复制可见正文到当前项目共享上下文</span></div>
-        <button className="primary-button" type="button" onClick={onAttach}>挂入公共上下文</button>
+        <div className="history-actions">
+          <button className="secondary-button" type="button" onClick={onRefresh}><ArrowsClockwise size={17} />更新历史</button>
+          <button className="primary-button" type="button" onClick={onAttach}>挂入公共上下文</button>
+        </div>
       </div>
       <div className="history-scroll" tabIndex={0} aria-label="历史消息滚动区域">
         <div className="history-list">
@@ -833,7 +839,9 @@ export function App() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
   const [toast, setToast] = useState("");
-  const autoLoadedRooms = useRef(new Set());
+  const autoLoadedRooms = useRef(new Set(Object.entries(state.threadCache || {})
+    .filter(([, cachedThreads]) => cachedThreads?.some((thread) => thread.kind === "codex"))
+    .map(([roomId]) => roomId)));
   const attachmentUrls = useRef(new Set());
   const runtimeEventCursor = useRef(0);
   const remoteEventCursor = useRef(0);
@@ -872,6 +880,10 @@ export function App() {
     attachmentUrls.current.clear();
   }, []);
   useEffect(() => {
+    if (privateCloud) {
+      setBridge({ ok: false, mode: "remote-pairing", indexedThreads: 0 });
+      return;
+    }
     fetch("/api/health")
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("bridge unavailable")))
       .then((health) => {
@@ -886,13 +898,17 @@ export function App() {
         }
       })
       .catch(() => setBridge({ ok: false, mode: "unavailable", indexedThreads: 0 }));
-  }, []);
+  }, [privateCloud]);
   useEffect(() => {
+    if (privateCloud) {
+      setRuntime({ available: false, reason: "由已配对电脑提供真实 Codex 运行时" });
+      return;
+    }
     fetch("/api/runtime/status")
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("runtime unavailable")))
       .then(setRuntime)
       .catch(() => setRuntime({ available: false, reason: "真实 Codex 运行时未连接" }));
-  }, []);
+  }, [privateCloud]);
   useEffect(() => {
     let cancelled = false;
     const poll = async () => {
@@ -1178,21 +1194,36 @@ export function App() {
     if (localIndexReady) fetchThreads(activeRoom, { notifyOnError: true });
   };
 
-  const selectThread = async (thread) => {
+  const selectThread = async (thread, { force = false } = {}) => {
     setActiveView("chat");
     setActiveThreadId(thread.id);
     setHistory(null);
     setHistoryError("");
     if (thread.id === "global") return;
+    const cachedHistory = stateRef.current.historyCacheByThread?.[thread.id];
+    if (cachedHistory && !force) {
+      setHistory({ thread: cachedHistory.thread, messages: cachedHistory.messages });
+      setHistoryLoading(false);
+      return;
+    }
     setHistoryLoading(true);
     try {
+      let nextHistory;
       if (privateCloud) {
-        setHistory(await requestRemoteIndex("messages", { threadId: thread.id }));
+        nextHistory = await requestRemoteIndex("messages", { threadId: thread.id, force });
       } else {
         const response = await fetch(`/api/threads/${encodeURIComponent(thread.id)}/messages`);
         if (!response.ok) throw new Error("无法读取这个历史对话");
-        setHistory(await response.json());
+        nextHistory = await response.json();
       }
+      setHistory(nextHistory);
+      setState((current) => ({
+        ...current,
+        historyCacheByThread: {
+          ...(current.historyCacheByThread || {}),
+          [thread.id]: { ...nextHistory, roomId: activeRoom.id, cachedAt: new Date().toISOString() },
+        },
+      }));
     } catch (error) {
       setHistoryError(error instanceof Error ? error.message : "读取失败");
     } finally {
@@ -1263,6 +1294,8 @@ export function App() {
       const commandsByRoom = { ...current.commandsByRoom };
       const knowledgeByRoom = { ...current.knowledgeByRoom };
       const threadCache = { ...current.threadCache };
+      const historyCacheByThread = Object.fromEntries(Object.entries(current.historyCacheByThread || {})
+        .filter(([, cached]) => cached.roomId !== room.id));
       const agentsByRoom = { ...current.agentsByRoom };
       const writeLocksByRoom = { ...current.writeLocksByRoom };
       delete messagesByRoom[room.id];
@@ -1271,7 +1304,7 @@ export function App() {
       delete threadCache[room.id];
       delete agentsByRoom[room.id];
       delete writeLocksByRoom[room.id];
-      return { ...current, rooms: remainingRooms, activeRoomId: nextRoomId, messagesByRoom, commandsByRoom, knowledgeByRoom, threadCache, agentsByRoom, writeLocksByRoom };
+      return { ...current, rooms: remainingRooms, activeRoomId: nextRoomId, messagesByRoom, commandsByRoom, knowledgeByRoom, threadCache, historyCacheByThread, agentsByRoom, writeLocksByRoom };
     });
     setActiveView("chat");
     setActiveThreadId("global");
@@ -1573,7 +1606,7 @@ export function App() {
     if (activeView === "knowledge") return <KnowledgeView entries={knowledge} onAdd={addKnowledge} />;
     if (activeView === "agents") return <AgentSettingsView agents={agents} onOpenAgent={openAgentEditor} onAddMember={addMember} onRemoveAgent={removeAgent} />;
     if (activeView === "settings") return <SettingsView bridge={bridge} pairing={pairing} runtime={runtime} rooms={state.rooms} syncStatus={syncStatus} onConnectRuntime={connectRuntime} onDisconnectRuntime={disconnectRuntime} onExport={exportConfig} onReset={resetPrototype} />;
-    if (activeThreadId !== "global") return <HistoryView history={history} loading={historyLoading} error={historyError} onAttach={attachHistory} />;
+    if (activeThreadId !== "global") return <HistoryView history={history} loading={historyLoading} error={historyError} onAttach={attachHistory} onRefresh={() => selectThread(activeThread, { force: true })} />;
     return (
       <ChatView
         messages={messages}

@@ -32,6 +32,14 @@ function createIndexRequestDb() {
           return { meta: { changes: 0 } };
         },
         async first() {
+          if (sql.includes("status IN ('pending', 'claimed')")) {
+            const [userId, requestType, requestJson] = values;
+            return Array.from(rows.values()).find((row) => row.user_id === userId && row.request_type === requestType && row.request_json === requestJson && ["pending", "claimed"].includes(row.status)) || null;
+          }
+          if (sql.includes("status = 'completed'")) {
+            const [userId, requestType, requestJson] = values;
+            return Array.from(rows.values()).find((row) => row.user_id === userId && row.request_type === requestType && row.request_json === requestJson && row.status === "completed") || null;
+          }
           if (sql.includes("FROM remote_index_requests WHERE status = 'pending'")) {
             return Array.from(rows.values()).find((row) => row.status === "pending") || null;
           }
@@ -255,6 +263,36 @@ test("relays an owner index request through the authenticated paired device", as
   const statusBody = await status.json();
   assert.equal(statusBody.indexRequest.status, "completed");
   assert.equal(statusBody.indexRequest.result.projects[0].name, "现有项目");
+});
+
+test("reuses an in-flight index request and serves a recent completed result without rereading the computer", async () => {
+  const env = { DB: createIndexRequestDb(), TEAM_ROOM_DEVICE_SECRET: "device-secret" };
+  const create = () => worker.fetch(new Request("https://example.test/api/remote/index-requests", {
+    method: "POST",
+    headers: { origin: "https://example.test", "content-type": "application/json" },
+    body: JSON.stringify({ type: "threads", projectPath: "G:\\project" }),
+  }), env);
+
+  const first = await create();
+  const firstBody = await first.json();
+  const duplicate = await create();
+  const duplicateBody = await duplicate.json();
+  assert.equal(duplicate.status, 200);
+  assert.equal(duplicateBody.reused, true);
+  assert.equal(duplicateBody.indexRequest.id, firstBody.indexRequest.id);
+
+  await worker.fetch(new Request("https://example.test/api/device/index-requests", { headers: { "x-team-room-device-secret": "device-secret" } }), env);
+  await worker.fetch(new Request(`https://example.test/api/device/index-requests/${firstBody.indexRequest.id}/result`, {
+    method: "POST",
+    headers: { "x-team-room-device-secret": "device-secret", "content-type": "application/json" },
+    body: JSON.stringify({ ok: true, result: { threads: [{ id: "thread-1", title: "已缓存" }] } }),
+  }), env);
+
+  const cached = await create();
+  const cachedBody = await cached.json();
+  assert.equal(cached.status, 200);
+  assert.equal(cachedBody.cached, true);
+  assert.equal(cachedBody.indexRequest.result.threads[0].title, "已缓存");
 });
 
 test("reclaims an expired device index claim so a retry is not stuck forever", async () => {
