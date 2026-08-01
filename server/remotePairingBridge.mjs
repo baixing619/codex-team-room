@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { MAX_ATTACHMENT_BYTES, safeAttachmentName } from "./localAttachmentStore.mjs";
 
 const POLL_INTERVAL_MS = 1_500;
 const HEARTBEAT_INTERVAL_MS = 10_000;
@@ -218,8 +219,10 @@ export class RemotePairingBridge {
 
   async request(pathname, options = {}) {
     const url = `${this.config.siteUrl}${pathname}`;
+    const requestTimeoutMs = Math.max(1, Number(options.requestTimeoutMs) || this.requestTimeoutMs);
+    const { requestTimeoutMs: _requestTimeoutMs, ...transportRequestOptions } = options;
     const requestOptions = {
-      ...options,
+      ...transportRequestOptions,
       headers: {
         "content-type": "application/json",
         "OAI-Sites-Authorization": `Bearer ${this.config.siwcBypassToken}`,
@@ -233,7 +236,7 @@ export class RemotePairingBridge {
     try {
       return await Promise.race([
         (async () => {
-          const transportOptions = { ...requestOptions, signal: controller.signal, timeoutMs: this.requestTimeoutMs };
+          const transportOptions = { ...requestOptions, signal: controller.signal, timeoutMs: requestTimeoutMs };
           let lastError;
           for (let attempt = 0; attempt < MAX_TRANSPORT_ATTEMPTS; attempt += 1) {
             try {
@@ -266,7 +269,7 @@ export class RemotePairingBridge {
             timedOut = true;
             controller.abort();
             reject(new Error("remote_request_timeout"));
-          }, this.requestTimeoutMs);
+          }, requestTimeoutMs);
         }),
       ]);
     } catch (error) {
@@ -289,7 +292,7 @@ export class RemotePairingBridge {
   async heartbeat() {
     await this.request("/api/device/heartbeat", {
       method: "POST",
-      body: JSON.stringify({ deviceId: this.config.deviceId, label: this.config.deviceLabel, version: "0.2.1" }),
+      body: JSON.stringify({ deviceId: this.config.deviceId, label: this.config.deviceLabel, version: "0.3.0" }),
     });
     this.lastHeartbeatAt = Date.now();
   }
@@ -317,8 +320,9 @@ export class RemotePairingBridge {
         }
       }
       const roomId = task.room_id || task.roomId || null;
+      const attachments = await this.downloadTaskAttachments(task);
       await this.runtime.connect({ cwd, agents: task.agents, confirmed: true, roomId, taskId: task.id });
-      await this.runtime.dispatch({ text: task.text, decisions: task.decisions, messageId: task.message_id, roomId, taskId: task.id });
+      await this.runtime.dispatch({ text: task.text, decisions: task.decisions, messageId: task.message_id, roomId, taskId: task.id, sharedContext: task.sharedContext, attachments });
       await this.request(`/api/device/tasks/${encodeURIComponent(task.id)}/result`, { method: "POST", body: JSON.stringify({ ok: true }) });
     } catch (error) {
       await this.request(`/api/device/tasks/${encodeURIComponent(task.id)}/result`, {
@@ -327,6 +331,26 @@ export class RemotePairingBridge {
       });
       throw error;
     }
+  }
+
+  async downloadTaskAttachments(task) {
+    const references = Array.isArray(task?.attachments) ? task.attachments.slice(0, 4) : [];
+    if (!references.length) return [];
+    const directory = path.join(os.tmpdir(), "codex-team-room-attachments", String(task.id).replace(/[^a-zA-Z0-9-]/g, "_"));
+    fs.mkdirSync(directory, { recursive: true });
+    const result = [];
+    for (const reference of references) {
+      const attachmentId = String(reference?.id || "");
+      if (!attachmentId) throw new Error("attachment_id_required");
+      const value = await this.request(`/api/device/attachments/${encodeURIComponent(attachmentId)}`, { requestTimeoutMs: 45_000 });
+      const buffer = Buffer.from(String(value.dataBase64 || ""), "base64");
+      if (!buffer.length || buffer.length > MAX_ATTACHMENT_BYTES) throw new Error("invalid_attachment_size");
+      const name = safeAttachmentName(value.name || reference.name);
+      const filePath = path.join(directory, `${attachmentId}-${name}`);
+      fs.writeFileSync(filePath, buffer, { flag: "w" });
+      result.push({ id: attachmentId, name, type: String(value.type || reference.type || "application/octet-stream"), size: buffer.length, path: filePath });
+    }
+    return result;
   }
 
   async uploadEvents() {

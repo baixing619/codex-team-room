@@ -2,6 +2,7 @@ import { listProjects, listThreads, localBridgeStatus, readVisibleMessages } fro
 import { getCodexRuntimeStatus } from "./codexAppServerRuntime.mjs";
 import { teamRoomRuntime } from "./teamRoomRuntimeManager.mjs";
 import { RemotePairingBridge } from "./remotePairingBridge.mjs";
+import { LocalAttachmentStore, MAX_ATTACHMENT_BYTES } from "./localAttachmentStore.mjs";
 
 function sendJson(response, status, value) {
   response.statusCode = status;
@@ -22,10 +23,22 @@ async function readJsonBody(request, maxBytes = 256 * 1024) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
+async function readBinaryBody(request, maxBytes = MAX_ATTACHMENT_BYTES) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > maxBytes) throw new Error("request_too_large");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
 export function codexBridgePlugin() {
   return {
     name: "codex-team-room-local-bridge",
     configureServer(server) {
+      const attachmentStore = new LocalAttachmentStore();
       const remotePairing = new RemotePairingBridge({
         runtime: teamRoomRuntime,
         indexProvider: { listProjects, listThreads, readVisibleMessages },
@@ -49,8 +62,34 @@ export function codexBridgePlugin() {
           if (request.method === "GET" && url.pathname === "/api/pair/local-status") {
             return sendJson(response, 200, remotePairing.status());
           }
+          if (request.method === "GET" && url.pathname === "/api/sync/state") {
+            return remotePairing.request("/api/device/state", { requestTimeoutMs: 30_000 })
+              .then((value) => sendJson(response, 200, value))
+              .catch((error) => sendJson(response, 503, { error: "sync_unavailable", message: error.message }));
+          }
+          if (request.method === "PUT" && url.pathname === "/api/sync/state") {
+            return readJsonBody(request, 1536 * 1024)
+              .then((body) => remotePairing.request("/api/device/state", { method: "PUT", body: JSON.stringify(body), requestTimeoutMs: 30_000 }))
+              .then((value) => sendJson(response, 200, value))
+              .catch((error) => sendJson(response, error.message === "sync_conflict" ? 409 : 503, { error: error.message === "sync_conflict" ? "sync_conflict" : "sync_unavailable", message: error.message }));
+          }
           if (request.method === "GET" && url.pathname === "/api/runtime/events") {
             return sendJson(response, 200, { events: teamRoomRuntime.listEvents(Number(url.searchParams.get("after") || 0)) });
+          }
+          if (request.method === "POST" && url.pathname === "/api/attachments") {
+            return readBinaryBody(request)
+              .then((buffer) => {
+                const rawName = request.headers["x-file-name"] || "attachment";
+                const name = decodeURIComponent(String(rawName));
+                const attachment = attachmentStore.save({ name, type: request.headers["content-type"], buffer });
+                return sendJson(response, 201, { attachment: { id: attachment.id, name: attachment.name, type: attachment.type, size: attachment.size } });
+              })
+              .catch((error) => sendJson(response, error.message === "request_too_large" ? 413 : 400, { error: error.message }));
+          }
+          const attachmentDelete = url.pathname.match(/^\/api\/attachments\/([^/]+)$/);
+          if (request.method === "DELETE" && attachmentDelete) {
+            attachmentStore.remove(decodeURIComponent(attachmentDelete[1]));
+            return sendJson(response, 200, { ok: true });
           }
           if (request.method === "POST" && url.pathname === "/api/runtime/connect") {
             return readJsonBody(request)
@@ -63,7 +102,7 @@ export function codexBridgePlugin() {
           }
           if (request.method === "POST" && url.pathname === "/api/runtime/dispatch") {
             return readJsonBody(request)
-              .then((body) => teamRoomRuntime.dispatch(body))
+              .then((body) => teamRoomRuntime.dispatch({ ...body, attachments: attachmentStore.resolve(body.attachments) }))
               .then((result) => sendJson(response, 200, result))
               .catch((error) => sendJson(response, 400, { error: "runtime_dispatch_failed", message: error.message }));
           }

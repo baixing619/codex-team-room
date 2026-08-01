@@ -8,6 +8,27 @@
       "when": 1785581708300,
       "tag": "0000_real_omega_sentinel",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1785593918233,
+      "tag": "0001_remote_index_requests",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1785593968082,
+      "tag": "0002_careless_blue_marvel",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1785596574364,
+      "tag": "0003_groovy_union_jack",
+      "breakpoints": true
     }
   ]
 }

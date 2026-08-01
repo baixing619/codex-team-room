@@ -156,7 +156,7 @@ export class TeamRoomRuntimeManager {
     return thread.id;
   }
 
-  async dispatch({ text, decisions, messageId, roomId = null, taskId = null }) {
+  async dispatch({ text, decisions, messageId, roomId = null, taskId = null, sharedContext = null, attachments = [], executionMode = true }) {
     if (!this.connection) throw new Error("Real runtime is not connected");
     const requestedRoomId = optionalId(roomId);
     if (requestedRoomId !== null && requestedRoomId !== this.roomId) {
@@ -167,10 +167,13 @@ export class TeamRoomRuntimeManager {
     const turns = await Promise.all(speakers.map(async (decision) => {
       const agent = this.agentById.get(decision.agentId);
       if (!agent) throw new Error(`Unknown agent: ${decision.agentId}`);
+      const turnAgent = executionMode === false && agent.permission === "request-write" ? { ...agent, permission: "read-only" } : agent;
+      const threadWasAlreadyBound = this.threadByAgentId.has(decision.agentId);
       const threadId = await this.ensureAgentThread(decision.agentId);
       // The current App Server protocol applies developer instructions on thread
-      // start/resume rather than turn/start, so refresh them before each turn.
-      if (optionalId(agent.systemPrompt)) {
+      // start/resume rather than turn/start. A newly started/resumed thread has
+      // already received them; only refresh a thread reused by a later turn.
+      if (threadWasAlreadyBound && optionalId(agent.systemPrompt)) {
         const resumedThread = await this.connection.protocol.resumeAgentThread(threadId, agent, this.cwd);
         if (!resumedThread?.id || resumedThread.id !== threadId) {
           throw new Error(`Codex resumed an unexpected thread for member ${agent.id}`);
@@ -178,10 +181,12 @@ export class TeamRoomRuntimeManager {
       }
       const turn = await this.connection.protocol.startAgentTurn({
         threadId,
-        agent,
+        agent: turnAgent,
         cwd: this.cwd,
         text,
         clientUserMessageId: messageId,
+        sharedContext,
+        attachments,
       });
       if (!turn?.id) throw new Error(`Codex did not return a turn for member ${agent.id}`);
       this.turnContextById.set(turn.id, { roomId: this.roomId, taskId: this.taskId });
