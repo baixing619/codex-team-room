@@ -1,4 +1,5 @@
 import { createInitialState } from "../data/defaults.js";
+import { migrateTeamRoomState, STATE_SCHEMA_VERSION } from "./roomAgents.js";
 
 const STORAGE_KEY = "codex-team-room:state:v1";
 
@@ -7,8 +8,8 @@ export function loadState() {
     const value = window.localStorage.getItem(STORAGE_KEY);
     if (!value) return createInitialState();
     const parsed = JSON.parse(value);
-    if (parsed.schemaVersion !== 1) return createInitialState();
-    return parsed;
+    if (parsed.schemaVersion > STATE_SCHEMA_VERSION) return createInitialState();
+    return migrateTeamRoomState(parsed);
   } catch {
     return createInitialState();
   }
@@ -27,3 +28,4 @@ export function resetState() {
   return createInitialState();
 }
 
+export { migrateTeamRoomState };

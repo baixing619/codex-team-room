@@ -13,6 +13,9 @@ export const DEFAULT_AGENTS = [
     reasoning: "high",
     permission: "coordinate",
     participation: "always",
+    boundThreadId: null,
+    threadBinding: "auto",
+    systemPrompt: "你是“总控”，在当前项目中担任项目经理。负责澄清目标、拆分任务并协调节奏；只处理当前项目和本轮任务相关的信息。不要读取、泄露或转发其他项目、其他对话、密钥、凭据或私人上下文。高影响操作必须先说明影响并遵守用户审批。",
     status: "active",
     statusLabel: "活跃中",
     avatar: "/assets/agents/agent-coordinator.png",
@@ -27,6 +30,9 @@ export const DEFAULT_AGENTS = [
     reasoning: "high",
     permission: "request-write",
     participation: "relevant",
+    boundThreadId: null,
+    threadBinding: "auto",
+    systemPrompt: "你是“开发”，在当前项目中担任实现工程师。负责独立实现、验证和清楚说明变更；只处理当前项目和本轮任务相关的信息。不要读取、泄露或转发其他项目、其他对话、密钥、凭据或私人上下文。任何写入必须先经过用户的明确审批。",
     status: "active",
     statusLabel: "活跃中",
     avatar: "/assets/agents/agent-developer.png",
@@ -41,6 +47,9 @@ export const DEFAULT_AGENTS = [
     reasoning: "high",
     permission: "read-only",
     participation: "review",
+    boundThreadId: null,
+    threadBinding: "auto",
+    systemPrompt: "你是“审核”，在当前项目中担任质量审核员。独立检查正确性、安全性、回归风险和遗漏；只处理当前项目和本轮任务相关的信息。不要读取、泄露或转发其他项目、其他对话、密钥、凭据或私人上下文。未经用户授权不要实施写入操作。",
     status: "silent",
     statusLabel: "静默中",
     avatar: "/assets/agents/agent-reviewer.png",
@@ -55,6 +64,9 @@ export const DEFAULT_AGENTS = [
     reasoning: "medium",
     permission: "read-only",
     participation: "knowledge",
+    boundThreadId: null,
+    threadBinding: "auto",
+    systemPrompt: "你是“资料”，在当前项目中担任知识管理员。整理与核对已确认信息，标记不确定性和来源边界；只处理当前项目和本轮任务相关的信息。不要读取、泄露或转发其他项目、其他对话、密钥、凭据或私人上下文。未经用户授权不要实施写入操作。",
     status: "active",
     statusLabel: "待命",
     avatar: "/assets/agents/agent-researcher.png",
@@ -71,7 +83,7 @@ export const DEFAULT_ROOM = {
 };
 
 export const DEFAULT_THREADS = [
-  { id: "global", title: "项目全局对话", time: "09:42", kind: "room" },
+  { id: "global", title: "团队调度台", time: "09:42", kind: "room" },
   { id: "requirements", title: "需求澄清", time: "昨天", kind: "demo" },
   { id: "api", title: "接口设计讨论", time: "昨天", kind: "demo" },
   { id: "review", title: "代码评审记录", time: "7月31日", kind: "demo" },
@@ -164,14 +176,14 @@ export const DEFAULT_KNOWLEDGE = [
 
 export function createInitialState() {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     rooms: [DEFAULT_ROOM],
     activeRoomId: DEFAULT_ROOM.id,
-    agents: DEFAULT_AGENTS,
+    agentsByRoom: { [DEFAULT_ROOM.id]: DEFAULT_AGENTS.map((agent) => ({ ...agent })) },
     messagesByRoom: { [DEFAULT_ROOM.id]: DEFAULT_MESSAGES },
     commandsByRoom: { [DEFAULT_ROOM.id]: DEFAULT_COMMANDS },
     knowledgeByRoom: { [DEFAULT_ROOM.id]: DEFAULT_KNOWLEDGE },
     threadCache: { [DEFAULT_ROOM.id]: DEFAULT_THREADS },
-    writeLock: null,
+    writeLocksByRoom: { [DEFAULT_ROOM.id]: null },
   };
 }

@@ -5,59 +5,125 @@ import { spawn } from "node:child_process";
 
 const POLL_INTERVAL_MS = 1_500;
 const HEARTBEAT_INTERVAL_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 8_000;
 
 const POWERSHELL_REQUEST_SCRIPT = `
 $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $headers = @{}
 $payload.headers.PSObject.Properties | ForEach-Object { $headers[$_.Name] = [string]$_.Value }
+$timeoutSec = [Math]::Max(1, [Math]::Min(30, [Math]::Ceiling([double]$payload.timeoutMs / 1000)))
 $params = @{
   Uri = [string]$payload.url
   Method = [string]$payload.method
   Headers = $headers
   UseBasicParsing = $true
-  TimeoutSec = 30
+  TimeoutSec = $timeoutSec
 }
-if ($null -ne $payload.body) {
-  $params.Body = [string]$payload.body
+if ($null -ne $payload.bodyBase64) {
+  $params.Body = [Text.Encoding]::UTF8.GetBytes([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$payload.bodyBase64)))
   $params.ContentType = 'application/json'
 }
 try {
   $response = Invoke-WebRequest @params
-  [pscustomobject]@{ status = [int]$response.StatusCode; body = [string]$response.Content } | ConvertTo-Json -Compress
+  $stream = New-Object System.IO.MemoryStream
+  try {
+    $response.RawContentStream.CopyTo($stream)
+    $bodyBase64 = [Convert]::ToBase64String($stream.ToArray())
+  } finally {
+    $stream.Dispose()
+  }
+  [pscustomobject]@{ status = [int]$response.StatusCode; bodyBase64 = $bodyBase64 } | ConvertTo-Json -Compress
 } catch {
   $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 599 }
-  [pscustomobject]@{ status = $status; body = [string]$_.Exception.Message } | ConvertTo-Json -Compress
+  $bodyBase64 = $null
+  if ($_.Exception.Response) {
+    try {
+      $stream = $_.Exception.Response.GetResponseStream()
+      if ($stream) {
+        $memory = New-Object System.IO.MemoryStream
+        try {
+          $stream.CopyTo($memory)
+          $bodyBase64 = [Convert]::ToBase64String($memory.ToArray())
+        } finally {
+          $memory.Dispose()
+          $stream.Dispose()
+        }
+      }
+    } catch {}
+  }
+  if ($null -eq $bodyBase64) {
+    $bodyBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$_.Exception.Message))
+  }
+  [pscustomobject]@{ status = $status; bodyBase64 = $bodyBase64 } | ConvertTo-Json -Compress
 }
 `;
+
+export function encodeUtf8Base64(value) {
+  return Buffer.from(String(value), "utf8").toString("base64");
+}
+
+export function decodeUtf8Base64(value) {
+  return Buffer.from(String(value || ""), "base64").toString("utf8");
+}
 
 export function windowsNativeRequest(url, options = {}) {
   if (process.platform !== "win32") return Promise.reject(new Error("native_http_fallback_unavailable"));
   return new Promise((resolve, reject) => {
+    const timeoutMs = Math.max(1, Number(options.timeoutMs) || REQUEST_TIMEOUT_MS);
     const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", POWERSHELL_REQUEST_SCRIPT], {
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    let timeoutId = null;
+    const terminate = () => {
+      if (child.killed || child.exitCode !== null) return;
+      try {
+        child.kill();
+      } catch {
+        // A child can exit between the state check and the termination request.
+      }
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      options.signal?.removeEventListener("abort", abort);
+      callback(value);
+    };
+    const abort = () => {
+      terminate();
+      finish(reject, new Error("remote_request_aborted"));
+    };
+    const timeout = () => {
+      terminate();
+      finish(reject, new Error("remote_request_timeout"));
+    };
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", reject);
+    child.on("error", (error) => finish(reject, error));
     child.on("exit", (code) => {
-      if (code !== 0) return reject(new Error(stderr.trim() || `native_http_fallback_${code}`));
+      if (code !== 0) return finish(reject, new Error(stderr.trim() || `native_http_fallback_${code}`));
       try {
         const value = JSON.parse(stdout.trim());
-        resolve(new Response(value.body || "", { status: value.status, headers: { "content-type": "application/json" } }));
+        finish(resolve, new Response(decodeUtf8Base64(value.bodyBase64), { status: value.status, headers: { "content-type": "application/json" } }));
       } catch (error) {
-        reject(error);
+        finish(reject, error);
       }
     });
+    if (options.signal?.aborted) return abort();
+    options.signal?.addEventListener("abort", abort, { once: true });
+    timeoutId = setTimeout(timeout, timeoutMs);
     child.stdin.end(JSON.stringify({
       url,
       method: options.method || "GET",
       headers: options.headers || {},
-      body: options.body ?? null,
+      bodyBase64: options.body == null ? null : encodeUtf8Base64(options.body),
+      timeoutMs,
     }));
   });
 }
@@ -83,13 +149,19 @@ function safeApprovalRequestId(value) {
 }
 
 export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
-  const common = { sequence: event.sequence, createdAt: event.createdAt, agentId: event.agentId || null };
+  const common = {
+    sequence: event.sequence,
+    createdAt: event.createdAt,
+    roomId: event.roomId || null,
+    taskId: event.taskId || null,
+    agentId: event.agentId || null,
+  };
   if (event.type === "agentMessage") return { ...common, text: event.text || "", threadId: event.threadId, turnId: event.turnId };
   if (event.type === "approvalRequested") {
     return { ...common, requestId: event.requestId, method: event.method, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, command: event.command, target: projectLabel };
   }
   if (event.type === "approvalResolved") return { ...common, requestId: event.requestId, decision: event.decision };
-  if (event.type === "agentThreadBound") return { ...common, threadId: event.threadId, model: event.model };
+  if (event.type === "agentThreadBound") return { ...common, threadId: event.threadId, model: event.model, bindingMode: event.bindingMode };
   if (event.type === "turnStarted") return { ...common, threadId: event.threadId, turnId: event.turnId, messageId: event.messageId };
   if (event.type === "turnCompleted") return { ...common, threadId: event.threadId, status: event.turn?.status || "completed" };
   if (event.type === "writeItemCompleted") return { ...common, threadId: event.threadId, item: { type: event.item?.type, status: event.item?.status } };
@@ -97,7 +169,7 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
 }
 
 export class RemotePairingBridge {
-  constructor({ runtime, indexProvider = null, configPath = path.resolve(".team-room", "pairing.json"), fetchImpl = fetch, nativeRequestImpl = windowsNativeRequest, timers = globalThis } = {}) {
+  constructor({ runtime, indexProvider = null, configPath = path.resolve(".team-room", "pairing.json"), fetchImpl = fetch, nativeRequestImpl = windowsNativeRequest, timers = globalThis, requestTimeoutMs = REQUEST_TIMEOUT_MS } = {}) {
     this.runtime = runtime;
     this.indexProvider = indexProvider;
     this.configPath = configPath;
@@ -111,6 +183,8 @@ export class RemotePairingBridge {
     this.lastHeartbeatAt = 0;
     this.lastTaskId = null;
     this.lastError = null;
+    this.nativePreferred = false;
+    this.requestTimeoutMs = Math.max(1, Number(requestTimeoutMs) || REQUEST_TIMEOUT_MS);
   }
 
   status() {
@@ -151,13 +225,41 @@ export class RemotePairingBridge {
         ...(options.headers || {}),
       },
     };
-    let response = await this.fetchImpl(url, requestOptions);
-    if (response.status === 403 && response.headers.get("content-type")?.includes("text/html")) {
-      response = await this.nativeRequestImpl(url, requestOptions);
+    let timedOut = false;
+    const controller = new AbortController();
+    let timeoutId;
+    try {
+      return await Promise.race([
+        (async () => {
+          const transportOptions = { ...requestOptions, signal: controller.signal, timeoutMs: this.requestTimeoutMs };
+          let nextResponse;
+          if (this.nativePreferred) {
+            nextResponse = await this.nativeRequestImpl(url, transportOptions);
+          } else {
+            nextResponse = await this.fetchImpl(url, transportOptions);
+            if (nextResponse.status === 403 && nextResponse.headers.get("content-type")?.includes("text/html")) {
+              this.nativePreferred = true;
+              nextResponse = await this.nativeRequestImpl(url, transportOptions);
+            }
+          }
+          const value = await nextResponse.json().catch(() => ({}));
+          if (!nextResponse.ok) throw new Error(value.error || `remote_pairing_http_${nextResponse.status}`);
+          return value;
+        })(),
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+            reject(new Error("remote_request_timeout"));
+          }, this.requestTimeoutMs);
+        }),
+      ]);
+    } catch (error) {
+      if (timedOut) throw new Error("remote_request_timeout");
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
     }
-    const value = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(value.error || `remote_pairing_http_${response.status}`);
-    return value;
   }
 
   async optionalRequest(pathname, emptyValue) {
@@ -172,7 +274,7 @@ export class RemotePairingBridge {
   async heartbeat() {
     await this.request("/api/device/heartbeat", {
       method: "POST",
-      body: JSON.stringify({ deviceId: this.config.deviceId, label: this.config.deviceLabel, version: "0.2.0" }),
+      body: JSON.stringify({ deviceId: this.config.deviceId, label: this.config.deviceLabel, version: "0.2.1" }),
     });
     this.lastHeartbeatAt = Date.now();
   }
@@ -185,8 +287,23 @@ export class RemotePairingBridge {
       const knownProject = cwd.toLowerCase() === this.config.cwd.toLowerCase()
         || projects.some((project) => project.exists !== false && String(project.path).toLowerCase() === cwd.toLowerCase());
       if (!knownProject) throw new Error("remote_project_not_found");
-      await this.runtime.connect({ cwd, agents: task.agents, confirmed: true });
-      await this.runtime.dispatch({ text: task.text, decisions: task.decisions, messageId: task.message_id });
+      const existingBindings = (Array.isArray(task.agents) ? task.agents : [])
+        .filter((agent) => agent?.threadBinding === "existing");
+      if (existingBindings.length) {
+        if (typeof this.indexProvider?.listThreads !== "function") throw new Error("remote_thread_binding_index_unavailable");
+        const permittedThreadIds = new Set((this.indexProvider.listThreads(cwd) || [])
+          .map((thread) => typeof thread?.id === "string" ? thread.id.trim() : "")
+          .filter(Boolean));
+        for (const agent of existingBindings) {
+          const boundThreadId = typeof agent.boundThreadId === "string" ? agent.boundThreadId.trim() : "";
+          if (!boundThreadId || !permittedThreadIds.has(boundThreadId)) {
+            throw new Error("remote_thread_binding_not_found");
+          }
+        }
+      }
+      const roomId = task.room_id || task.roomId || null;
+      await this.runtime.connect({ cwd, agents: task.agents, confirmed: true, roomId, taskId: task.id });
+      await this.runtime.dispatch({ text: task.text, decisions: task.decisions, messageId: task.message_id, roomId, taskId: task.id });
       await this.request(`/api/device/tasks/${encodeURIComponent(task.id)}/result`, { method: "POST", body: JSON.stringify({ ok: true }) });
     } catch (error) {
       await this.request(`/api/device/tasks/${encodeURIComponent(task.id)}/result`, {
@@ -204,7 +321,7 @@ export class RemotePairingBridge {
       method: "POST",
       body: JSON.stringify({
         deviceId: this.config.deviceId,
-        events: events.map((event) => ({ taskId: this.lastTaskId, type: event.type, payload: sanitizeRuntimeEvent(event) })),
+        events: events.map((event) => ({ taskId: event.taskId || this.lastTaskId, type: event.type, payload: sanitizeRuntimeEvent(event) })),
       }),
     });
     this.eventCursor = events.at(-1).sequence;

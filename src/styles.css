@@ -214,6 +214,52 @@ select:focus-visible {
   gap: 3px;
 }
 
+.room-item {
+  position: relative;
+  min-width: 0;
+}
+
+.room-item .sidebar-row {
+  padding-right: 34px;
+}
+
+.room-item .sidebar-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-remove {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  width: 27px;
+  height: 27px;
+  margin-top: -13.5px;
+  border: 0;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.room-item:hover .room-remove,
+.room-item:focus-within .room-remove {
+  opacity: 1;
+}
+
+.room-remove--persistent {
+  opacity: 1;
+}
+
+.room-remove:hover {
+  color: var(--danger);
+  background: #fff0f2;
+}
+
 .thread-list {
   overflow-y: auto;
   max-height: 100%;
@@ -325,6 +371,53 @@ select:focus-visible {
   font-size: 18px;
   font-weight: 700;
   cursor: pointer;
+}
+
+.room-switcher-wrap {
+  position: relative;
+}
+
+.room-switcher-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 10px);
+  left: 0;
+  width: min(320px, calc(100vw - 36px));
+  padding: 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 14px 30px rgba(35, 37, 53, 0.16);
+}
+
+.room-switcher-option {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  border-radius: 7px;
+  padding: 9px 10px;
+  background: transparent;
+  color: #4e5260;
+  text-align: left;
+  cursor: pointer;
+}
+
+.room-switcher-option:hover,
+.room-switcher-option.is-current {
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.room-switcher-option span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .header-divider {
@@ -809,7 +902,7 @@ select:focus-visible {
   padding: 17px 5px 0;
   background: transparent;
   text-align: left;
-  cursor: pointer;
+  cursor: default;
   color: #555967;
 }
 
@@ -916,6 +1009,14 @@ select:focus-visible {
   gap: 10px;
 }
 
+.content-toolbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .knowledge-list,
 .agent-settings-list,
 .settings-sections {
@@ -968,6 +1069,16 @@ select:focus-visible {
 }
 
 .agent-settings-row {
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 4px;
+}
+
+.agent-settings-row__main {
+  width: 100%;
   border: 0;
   border-bottom: 1px solid var(--line);
   background: #fff;
@@ -975,13 +1086,30 @@ select:focus-visible {
   grid-template-columns: 58px minmax(180px, 1fr) 130px 90px 130px 24px;
   align-items: center;
   gap: 14px;
-  padding: 18px 4px;
+  padding: 18px 0;
   text-align: left;
   cursor: pointer;
 }
 
-.agent-settings-row:hover {
+.agent-settings-row__main:hover {
   background: #fbfbfe;
+}
+
+.agent-settings-remove {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.agent-settings-remove:hover {
+  background: #fff0f2;
+  color: var(--danger);
 }
 
 .agent-settings-main p {
@@ -1269,6 +1397,13 @@ select:focus-visible {
   font-weight: 400;
 }
 
+.field-label small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
 .drawer-security {
   margin: 20px 24px;
   background: #edf8f3;
@@ -1337,7 +1472,7 @@ select:focus-visible {
 @media (max-width: 1180px) {
   .app-shell { grid-template-columns: 240px minmax(520px, 1fr); }
   .agent-panel { display: none; }
-  .agent-settings-row { grid-template-columns: 56px minmax(180px, 1fr) 120px 86px 24px; }
+  .agent-settings-row__main { grid-template-columns: 56px minmax(180px, 1fr) 120px 86px 24px; }
   .agent-settings-fact:nth-of-type(3) { display: none; }
 }
 
@@ -1349,6 +1484,7 @@ select:focus-visible {
   .outline-action { margin-bottom: 14px; }
   .sidebar-section { margin-bottom: 12px; }
   .room-list { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  .room-remove { opacity: 1; }
   .sidebar-section--threads { flex: none; overflow: visible; }
   .sidebar-section--threads .sidebar-label { padding-bottom: 6px; }
   .thread-list { display: flex; gap: 6px; max-height: none; overflow-x: auto; padding-bottom: 4px; }
@@ -1360,9 +1496,11 @@ select:focus-visible {
   .header-actions { display: none; }
   .message-scroll { padding-inline: 16px; }
   .command-card { margin-left: 0; margin-right: 0; }
-  .agent-settings-row { grid-template-columns: 54px 1fr 24px; }
+  .agent-settings-row__main { grid-template-columns: 54px 1fr 24px; }
   .agent-settings-fact { display: none; }
   .knowledge-form { grid-template-columns: 1fr; }
   .knowledge-form textarea,
   .knowledge-form .form-actions { grid-column: auto; }
+  .content-toolbar { align-items: flex-start; }
+  .content-toolbar-actions { justify-content: flex-start; }
 }

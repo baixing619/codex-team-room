@@ -56,8 +56,17 @@ export class JsonLineRpcClient extends EventEmitter {
   }
 }
 
-function sandboxForAgent(agent) {
+function threadSandboxForAgent(agent) {
+  return agent.permission === "request-write" ? "workspace-write" : "read-only";
+}
+
+function turnSandboxForAgent(agent) {
   return agent.permission === "request-write" ? "workspaceWrite" : "readOnly";
+}
+
+function developerInstructionsForAgent(agent) {
+  const value = typeof agent?.systemPrompt === "string" ? agent.systemPrompt.trim() : "";
+  return value || null;
 }
 
 export class CodexAppServerProtocol extends EventEmitter {
@@ -81,18 +90,28 @@ export class CodexAppServerProtocol extends EventEmitter {
 
   async startAgentThread(agent, cwd) {
     await this.initialize();
+    const developerInstructions = developerInstructionsForAgent(agent);
     const result = await this.rpc.request("thread/start", {
       cwd,
       model: agent.model,
-      approvalPolicy: "unlessTrusted",
-      sandbox: sandboxForAgent(agent),
+      approvalPolicy: "untrusted",
+      sandbox: threadSandboxForAgent(agent),
+      ...(developerInstructions ? { developerInstructions } : {}),
     });
     return result.thread;
   }
 
-  async resumeAgentThread(threadId) {
+  async resumeAgentThread(threadId, agent, cwd) {
     await this.initialize();
-    const result = await this.rpc.request("thread/resume", { threadId });
+    const developerInstructions = developerInstructionsForAgent(agent);
+    const result = await this.rpc.request("thread/resume", {
+      threadId,
+      cwd,
+      model: agent.model,
+      approvalPolicy: "untrusted",
+      sandbox: threadSandboxForAgent(agent),
+      ...(developerInstructions ? { developerInstructions } : {}),
+    });
     return result.thread;
   }
 
@@ -105,8 +124,8 @@ export class CodexAppServerProtocol extends EventEmitter {
       cwd,
       model: agent.model,
       effort: agent.reasoning,
-      approvalPolicy: "unlessTrusted",
-      sandboxPolicy: sandboxForAgent(agent) === "workspaceWrite"
+      approvalPolicy: "untrusted",
+      sandboxPolicy: turnSandboxForAgent(agent) === "workspaceWrite"
         ? { type: "workspaceWrite", writableRoots: [cwd], networkAccess: false }
         : { type: "readOnly", networkAccess: false },
     });

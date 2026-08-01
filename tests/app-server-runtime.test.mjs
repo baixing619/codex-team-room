@@ -16,18 +16,35 @@ async function finishInitialize(harness) {
   assert.equal(harness.sent[1].method, "initialized");
 }
 
-test("binds each member model and permission to an independent Codex thread", async () => {
+test("binds each member model, permission, and system prompt to an independent Codex thread", async () => {
   const harness = createHarness();
   await finishInitialize(harness);
-  const agent = { id: "developer", model: "gpt-5.6-sol", reasoning: "high", permission: "request-write" };
+  const agent = { id: "developer", model: "gpt-5.6-sol", reasoning: "high", permission: "request-write", systemPrompt: "只处理当前项目" };
   const pending = harness.protocol.startAgentThread(agent, "G:\\project");
   await Promise.resolve();
   const request = harness.sent.at(-1);
   assert.equal(request.method, "thread/start");
   assert.equal(request.params.model, "gpt-5.6-sol");
-  assert.equal(request.params.sandbox, "workspaceWrite");
+  assert.equal(request.params.sandbox, "workspace-write");
+  assert.equal(request.params.developerInstructions, "只处理当前项目");
   harness.rpc.receive({ id: request.id, result: { thread: { id: "thread-developer" } } });
   assert.equal((await pending).id, "thread-developer");
+});
+
+test("resuming a selected thread reapplies its project cwd and member system prompt", async () => {
+  const harness = createHarness();
+  await finishInitialize(harness);
+  const agent = { id: "developer", model: "gpt-5.6-terra", reasoning: "high", permission: "read-only", systemPrompt: "不要读取其他项目" };
+  const pending = harness.protocol.resumeAgentThread("thread-existing", agent, "G:\\project");
+  await Promise.resolve();
+  const request = harness.sent.at(-1);
+  assert.equal(request.method, "thread/resume");
+  assert.equal(request.params.threadId, "thread-existing");
+  assert.equal(request.params.cwd, "G:\\project");
+  assert.equal(request.params.sandbox, "read-only");
+  assert.equal(request.params.developerInstructions, "不要读取其他项目");
+  harness.rpc.receive({ id: request.id, result: { thread: { id: "thread-existing" } } });
+  assert.equal((await pending).id, "thread-existing");
 });
 
 test("turn overrides keep model, effort, workspace root, and network denial together", async () => {
@@ -45,6 +62,7 @@ test("turn overrides keep model, effort, workspace root, and network denial toge
   const request = harness.sent.at(-1);
   assert.equal(request.method, "turn/start");
   assert.equal(request.params.effort, "xhigh");
+  assert.equal(request.params.approvalPolicy, "untrusted");
   assert.deepEqual(request.params.sandboxPolicy.writableRoots, ["G:\\project"]);
   assert.equal(request.params.sandboxPolicy.networkAccess, false);
   harness.rpc.receive({ id: request.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
