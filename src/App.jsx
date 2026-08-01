@@ -44,6 +44,11 @@ function classNames(...values) {
   return values.filter(Boolean).join(" ");
 }
 
+function isPrivateCloudHost() {
+  if (typeof window === "undefined") return false;
+  return !["127.0.0.1", "localhost"].includes(window.location.hostname);
+}
+
 function nowLabel() {
   return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date());
 }
@@ -88,12 +93,14 @@ function Sidebar({
   onOpenImport,
   onSelectView,
 }) {
+  const privateCloud = isPrivateCloudHost();
+  const connectionLabel = bridge?.ok ? "本地 · 已连接" : privateCloud ? "私人云端 · 本机未配对" : "本地 · 演示模式";
   return (
     <aside className="sidebar">
       <div className="brand-block">
         <div className="brand-name">Codex Team Room</div>
         <div className="connection-line">
-          本地 · {bridge?.ok ? "已连接" : "演示模式"}
+          {connectionLabel}
           <span className={classNames("status-dot", bridge?.ok ? "status-dot--green" : "status-dot--gray")} />
         </div>
       </div>
@@ -522,6 +529,7 @@ function AgentSettingsView({ agents, onOpenAgent }) {
 }
 
 function SettingsView({ bridge, runtime, rooms, onConnectRuntime, onDisconnectRuntime, onExport, onReset }) {
+  const privateCloud = isPrivateCloudHost();
   return (
     <div className="content-view">
       <div className="content-toolbar"><div><span className="eyebrow">本地优先</span><h2>连接、隐私与开源</h2></div></div>
@@ -529,7 +537,7 @@ function SettingsView({ bridge, runtime, rooms, onConnectRuntime, onDisconnectRu
         <section className="settings-block">
           <div className="settings-icon"><Database size={22} /></div>
           <div className="settings-copy"><h3>本地 Codex 索引</h3><p>默认只扫描会话元数据；只有你打开具体线程时，才读取该线程的可见消息。</p></div>
-          <div className={classNames("settings-state", bridge?.ok && "is-good")}>{bridge?.ok ? `${bridge.indexedThreads} 条会话` : "演示模式"}</div>
+          <div className={classNames("settings-state", bridge?.ok && "is-good")}>{bridge?.ok ? `${bridge.indexedThreads} 条会话` : privateCloud ? "等待本机配对" : "演示模式"}</div>
         </section>
         <section className="settings-block">
           <div className="settings-icon"><FolderOpen size={22} /></div>
