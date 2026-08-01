@@ -251,6 +251,25 @@ test("Windows-native request fallback handles a Cloudflare block without exposin
   assert.equal(nativeCalls[0].options.headers["x-team-room-device-secret"], "device-secret");
 });
 
+test("remote bridge retries one transient native 599 response", async () => {
+  let nativeCalls = 0;
+  const bridge = new RemotePairingBridge({
+    runtime: {},
+    fetchImpl: async () => new Response("blocked", { status: 403, headers: { "content-type": "text/html" } }),
+    nativeRequestImpl: async () => {
+      nativeCalls += 1;
+      if (nativeCalls === 1) return new Response("temporary transport failure", { status: 599 });
+      return Response.json({ task: null, title: "延续Pro订阅回本策略" });
+    },
+  });
+  bridge.config = { siteUrl: "https://private.example", deviceSecret: "device-secret", siwcBypassToken: "bypass-token" };
+
+  const value = await bridge.request("/api/device/tasks");
+
+  assert.equal(nativeCalls, 2);
+  assert.deepEqual(value, { task: null, title: "延续Pro订阅回本策略" });
+});
+
 test("remote bridge releases its polling lock when an outbound request times out", async () => {
   const bridge = new RemotePairingBridge({
     runtime: { listEvents: () => [] },

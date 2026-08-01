@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { addRoomMember, createProjectMember, createSafeMemberPrompt, migrateTeamRoomState, removeRoomMember, STATE_SCHEMA_VERSION } from "../src/lib/roomAgents.js";
+import { addRoomMember, createProjectMember, createSafeMemberPrompt, isCorruptedThreadTitle, migrateTeamRoomState, removeRoomMember, STATE_SCHEMA_VERSION } from "../src/lib/roomAgents.js";
 
 test("migrates legacy global members into independent per-room copies", () => {
   const migrated = migrateTeamRoomState({
@@ -44,4 +44,23 @@ test("adding or removing a member only changes the target room list", () => {
   assert.deepEqual(changedA.map((member) => member.id), ["new"]);
   assert.deepEqual(projectA.map((member) => member.id), ["a"]);
   assert.deepEqual(projectB.map((member) => member.id), ["b"]);
+});
+
+test("migration removes only cached thread titles corrupted into question marks", () => {
+  const migrated = migrateTeamRoomState({
+    rooms: [{ id: "room-a", name: "项目 A" }],
+    activeRoomId: "room-a",
+    threadCache: {
+      "room-a": [
+        { id: "global", title: "团队调度台", kind: "room" },
+        { id: "broken", title: "??????", kind: "codex" },
+        { id: "valid", title: "是不是这样？", kind: "codex" },
+      ],
+    },
+  });
+
+  assert.deepEqual(migrated.threadCache["room-a"].map((thread) => thread.id), ["global", "valid"]);
+  assert.equal(isCorruptedThreadTitle("?? ??"), true);
+  assert.equal(isCorruptedThreadTitle("问题？"), false);
+  assert.equal(isCorruptedThreadTitle("?"), false);
 });

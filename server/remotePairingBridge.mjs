@@ -5,7 +5,9 @@ import { spawn } from "node:child_process";
 
 const POLL_INTERVAL_MS = 1_500;
 const HEARTBEAT_INTERVAL_MS = 10_000;
-const REQUEST_TIMEOUT_MS = 8_000;
+const REQUEST_TIMEOUT_MS = 15_000;
+const MAX_TRANSPORT_ATTEMPTS = 2;
+const RETRYABLE_HTTP_STATUSES = new Set([502, 503, 504, 599]);
 
 const POWERSHELL_REQUEST_SCRIPT = `
 $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
@@ -232,19 +234,32 @@ export class RemotePairingBridge {
       return await Promise.race([
         (async () => {
           const transportOptions = { ...requestOptions, signal: controller.signal, timeoutMs: this.requestTimeoutMs };
-          let nextResponse;
-          if (this.nativePreferred) {
-            nextResponse = await this.nativeRequestImpl(url, transportOptions);
-          } else {
-            nextResponse = await this.fetchImpl(url, transportOptions);
-            if (nextResponse.status === 403 && nextResponse.headers.get("content-type")?.includes("text/html")) {
-              this.nativePreferred = true;
-              nextResponse = await this.nativeRequestImpl(url, transportOptions);
+          let lastError;
+          for (let attempt = 0; attempt < MAX_TRANSPORT_ATTEMPTS; attempt += 1) {
+            try {
+              let nextResponse;
+              if (this.nativePreferred) {
+                nextResponse = await this.nativeRequestImpl(url, transportOptions);
+              } else {
+                nextResponse = await this.fetchImpl(url, transportOptions);
+                if (nextResponse.status === 403 && nextResponse.headers.get("content-type")?.includes("text/html")) {
+                  this.nativePreferred = true;
+                  nextResponse = await this.nativeRequestImpl(url, transportOptions);
+                }
+              }
+              const value = await nextResponse.json().catch(() => ({}));
+              if (nextResponse.ok) return value;
+              lastError = new Error(value.error || `remote_pairing_http_${nextResponse.status}`);
+              if (!RETRYABLE_HTTP_STATUSES.has(nextResponse.status)) throw lastError;
+            } catch (error) {
+              lastError = error;
+              const retryable = error instanceof TypeError
+                || ["remote_pairing_http_502", "remote_pairing_http_503", "remote_pairing_http_504", "remote_pairing_http_599"].includes(error?.message);
+              if (!retryable) throw error;
             }
+            if (attempt + 1 >= MAX_TRANSPORT_ATTEMPTS) throw lastError;
           }
-          const value = await nextResponse.json().catch(() => ({}));
-          if (!nextResponse.ok) throw new Error(value.error || `remote_pairing_http_${nextResponse.status}`);
-          return value;
+          throw lastError || new Error("remote_pairing_transport_failed");
         })(),
         new Promise((_, reject) => {
           timeoutId = setTimeout(() => {

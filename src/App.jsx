@@ -904,7 +904,7 @@ export function App() {
     setState((current) => ({ ...current, threadCache: { ...current.threadCache, [roomId]: nextThreads } }));
   };
 
-  const fetchThreads = async (room) => {
+  const fetchThreads = async (room, { notifyOnError = false } = {}) => {
     try {
       let data;
       if (privateCloud) {
@@ -919,16 +919,38 @@ export function App() {
         ...data.threads.map((thread) => ({ ...thread, time: formatRelativeDate(thread.updatedAt), kind: "codex" })),
       ];
       updateRoomThreads(room.id, nextThreads);
-    } catch {
-      if (!state.threadCache[room.id]) updateRoomThreads(room.id, DEFAULT_THREADS);
+      autoLoadedRooms.current.add(room.id);
+      return true;
+    } catch (error) {
+      autoLoadedRooms.current.delete(room.id);
+      setState((current) => {
+        if (current.threadCache[room.id]?.length) return current;
+        return { ...current, threadCache: { ...current.threadCache, [room.id]: DEFAULT_THREADS } };
+      });
+      if (notifyOnError) {
+        const message = error instanceof Error ? error.message : "读取失败";
+        setToast(/599|timeout|超时/.test(message)
+          ? "与已配对电脑的连接刚刚中断，正在自动重试"
+          : `读取对话失败：${message}`);
+      }
+      return false;
     }
   };
 
   useEffect(() => {
     const localIndexReady = bridge?.ok || (privateCloud && pairing?.online);
     if (!localIndexReady || !activeRoom || autoLoadedRooms.current.has(activeRoom.id)) return;
-    autoLoadedRooms.current.add(activeRoom.id);
-    fetchThreads(activeRoom);
+    let cancelled = false;
+    let retryTimer = null;
+    const load = async () => {
+      const loaded = await fetchThreads(activeRoom);
+      if (!cancelled && !loaded) retryTimer = window.setTimeout(load, 3_000);
+    };
+    load();
+    return () => {
+      cancelled = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
+    };
   }, [bridge?.ok, privateCloud, pairing?.online, activeRoom?.id]);
 
   const selectRoom = (roomId) => {
@@ -939,7 +961,14 @@ export function App() {
     setHistory(null);
     setOpenAgentId(null);
     setNewMember(null);
-    if (room) fetchThreads(room);
+    if (room) fetchThreads(room, { notifyOnError: true });
+  };
+
+  const openAgentEditor = (agentId) => {
+    setNewMember(null);
+    setOpenAgentId(agentId);
+    const localIndexReady = bridge?.ok || (privateCloud && pairing?.online);
+    if (localIndexReady) fetchThreads(activeRoom, { notifyOnError: true });
   };
 
   const selectThread = async (thread) => {
@@ -1252,6 +1281,8 @@ export function App() {
     }
     setOpenAgentId(null);
     setNewMember(createProjectMember());
+    const localIndexReady = bridge?.ok || (privateCloud && pairing?.online);
+    if (localIndexReady) fetchThreads(activeRoom, { notifyOnError: true });
   };
 
   const removeAgent = (agent) => {
@@ -1320,7 +1351,7 @@ export function App() {
 
   const renderCenter = () => {
     if (activeView === "knowledge") return <KnowledgeView entries={knowledge} onAdd={addKnowledge} />;
-    if (activeView === "agents") return <AgentSettingsView agents={agents} onOpenAgent={(agentId) => { setNewMember(null); setOpenAgentId(agentId); }} onAddMember={addMember} onRemoveAgent={removeAgent} />;
+    if (activeView === "agents") return <AgentSettingsView agents={agents} onOpenAgent={openAgentEditor} onAddMember={addMember} onRemoveAgent={removeAgent} />;
     if (activeView === "settings") return <SettingsView bridge={bridge} pairing={pairing} runtime={runtime} rooms={state.rooms} onConnectRuntime={connectRuntime} onDisconnectRuntime={disconnectRuntime} onExport={exportConfig} onReset={resetPrototype} />;
     if (activeThreadId !== "global") return <HistoryView history={history} loading={historyLoading} error={historyError} onAttach={attachHistory} />;
     return (
@@ -1362,7 +1393,7 @@ export function App() {
         <RoomHeader room={activeRoom} rooms={state.rooms} activeView={activeView} activeThread={activeThread} onSelectRoom={selectRoom} />
         <div className="main-content">{renderCenter()}</div>
       </main>
-      {activeView === "chat" && activeThreadId === "global" ? <AgentRoster agents={agents} onOpenAgent={(agentId) => { setNewMember(null); setOpenAgentId(agentId); }} /> : null}
+      {activeView === "chat" && activeThreadId === "global" ? <AgentRoster agents={agents} onOpenAgent={openAgentEditor} /> : null}
 
       {importOpen ? <ImportProjectModal projects={projects} loading={projectsLoading} error={projectsError} connectedPaths={connectedPaths} onClose={() => setImportOpen(false)} onRefresh={loadProjects} onAttach={attachProject} /> : null}
       {openAgent ? <AgentDrawer agent={openAgent} bindingThreads={threads.filter((thread) => thread.kind === "codex")} isNew={Boolean(newMember)} onClose={() => { setOpenAgentId(null); setNewMember(null); }} onSave={saveAgent} /> : null}

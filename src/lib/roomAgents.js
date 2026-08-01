@@ -1,6 +1,21 @@
 import { DEFAULT_AGENTS, DEFAULT_ROOM } from "../data/defaults.js";
 
-export const STATE_SCHEMA_VERSION = 2;
+export const STATE_SCHEMA_VERSION = 3;
+
+export function isCorruptedThreadTitle(value) {
+  const compact = String(value ?? "").replace(/\s/g, "");
+  return compact.length >= 2 && /^\?+$/.test(compact);
+}
+
+export function sanitizeThreadCache(value) {
+  if (!value || typeof value !== "object") return {};
+  return Object.fromEntries(Object.entries(value).map(([roomId, threads]) => [
+    roomId,
+    Array.isArray(threads)
+      ? threads.filter((thread) => !isCorruptedThreadTitle(thread?.title))
+      : [],
+  ]));
+}
 
 export function createSafeMemberPrompt({ name = "成员", role = "项目协作者" } = {}) {
   const memberName = String(name).trim() || "成员";
@@ -93,5 +108,6 @@ export function migrateTeamRoomState(value) {
     activeRoomId,
     agentsByRoom,
     writeLocksByRoom,
+    threadCache: sanitizeThreadCache(input.threadCache),
   };
 }
