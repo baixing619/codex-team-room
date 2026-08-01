@@ -37,6 +37,18 @@ npm run build
 npm run release:check
 ```
 
+## 启用真实成员运行时
+
+Team Room 不捆绑 Codex 可执行文件。需要真实成员线程时，请按 [OpenAI 官方 Codex CLI 安装说明](https://help.openai.com/en/articles/11096431) 单独安装并登录：
+
+```powershell
+npm install -g @openai/codex
+codex login
+codex login status
+```
+
+Windows 上通过 npm 安装的官方 x64/ARM64 平台二进制会被自动识别。确认设置页显示 CLI 可用后，仍需由用户点击“启用真实成员”才会启动 App Server；Team Room 不会因检测到 CLI 而自动执行任务。
+
 ## 隐私边界
 
 - 不上传项目文件、对话、令牌、Cookie 或账号信息。

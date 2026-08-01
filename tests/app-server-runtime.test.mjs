@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CodexAppServerProtocol, JsonLineRpcClient } from "../server/codexAppServerRuntime.mjs";
+import { CodexAppServerProtocol, JsonLineRpcClient, npmCodexBinaryCandidate } from "../server/codexAppServerRuntime.mjs";
 
 function createHarness() {
   const sent = [];
@@ -59,4 +59,12 @@ test("approval responses allow one-time accept but reject session-wide grants", 
 
   harness.rpc.receive({ id: 78, method: "item/commandExecution/requestApproval", params: { threadId: "thread-1" } });
   assert.throws(() => harness.protocol.resolveApproval(78, "acceptForSession"), /one-time accept/);
+});
+
+test("resolves the official npm Codex binary on native Windows", () => {
+  assert.equal(
+    npmCodexBinaryCandidate({ appData: "C:\\Users\\demo\\AppData\\Roaming", arch: "x64" }),
+    "C:\\Users\\demo\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe",
+  );
+  assert.equal(npmCodexBinaryCandidate({ appData: "C:\\Users\\demo", arch: "ia32" }), null);
 });

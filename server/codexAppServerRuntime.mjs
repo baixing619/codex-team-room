@@ -121,15 +121,47 @@ export class CodexAppServerProtocol extends EventEmitter {
   }
 }
 
+export function npmCodexBinaryCandidate({ appData = process.env.APPDATA, arch = process.arch } = {}) {
+  const platformPackage = arch === "arm64" ? "codex-win32-arm64" : arch === "x64" ? "codex-win32-x64" : null;
+  const rustTarget = arch === "arm64" ? "aarch64-pc-windows-msvc" : arch === "x64" ? "x86_64-pc-windows-msvc" : null;
+  if (!appData || !platformPackage || !rustTarget) return null;
+  return path.join(
+    appData,
+    "npm",
+    "node_modules",
+    "@openai",
+    "codex",
+    "node_modules",
+    "@openai",
+    platformPackage,
+    "vendor",
+    rustTarget,
+    "bin",
+    "codex.exe",
+  );
+}
+
+function npmCodexBinaryFromShim(shimPath) {
+  if (process.platform !== "win32" || !/\.(?:cmd|ps1)$/i.test(shimPath)) return null;
+  const appData = path.dirname(path.dirname(shimPath));
+  return npmCodexBinaryCandidate({ appData });
+}
+
 function whereCandidates() {
   const candidates = [];
   const explicit = process.env.CODEX_TEAM_ROOM_CODEX_BIN;
   if (explicit) candidates.push(path.resolve(explicit));
+  if (process.platform === "win32") {
+    const npmBinary = npmCodexBinaryCandidate();
+    if (npmBinary) candidates.push(npmBinary);
+  }
   const finder = process.platform === "win32" ? "where.exe" : "which";
   const result = spawnSync(finder, ["codex"], { encoding: "utf8", timeout: 2500, windowsHide: true });
   if (result.status === 0) {
     for (const line of String(result.stdout || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
       if (process.platform !== "win32" || line.toLowerCase().endsWith(".exe")) candidates.push(line);
+      const npmBinary = npmCodexBinaryFromShim(line);
+      if (npmBinary) candidates.push(npmBinary);
     }
   }
   return Array.from(new Set(candidates));
