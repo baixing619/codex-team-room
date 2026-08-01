@@ -399,6 +399,26 @@ export class RemotePairingBridge {
     });
   }
 
+  async drainIndexRequests(firstRequest, limit = 6) {
+    let current = firstRequest;
+    let processed = 0;
+    while (current && processed < limit) {
+      try {
+        await this.processIndexRequest(current);
+      } catch (error) {
+        await this.request(`/api/device/index-requests/${encodeURIComponent(current.id)}/result`, {
+          method: "POST",
+          body: JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+        });
+      }
+      processed += 1;
+      if (processed < limit) {
+        const next = await this.optionalRequest("/api/device/index-requests", { indexRequest: null });
+        current = next.indexRequest;
+      }
+    }
+  }
+
   async tick() {
     if (this.busy || !this.config) return;
     this.busy = true;
@@ -411,17 +431,7 @@ export class RemotePairingBridge {
       ]);
       if (task) await this.processTask(task);
       if (approval) await this.processApproval(approval);
-      if (indexRequest) {
-        try {
-          await this.processIndexRequest(indexRequest);
-        } catch (error) {
-          await this.request(`/api/device/index-requests/${encodeURIComponent(indexRequest.id)}/result`, {
-            method: "POST",
-            body: JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }),
-          });
-          throw error;
-        }
-      }
+      if (indexRequest) await this.drainIndexRequests(indexRequest);
       await this.uploadEvents();
       this.lastError = null;
     } catch (error) {

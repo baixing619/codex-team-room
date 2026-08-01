@@ -1,6 +1,6 @@
 import { DEFAULT_AGENTS, DEFAULT_ROOM } from "../data/defaults.js";
 
-export const STATE_SCHEMA_VERSION = 4;
+export const STATE_SCHEMA_VERSION = 5;
 
 const LEGACY_DEMO_MESSAGE_IDS = new Set(["m1", "m2", "m3", "m4", "m5", "m6", "day"]);
 const LEGACY_DEMO_KNOWLEDGE_IDS = new Set(["knowledge-1", "knowledge-2", "knowledge-3"]);
@@ -18,6 +18,32 @@ export function sanitizeThreadCache(value) {
       ? threads.filter((thread) => thread?.kind !== "demo" && !isCorruptedThreadTitle(thread?.title))
       : [],
   ]));
+}
+
+export function sanitizeHistoryCache(value) {
+  if (!value || typeof value !== "object") return {};
+  const entries = Object.entries(value).slice(-30);
+  return Object.fromEntries(entries.flatMap(([threadId, cached]) => {
+    if (!cached?.thread || !Array.isArray(cached.messages)) return [];
+    const safeThreadId = String(threadId || cached.thread.id || "").slice(0, 200);
+    if (!safeThreadId) return [];
+    let remainingText = 240_000;
+    const messages = cached.messages.slice(-200).map((message) => {
+      const text = String(message?.text || "").slice(0, Math.min(8_000, remainingText));
+      remainingText -= text.length;
+      return {
+        id: String(message?.id || crypto.randomUUID()).slice(0, 200),
+        role: message?.role === "user" ? "user" : "assistant",
+        text,
+      };
+    }).filter((message) => message.text);
+    return [[safeThreadId, {
+      thread: { ...cached.thread, id: safeThreadId, title: String(cached.thread.title || "未命名对话").slice(0, 500) },
+      messages,
+      roomId: String(cached.roomId || "").slice(0, 160),
+      cachedAt: String(cached.cachedAt || ""),
+    }]];
+  }));
 }
 
 export function createSafeMemberPrompt({ name = "成员", role = "项目协作者" } = {}) {
@@ -112,6 +138,7 @@ export function migrateTeamRoomState(value) {
     agentsByRoom,
     writeLocksByRoom,
     threadCache: sanitizeThreadCache(input.threadCache),
+    historyCacheByThread: sanitizeHistoryCache(input.historyCacheByThread),
     messagesByRoom: Object.fromEntries(Object.entries(input.messagesByRoom || {}).map(([roomId, messages]) => [roomId, (Array.isArray(messages) ? messages : []).filter((message) => !LEGACY_DEMO_MESSAGE_IDS.has(message?.id))])),
     commandsByRoom: Object.fromEntries(Object.entries(input.commandsByRoom || {}).map(([roomId, commands]) => [roomId, (Array.isArray(commands) ? commands : []).filter((command) => command?.id !== "command-1")])),
     knowledgeByRoom: Object.fromEntries(Object.entries(input.knowledgeByRoom || {}).map(([roomId, entries]) => [roomId, (Array.isArray(entries) ? entries : []).filter((entry) => !LEGACY_DEMO_KNOWLEDGE_IDS.has(entry?.id))])),

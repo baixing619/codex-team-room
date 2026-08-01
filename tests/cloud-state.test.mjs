@@ -43,6 +43,7 @@ test("applies a phone snapshot with new room data while retaining the computer a
     messagesByRoom: { [desktopRoom.id]: [{ id: "old-message", text: "电脑旧消息" }] },
     knowledgeByRoom: { [desktopRoom.id]: [] },
   });
+  computerState.historyCacheByThread = { "local-thread": { thread: { id: "local-thread", title: "本机缓存" }, messages: [], roomId: desktopRoom.id } };
 
   const snapshot = createCloudSnapshot(phoneState);
   const snapshotAttachment = snapshot.messagesByRoom[mobileRoom.id][0].attachments[0];
@@ -57,4 +58,6 @@ test("applies a phone snapshot with new room data while retaining the computer a
   assert.equal(applied.knowledgeByRoom[mobileRoom.id][0].title, "手机知识");
   assert.equal(applied.messagesByRoom[mobileRoom.id][0].text, "手机新增的消息");
   assert.equal(applied.messagesByRoom[mobileRoom.id][0].attachments[0].file, undefined);
+  assert.equal(snapshot.historyCacheByThread, undefined);
+  assert.equal(applied.historyCacheByThread["local-thread"].thread.title, "本机缓存");
 });

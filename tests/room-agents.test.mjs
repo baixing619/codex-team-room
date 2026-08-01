@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { addRoomMember, createProjectMember, createSafeMemberPrompt, isCorruptedThreadTitle, migrateTeamRoomState, removeRoomMember, STATE_SCHEMA_VERSION } from "../src/lib/roomAgents.js";
+import { addRoomMember, createProjectMember, createSafeMemberPrompt, isCorruptedThreadTitle, migrateTeamRoomState, removeRoomMember, sanitizeHistoryCache, STATE_SCHEMA_VERSION } from "../src/lib/roomAgents.js";
 
 test("migrates legacy global members into independent per-room copies", () => {
   const migrated = migrateTeamRoomState({
@@ -63,4 +63,20 @@ test("migration removes only cached thread titles corrupted into question marks"
   assert.equal(isCorruptedThreadTitle("?? ??"), true);
   assert.equal(isCorruptedThreadTitle("问题？"), false);
   assert.equal(isCorruptedThreadTitle("?"), false);
+});
+
+test("history cache survives refresh migration while bounding stored transcript text", () => {
+  const cached = sanitizeHistoryCache({
+    "thread-1": {
+      thread: { id: "thread-1", title: "真实历史对话" },
+      roomId: "room-a",
+      cachedAt: "2026-08-02T00:00:00.000Z",
+      messages: [{ id: "message-1", role: "user", text: "a".repeat(10_000) }],
+    },
+  });
+
+  assert.equal(cached["thread-1"].thread.title, "真实历史对话");
+  assert.equal(cached["thread-1"].roomId, "room-a");
+  assert.equal(cached["thread-1"].messages[0].text.length, 8_000);
+  assert.equal(migrateTeamRoomState({ historyCacheByThread: cached }).historyCacheByThread["thread-1"].messages.length, 1);
 });

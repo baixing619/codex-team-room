@@ -1320,6 +1320,16 @@ select:focus-visible {
   gap: 8px;
 }
 
+.history-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.history-actions button {
+  white-space: nowrap;
+}
+
 .history-list {
   max-width: 760px;
   margin: 24px auto;
@@ -1621,7 +1631,8 @@ select:focus-visible {
   .composer-tool { width: 32px; height: 36px; }
   .history-view { padding: 16px 14px 0; }
   .history-banner { align-items: flex-start; flex-direction: column; }
-  .history-banner .primary-button { width: 100%; justify-content: center; }
+  .history-actions { width: 100%; }
+  .history-actions button { flex: 1; justify-content: center; }
   .command-card { margin-left: 0; margin-right: 0; }
   .agent-settings-row__main { grid-template-columns: 54px 1fr 24px; }
   .agent-settings-fact { display: none; }
