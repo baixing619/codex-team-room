@@ -11,7 +11,6 @@ import {
   CheckCircle,
   Code,
   Database,
-  DotsThree,
   Eye,
   FolderOpen,
   GearSix,
@@ -31,7 +30,8 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { DEFAULT_THREADS, MODEL_OPTIONS } from "./data/defaults.js";
-import { createAgentReply, decideParticipation, shouldRequestCommand } from "./lib/participation.js";
+import { commandRequestingAgent, createAgentReply, decideParticipation, shouldRequestCommand } from "./lib/participation.js";
+import { addRoomMember, createProjectMember, createRoomAgents, createSafeMemberPrompt, removeRoomMember, replaceRoomMember } from "./lib/roomAgents.js";
 import { loadState, resetState, saveState } from "./lib/storage.js";
 
 const VIEW_ITEMS = [
@@ -76,7 +76,7 @@ async function requestRemoteIndex(type, body = {}) {
   const requestId = created.indexRequest?.id;
   if (!requestId) throw new Error("无法创建本地索引请求");
 
-  for (let attempt = 0; attempt < 30; attempt += 1) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, 500));
     const response = await fetch(`/api/remote/index-requests/${encodeURIComponent(requestId)}`);
     const value = await response.json();
@@ -84,7 +84,7 @@ async function requestRemoteIndex(type, body = {}) {
     if (value.indexRequest?.status === "completed") return value.indexRequest.result;
     if (value.indexRequest?.status === "failed") throw new Error(value.indexRequest.error || "本机索引读取失败");
   }
-  throw new Error("等待本机索引超时，请确认电脑仍在线");
+  throw new Error("读取本机索引超时，请确认电脑保持在线后重试");
 }
 
 function AgentAvatar({ agent, size = "medium" }) {
@@ -108,6 +108,7 @@ function Sidebar({
   onSelectRoom,
   onSelectThread,
   onOpenImport,
+  onRemoveRoom,
   onSelectView,
 }) {
   const privateCloud = isPrivateCloudHost();
@@ -140,16 +141,22 @@ function Sidebar({
         <div className="sidebar-label">项目房间</div>
         <div className="room-list">
           {rooms.map((room) => (
-            <button
-              key={room.id}
-              className={classNames("sidebar-row", room.id === activeRoom.id && activeView === "chat" && "is-active")}
-              type="button"
-              onClick={() => onSelectRoom(room.id)}
-              title={room.path}
-            >
-              <ChatsCircle size={18} />
-              <span>{room.name}</span>
-            </button>
+            <div className="room-item" key={room.id}>
+              <button
+                className={classNames("sidebar-row", room.id === activeRoom.id && activeView === "chat" && "is-active")}
+                type="button"
+                onClick={() => onSelectRoom(room.id)}
+                title={room.path}
+              >
+                <ChatsCircle size={18} />
+                <span>{room.name}</span>
+              </button>
+              {room.source !== "local" ? (
+                <button className="room-remove room-remove--persistent" type="button" aria-label={`移除${room.name}`} title="仅从 Team Room 移除" onClick={() => onRemoveRoom(room)}>
+                  <X size={15} weight="bold" />
+                </button>
+              ) : null}
+            </div>
           ))}
         </div>
       </section>
@@ -168,7 +175,7 @@ function Sidebar({
               onClick={() => onSelectThread(thread)}
             >
               {thread.id === "global" ? <Hash size={16} weight="bold" /> : <ChatCircle size={16} />}
-              <span className="thread-title">{thread.title}</span>
+              <span className="thread-title">{thread.id === "global" ? "团队调度台" : thread.title}</span>
               <span className="thread-time">{thread.time || formatRelativeDate(thread.updatedAt)}</span>
             </button>
           ))}
@@ -192,28 +199,65 @@ function Sidebar({
   );
 }
 
-function RoomHeader({ room, activeView, activeThread }) {
+function RoomHeader({ room, rooms, activeView, activeThread, onSelectRoom }) {
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+  const switcherRef = useRef(null);
+  useEffect(() => {
+    if (!switcherOpen) return undefined;
+    const closeIfOutside = (event) => {
+      if (!switcherRef.current?.contains(event.target)) setSwitcherOpen(false);
+    };
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") setSwitcherOpen(false);
+    };
+    document.addEventListener("pointerdown", closeIfOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeIfOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [switcherOpen]);
   const titles = {
     knowledge: ["知识库", "保存团队确认过的事实、决定和安全边界。"],
     agents: ["成员配置", "为每位成员单独配置职责、模型和权限。"],
     settings: ["项目设置", "管理本地连接、隐私和开源发布状态。"],
   };
-  const title = activeView === "chat" ? activeThread?.title || "项目全局对话" : titles[activeView]?.[0];
+  const title = activeView === "chat" ? activeThread?.id === "global" ? "团队调度台" : activeThread?.title || "团队调度台" : titles[activeView]?.[0];
   const subtitle =
     activeView === "chat"
       ? activeThread?.id && activeThread.id !== "global"
         ? "历史对话以只读方式打开，可选择挂入团队公共上下文。"
-        : "围绕当前项目的全部协作与决策在此汇总，保持上下文一致。"
+        : "消息只路由给当前项目中需要发言的成员任务，不会群发到历史对话。"
       : titles[activeView]?.[1];
 
   return (
     <header className="room-header">
       <div className="room-heading">
         <div className="room-title-line">
-          <button className="room-switcher" type="button">
-            {room.name}
-            <CaretDown size={15} weight="bold" />
-          </button>
+          <div className="room-switcher-wrap" ref={switcherRef}>
+            <button className="room-switcher" type="button" aria-haspopup="menu" aria-expanded={switcherOpen} onClick={() => setSwitcherOpen((value) => !value)}>
+              {room.name}
+              <CaretDown size={15} weight="bold" />
+            </button>
+            {switcherOpen ? (
+              <div className="room-switcher-menu" role="menu" aria-label="切换项目房间">
+                {rooms.map((candidate) => (
+                  <button
+                    key={candidate.id}
+                    className={classNames("room-switcher-option", candidate.id === room.id && "is-current")}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={candidate.id === room.id}
+                    onClick={() => { onSelectRoom(candidate.id); setSwitcherOpen(false); }}
+                  >
+                    <FolderOpen size={16} />
+                    <span>{candidate.name}</span>
+                    {candidate.id === room.id ? <Check size={16} weight="bold" /> : null}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
           <span className="header-divider" />
           <div className="channel-title">
             {activeView === "chat" ? <Hash size={17} weight="bold" /> : null}
@@ -226,9 +270,6 @@ function RoomHeader({ room, activeView, activeThread }) {
         <span>8月1日</span>
         <CalendarBlank size={19} />
         <span className="header-divider header-divider--short" />
-        <button className="icon-button" type="button" aria-label="更多选项">
-          <DotsThree size={22} weight="bold" />
-        </button>
       </div>
     </header>
   );
@@ -371,7 +412,7 @@ function Composer({ value, onChange, onSend, executionMode, onToggleMode, disabl
         </button>
       </div>
       <div className="composer-caption">
-        <span>{executionMode ? "可申请执行：成员仍需经过审批才能写入" : "仅讨论：不会提出命令执行请求"}</span>
+        <span>{executionMode ? "当前项目团队调度：只分派给需发言的成员，不会向历史对话群发；写入仍需审批" : "仅讨论：不会提出命令执行请求，也不会向历史对话群发"}</span>
       </div>
     </div>
   );
@@ -473,11 +514,10 @@ function AgentRoster({ agents, onOpenAgent }) {
           </button>
         ))}
       </div>
-      <button className="silence-rule" type="button">
+      <div className="silence-rule">
         <Sparkle size={18} />
         <span><strong>自动静默规则</strong><small>职责无关或无新增信息时不发言</small></span>
-        <CaretDown size={16} />
-      </button>
+      </div>
     </aside>
   );
 }
@@ -531,23 +571,26 @@ function KnowledgeView({ entries, onAdd }) {
   );
 }
 
-function AgentSettingsView({ agents, onOpenAgent }) {
+function AgentSettingsView({ agents, onOpenAgent, onAddMember, onRemoveAgent }) {
   return (
     <div className="content-view">
       <div className="content-toolbar">
-        <div><span className="eyebrow">独立角色</span><h2>成员与模型</h2></div>
-        <div className="privacy-chip"><ShieldCheck size={17} />每个成员单独授权</div>
+        <div><span className="eyebrow">项目独立</span><h2>成员与模型</h2></div>
+        <div className="content-toolbar-actions"><div className="privacy-chip"><ShieldCheck size={17} />仅影响当前项目</div><button className="primary-button" type="button" onClick={onAddMember}><Plus size={17} />新增成员</button></div>
       </div>
       <div className="agent-settings-list">
         {agents.map((agent) => (
-          <button className="agent-settings-row" key={agent.id} type="button" onClick={() => onOpenAgent(agent.id)}>
+          <div className="agent-settings-row" key={agent.id}>
+            <button className="agent-settings-row__main" type="button" onClick={() => onOpenAgent(agent.id)}>
             <AgentAvatar agent={agent} size="large" />
             <div className="agent-settings-main"><strong>{agent.name} · {agent.role}</strong><p>{agent.description}</p></div>
             <div className="agent-settings-fact"><span>模型</span><strong>{MODEL_OPTIONS.find((item) => item.value === agent.model)?.label || agent.model}</strong></div>
             <div className="agent-settings-fact"><span>推理</span><strong>{agent.reasoning}</strong></div>
             <div className="agent-settings-fact"><span>权限</span><strong>{agent.permission}</strong></div>
             <SlidersHorizontal size={20} />
-          </button>
+            </button>
+            <button className="agent-settings-remove" type="button" aria-label={`从当前项目移除${agent.name}`} title="只从当前项目移除" onClick={() => onRemoveAgent(agent)}> <X size={18} weight="bold" /> </button>
+          </div>
         ))}
       </div>
     </div>
@@ -620,24 +663,43 @@ function ImportProjectModal({ projects, loading, error, connectedPaths, onClose,
   );
 }
 
-function AgentDrawer({ agent, onClose, onSave }) {
+function projectDisplayName(project) {
+  const name = typeof project?.name === "string" ? project.name.trim() : "";
+  if (name && !/^\?+$/.test(name)) return name;
+  const pathParts = String(project?.path || "").replace(/[\\/]+$/, "").split(/[\\/]/);
+  const fallback = pathParts.at(-1)?.trim();
+  return fallback && !/^\?+$/.test(fallback) ? fallback : "未命名项目";
+}
+
+function AgentDrawer({ agent, onClose, onSave, bindingThreads = [], isNew = false }) {
   const [form, setForm] = useState(agent);
-  useEffect(() => setForm(agent), [agent]);
+  const [promptEdited, setPromptEdited] = useState(!isNew);
+  useEffect(() => { setForm(agent); setPromptEdited(!isNew); }, [agent, isNew]);
   if (!agent) return null;
+
+  const updateIdentity = (field, value) => {
+    setForm((current) => {
+      const next = { ...current, [field]: value };
+      return promptEdited ? next : { ...next, systemPrompt: createSafeMemberPrompt(next) };
+    });
+  };
 
   return (
     <div className="drawer-backdrop" role="presentation" onMouseDown={onClose}>
       <aside className="drawer" role="dialog" aria-modal="true" aria-label={`配置${agent.name}`} onMouseDown={(event) => event.stopPropagation()}>
-        <header className="drawer-header"><div><span className="eyebrow">成员配置</span><h2>{agent.name}</h2></div><button className="icon-button" type="button" onClick={onClose}><X size={21} /></button></header>
+        <header className="drawer-header"><div><span className="eyebrow">当前项目成员</span><h2>{isNew ? "新增成员" : agent.name}</h2></div><button className="icon-button" type="button" onClick={onClose}><X size={21} /></button></header>
         <div className="drawer-profile"><AgentAvatar agent={agent} size="xlarge" /><div><strong>{agent.role}</strong><p>{agent.description}</p></div></div>
-        <label className="field-label">成员职责<input value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })} /></label>
+        <label className="field-label">成员名称<input value={form.name} onChange={(event) => updateIdentity("name", event.target.value)} /></label>
+        <label className="field-label">成员职责<input value={form.role} onChange={(event) => updateIdentity("role", event.target.value)} /></label>
         <label className="field-label">说明<textarea rows={3} value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
         <label className="field-label">模型<select value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })}>{MODEL_OPTIONS.map((model) => <option key={model.value} value={model.value}>{model.label}</option>)}</select></label>
         <label className="field-label">推理强度<select value={form.reasoning} onChange={(event) => setForm({ ...form, reasoning: event.target.value })}><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select></label>
         <label className="field-label">项目权限<select value={form.permission} onChange={(event) => setForm({ ...form, permission: event.target.value })}><option value="read-only">只读</option><option value="request-write">可申请写入</option><option value="coordinate">协调与审批建议</option></select></label>
         <label className="field-label">发言策略<select value={form.participation} onChange={(event) => setForm({ ...form, participation: event.target.value })}><option value="always">每条消息都路由</option><option value="relevant">职责相关时发言</option><option value="review">存在风险或需复核时发言</option><option value="knowledge">需要资料与知识时发言</option></select></label>
-        <div className="drawer-security"><ShieldCheck size={20} /><span>模型可以建议操作，但写入命令必须经过项目执行闸门。</span></div>
-        <div className="drawer-actions"><button className="secondary-button" type="button" onClick={onClose}>取消</button><button className="primary-button" type="button" onClick={() => onSave(form)}>保存配置</button></div>
+        <label className="field-label">绑定对话<select value={form.threadBinding === "existing" && form.boundThreadId ? form.boundThreadId : "auto"} onChange={(event) => setForm({ ...form, threadBinding: event.target.value === "auto" ? "auto" : "existing", boundThreadId: event.target.value === "auto" ? null : event.target.value })}><option value="auto">自动创建独立对话（默认）</option>{bindingThreads.map((thread) => <option key={thread.id} value={thread.id}>{thread.title}</option>)}</select><small>默认会为此成员在当前项目创建独立 Codex 对话；选择历史对话后只复用这一条，不会向其他历史对话群发。</small></label>
+        <label className="field-label">成员提示词<textarea rows={7} value={form.systemPrompt || createSafeMemberPrompt(form)} onChange={(event) => { setPromptEdited(true); setForm({ ...form, systemPrompt: event.target.value }); }} /><small>提示词会作为这个成员后续 Codex turn 的开发者指令传入；它只保存于当前项目房间。</small></label>
+        <div className="drawer-security"><ShieldCheck size={20} /><span>模型可以建议操作，但写入命令必须经过项目执行闸门；成员不能跨项目读取或转发上下文。</span></div>
+        <div className="drawer-actions"><button className="secondary-button" type="button" onClick={onClose}>取消</button><button className="primary-button" type="button" onClick={() => onSave({ ...form, systemPrompt: (form.systemPrompt || createSafeMemberPrompt(form)).trim() || createSafeMemberPrompt(form) })}>{isNew ? "添加成员" : "保存配置"}</button></div>
       </aside>
     </div>
   );
@@ -675,6 +737,7 @@ export function App() {
   const [projectsLoading, setProjectsLoading] = useState(false);
   const [projectsError, setProjectsError] = useState("");
   const [openAgentId, setOpenAgentId] = useState(null);
+  const [newMember, setNewMember] = useState(null);
   const [inspectedCommandId, setInspectedCommandId] = useState(null);
   const [history, setHistory] = useState(null);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -686,11 +749,13 @@ export function App() {
 
   const activeRoom = state.rooms.find((room) => room.id === state.activeRoomId) || state.rooms[0];
   const threads = state.threadCache[activeRoom.id] || DEFAULT_THREADS;
+  const agents = state.agentsByRoom?.[activeRoom.id] || [];
+  const writeLock = state.writeLocksByRoom?.[activeRoom.id] || null;
   const activeThread = threads.find((thread) => thread.id === activeThreadId) || threads[0];
   const messages = state.messagesByRoom[activeRoom.id] || [];
   const commands = state.commandsByRoom[activeRoom.id] || [];
   const knowledge = state.knowledgeByRoom[activeRoom.id] || [];
-  const openAgent = state.agents.find((agent) => agent.id === openAgentId) || null;
+  const openAgent = newMember || agents.find((agent) => agent.id === openAgentId) || null;
   const inspectedCommand = commands.find((command) => command.id === inspectedCommandId) || null;
   const connectedPaths = useMemo(() => new Set(state.rooms.map((room) => room.path.toLowerCase())), [state.rooms]);
   const realRuntimeActive = Boolean(runtime?.connected && runtime.cwd?.toLowerCase() === activeRoom.path.toLowerCase());
@@ -754,25 +819,27 @@ export function App() {
         setState((current) => {
           let next = current;
           for (const event of data.events) {
+            const roomId = event.roomId && next.rooms.some((room) => room.id === event.roomId) ? event.roomId : null;
+            if (!roomId) continue;
             if (event.type === "agentThreadBound") {
-              next = { ...next, agents: next.agents.map((agent) => agent.id === event.agentId ? { ...agent, runtimeThreadId: event.threadId } : agent) };
+              next = { ...next, agentsByRoom: { ...next.agentsByRoom, [roomId]: (next.agentsByRoom?.[roomId] || []).map((agent) => agent.id === event.agentId ? { ...agent, boundThreadId: event.threadId, threadBinding: event.bindingMode || agent.threadBinding || "auto" } : agent) } };
             }
             if (event.type === "agentMessage" && event.text) {
-              next = { ...next, messagesByRoom: { ...next.messagesByRoom, [activeRoom.id]: [...(next.messagesByRoom[activeRoom.id] || []), { id: `runtime-message-${event.sequence}`, kind: "agent", agentId: event.agentId, time: nowLabel(), text: event.text }] } };
+              next = { ...next, messagesByRoom: { ...next.messagesByRoom, [roomId]: [...(next.messagesByRoom[roomId] || []), { id: `runtime-message-${event.sequence}`, kind: "agent", agentId: event.agentId, time: nowLabel(), text: event.text }] } };
             }
             if (event.type === "approvalRequested") {
               const commandId = `runtime-command-${event.requestId}`;
-              const existing = next.commandsByRoom[activeRoom.id] || [];
+              const existing = next.commandsByRoom[roomId] || [];
               if (!existing.some((command) => command.id === commandId)) {
                 const command = { id: commandId, source: "runtime", runtimeRequestId: event.requestId, agentId: event.agentId, title: "Codex 请求受控执行", command: event.command, summary: "来自真实 App Server 线程，等待一次性审批。", target: event.cwd, impact: "可能写入项目", risk: "中", status: "pending", time: nowLabel() };
-                next = { ...next, commandsByRoom: { ...next.commandsByRoom, [activeRoom.id]: [...existing, command] } };
+                next = { ...next, commandsByRoom: { ...next.commandsByRoom, [roomId]: [...existing, command] } };
               }
             }
             if (event.type === "approvalResolved") {
-              next = { ...next, commandsByRoom: { ...next.commandsByRoom, [activeRoom.id]: (next.commandsByRoom[activeRoom.id] || []).map((command) => command.runtimeRequestId === event.requestId ? { ...command, status: event.decision === "accept" ? "approved" : "denied" } : command) } };
+              next = { ...next, commandsByRoom: { ...next.commandsByRoom, [roomId]: (next.commandsByRoom[roomId] || []).map((command) => command.runtimeRequestId === event.requestId ? { ...command, status: event.decision === "accept" ? "approved" : "denied" } : command) } };
             }
             if (event.type === "writeItemCompleted") {
-              next = { ...next, writeLock: null, commandsByRoom: { ...next.commandsByRoom, [activeRoom.id]: (next.commandsByRoom[activeRoom.id] || []).map((command) => command.source === "runtime" && command.agentId === event.agentId && command.status === "approved" ? { ...command, status: "completed" } : command) } };
+              next = { ...next, writeLocksByRoom: { ...next.writeLocksByRoom, [roomId]: null }, commandsByRoom: { ...next.commandsByRoom, [roomId]: (next.commandsByRoom[roomId] || []).map((command) => command.source === "runtime" && command.agentId === event.agentId && command.status === "approved" ? { ...command, status: "completed" } : command) } };
             }
           }
           return next;
@@ -784,7 +851,7 @@ export function App() {
     poll();
     const interval = window.setInterval(poll, 800);
     return () => { cancelled = true; window.clearInterval(interval); };
-  }, [runtime?.connected, activeRoom.id]);
+  }, [runtime?.connected]);
   useEffect(() => {
     if (!privateCloud) return undefined;
     let cancelled = false;
@@ -799,25 +866,27 @@ export function App() {
           let next = current;
           for (const event of data.events) {
             const payload = event.payload || {};
+            const roomId = payload.roomId && next.rooms.some((room) => room.id === payload.roomId) ? payload.roomId : null;
+            if (!roomId) continue;
             if (event.event_type === "agentThreadBound") {
-              next = { ...next, agents: next.agents.map((agent) => agent.id === payload.agentId ? { ...agent, runtimeThreadId: payload.threadId } : agent) };
+              next = { ...next, agentsByRoom: { ...next.agentsByRoom, [roomId]: (next.agentsByRoom?.[roomId] || []).map((agent) => agent.id === payload.agentId ? { ...agent, boundThreadId: payload.threadId, threadBinding: payload.bindingMode || agent.threadBinding || "auto" } : agent) } };
             }
             if (event.event_type === "agentMessage" && payload.text) {
-              next = { ...next, messagesByRoom: { ...next.messagesByRoom, [activeRoom.id]: [...(next.messagesByRoom[activeRoom.id] || []), { id: `remote-message-${event.sequence}`, kind: "agent", agentId: payload.agentId, time: nowLabel(), text: payload.text }] } };
+              next = { ...next, messagesByRoom: { ...next.messagesByRoom, [roomId]: [...(next.messagesByRoom[roomId] || []), { id: `remote-message-${event.sequence}`, kind: "agent", agentId: payload.agentId, time: nowLabel(), text: payload.text }] } };
             }
             if (event.event_type === "approvalRequested") {
               const commandId = `remote-command-${payload.requestId}`;
-              const existing = next.commandsByRoom[activeRoom.id] || [];
+              const existing = next.commandsByRoom[roomId] || [];
               if (!existing.some((command) => command.id === commandId)) {
                 const command = { id: commandId, source: "remote", runtimeRequestId: payload.requestId, agentId: payload.agentId, title: "Codex 请求受控执行", command: payload.command, summary: "来自已配对电脑的真实 Codex，等待一次性审批。", target: payload.target || "已配对项目", impact: "可能写入项目", risk: "中", status: "pending", time: nowLabel() };
-                next = { ...next, commandsByRoom: { ...next.commandsByRoom, [activeRoom.id]: [...existing, command] } };
+                next = { ...next, commandsByRoom: { ...next.commandsByRoom, [roomId]: [...existing, command] } };
               }
             }
             if (event.event_type === "approvalResolved") {
-              next = { ...next, commandsByRoom: { ...next.commandsByRoom, [activeRoom.id]: (next.commandsByRoom[activeRoom.id] || []).map((command) => String(command.runtimeRequestId) === String(payload.requestId) ? { ...command, status: payload.decision === "accept" ? "approved" : "denied" } : command) } };
+              next = { ...next, commandsByRoom: { ...next.commandsByRoom, [roomId]: (next.commandsByRoom[roomId] || []).map((command) => String(command.runtimeRequestId) === String(payload.requestId) ? { ...command, status: payload.decision === "accept" ? "approved" : "denied" } : command) } };
             }
             if (event.event_type === "writeItemCompleted") {
-              next = { ...next, writeLock: null, commandsByRoom: { ...next.commandsByRoom, [activeRoom.id]: (next.commandsByRoom[activeRoom.id] || []).map((command) => command.source === "remote" && command.agentId === payload.agentId && command.status === "approved" ? { ...command, status: "completed" } : command) } };
+              next = { ...next, writeLocksByRoom: { ...next.writeLocksByRoom, [roomId]: null }, commandsByRoom: { ...next.commandsByRoom, [roomId]: (next.commandsByRoom[roomId] || []).map((command) => command.source === "remote" && command.agentId === payload.agentId && command.status === "approved" ? { ...command, status: "completed" } : command) } };
             }
           }
           return next;
@@ -829,7 +898,7 @@ export function App() {
     poll();
     const interval = window.setInterval(poll, 1_200);
     return () => { cancelled = true; window.clearInterval(interval); };
-  }, [privateCloud, activeRoom.id]);
+  }, [privateCloud]);
 
   const updateRoomThreads = (roomId, nextThreads) => {
     setState((current) => ({ ...current, threadCache: { ...current.threadCache, [roomId]: nextThreads } }));
@@ -846,7 +915,7 @@ export function App() {
         data = await response.json();
       }
       const nextThreads = [
-        { id: "global", title: "项目全局对话", time: "现在", kind: "room" },
+        { id: "global", title: "团队调度台", time: "现在", kind: "room" },
         ...data.threads.map((thread) => ({ ...thread, time: formatRelativeDate(thread.updatedAt), kind: "codex" })),
       ];
       updateRoomThreads(room.id, nextThreads);
@@ -856,10 +925,11 @@ export function App() {
   };
 
   useEffect(() => {
-    if (!bridge?.ok || !activeRoom || autoLoadedRooms.current.has(activeRoom.id)) return;
+    const localIndexReady = bridge?.ok || (privateCloud && pairing?.online);
+    if (!localIndexReady || !activeRoom || autoLoadedRooms.current.has(activeRoom.id)) return;
     autoLoadedRooms.current.add(activeRoom.id);
     fetchThreads(activeRoom);
-  }, [bridge?.ok, activeRoom?.id]);
+  }, [bridge?.ok, privateCloud, pairing?.online, activeRoom?.id]);
 
   const selectRoom = (roomId) => {
     const room = state.rooms.find((item) => item.id === roomId);
@@ -867,6 +937,8 @@ export function App() {
     setActiveView("chat");
     setActiveThreadId("global");
     setHistory(null);
+    setOpenAgentId(null);
+    setNewMember(null);
     if (room) fetchThreads(room);
   };
 
@@ -905,7 +977,13 @@ export function App() {
         if (!response.ok) throw new Error("本地索引暂不可用");
         data = await response.json();
       }
-      setProjects(data.projects || []);
+      const nextProjects = (data.projects || []).map((project) => ({ ...project, name: projectDisplayName(project) }));
+      setProjects(nextProjects);
+      const namesByPath = new Map(nextProjects.map((project) => [project.path.toLowerCase(), project.name]));
+      setState((current) => ({
+        ...current,
+        rooms: current.rooms.map((room) => namesByPath.has(room.path.toLowerCase()) ? { ...room, name: namesByPath.get(room.path.toLowerCase()) } : room),
+      }));
     } catch (error) {
       setProjectsError(error instanceof Error ? error.message : "扫描失败");
     } finally {
@@ -920,7 +998,7 @@ export function App() {
 
   const attachProject = (project) => {
     const roomId = `room-${Date.now()}`;
-    const room = { id: roomId, name: project.name, path: project.path, source: "codex-index", connected: true };
+    const room = { id: roomId, name: projectDisplayName(project), path: project.path, source: "codex-index", connected: true };
     setState((current) => ({
       ...current,
       rooms: [...current.rooms, room],
@@ -928,16 +1006,50 @@ export function App() {
       messagesByRoom: { ...current.messagesByRoom, [roomId]: [{ id: `welcome-${roomId}`, kind: "system", time: nowLabel(), text: `已以只读方式接入 ${project.name}，发现 ${project.threadCount} 个历史对话` }] },
       commandsByRoom: { ...current.commandsByRoom, [roomId]: [] },
       knowledgeByRoom: { ...current.knowledgeByRoom, [roomId]: [] },
-      threadCache: { ...current.threadCache, [roomId]: [{ id: "global", title: "项目全局对话", time: "现在", kind: "room" }] },
+      threadCache: { ...current.threadCache, [roomId]: [{ id: "global", title: "团队调度台", time: "现在", kind: "room" }] },
+      agentsByRoom: { ...current.agentsByRoom, [roomId]: createRoomAgents() },
+      writeLocksByRoom: { ...current.writeLocksByRoom, [roomId]: null },
     }));
     setActiveView("chat");
     setActiveThreadId("global");
     setImportOpen(false);
     fetchThreads(room);
-    setToast(`已接入 ${project.name}`);
+    setToast(`已接入 ${room.name}`);
+  };
+
+  const removeRoom = (room) => {
+    const confirmed = window.confirm(`只从 Team Room 移除“${room.name}”？\n\n电脑里的项目文件和 Codex 历史对话都不会被删除。`);
+    if (!confirmed) return;
+    setState((current) => {
+      const remainingRooms = current.rooms.filter((item) => item.id !== room.id);
+      const nextRoomId = current.activeRoomId === room.id ? remainingRooms[0]?.id : current.activeRoomId;
+      const messagesByRoom = { ...current.messagesByRoom };
+      const commandsByRoom = { ...current.commandsByRoom };
+      const knowledgeByRoom = { ...current.knowledgeByRoom };
+      const threadCache = { ...current.threadCache };
+      const agentsByRoom = { ...current.agentsByRoom };
+      const writeLocksByRoom = { ...current.writeLocksByRoom };
+      delete messagesByRoom[room.id];
+      delete commandsByRoom[room.id];
+      delete knowledgeByRoom[room.id];
+      delete threadCache[room.id];
+      delete agentsByRoom[room.id];
+      delete writeLocksByRoom[room.id];
+      return { ...current, rooms: remainingRooms, activeRoomId: nextRoomId, messagesByRoom, commandsByRoom, knowledgeByRoom, threadCache, agentsByRoom, writeLocksByRoom };
+    });
+    setActiveView("chat");
+    setActiveThreadId("global");
+    setHistory(null);
+    setOpenAgentId(null);
+    setNewMember(null);
+    setToast(`已从 Team Room 移除 ${room.name}`);
   };
 
   const connectRuntime = async () => {
+    if (!agents.length) {
+      setToast("请先为当前项目新增至少一位成员");
+      return;
+    }
     if (!runtime?.available) {
       setToast("未找到可独立启动的 Codex CLI");
       return;
@@ -946,7 +1058,7 @@ export function App() {
     if (!confirmed) return;
     try {
       runtimeEventCursor.current = 0;
-      const status = await postJson("/api/runtime/connect", { confirmed: true, cwd: activeRoom.path, agents: state.agents });
+      const status = await postJson("/api/runtime/connect", { confirmed: true, cwd: activeRoom.path, roomId: activeRoom.id, agents });
       setRuntime(status);
       setToast("真实成员运行时已连接");
     } catch (error) {
@@ -958,7 +1070,7 @@ export function App() {
     try {
       const status = await postJson("/api/runtime/disconnect", {});
       setRuntime(status);
-      setState((current) => ({ ...current, writeLock: null }));
+      setState((current) => ({ ...current, writeLocksByRoom: { ...current.writeLocksByRoom, [activeRoom.id]: null } }));
       setToast("已断开真实运行时，回到安全模拟");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "断开失败");
@@ -968,14 +1080,18 @@ export function App() {
   const sendMessage = () => {
     const text = draft.trim();
     if (!text) return;
-    const decisions = decideParticipation(text, state.agents);
+    if (!agents.length) {
+      setToast("当前项目没有成员；请先在成员配置中新增成员");
+      return;
+    }
+    const decisions = decideParticipation(text, agents);
     const userMessage = { id: `user-${Date.now()}`, kind: "user", time: nowLabel(), text };
-    const silentNames = decisions.filter((item) => item.decision === "silent").map((item) => state.agents.find((agent) => agent.id === item.agentId)?.name).filter(Boolean);
+    const silentNames = decisions.filter((item) => item.decision === "silent").map((item) => agents.find((agent) => agent.id === item.agentId)?.name).filter(Boolean);
 
     setDraft("");
     setState((current) => ({
       ...current,
-      agents: current.agents.map((agent) => ({ ...agent, status: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "thinking" : "silent", statusLabel: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "判断中" : "静默中" })),
+      agentsByRoom: { ...current.agentsByRoom, [activeRoom.id]: (current.agentsByRoom?.[activeRoom.id] || []).map((agent) => ({ ...agent, status: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "thinking" : "silent", statusLabel: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "判断中" : "静默中" })) },
       messagesByRoom: {
         ...current.messagesByRoom,
         [activeRoom.id]: [
@@ -991,7 +1107,7 @@ export function App() {
         setToast("这台私人站点还没有和电脑配对");
         return;
       }
-      postJson("/api/remote/tasks", { text, decisions, agents: state.agents, roomId: activeRoom.id, messageId: userMessage.id, cwd: activeRoom.path })
+      postJson("/api/remote/tasks", { text, decisions, agents, roomId: activeRoom.id, messageId: userMessage.id, cwd: activeRoom.path })
         .then(() => {
           setState((current) => ({
             ...current,
@@ -1000,7 +1116,7 @@ export function App() {
         })
         .catch((error) => setToast(error instanceof Error ? error.message : "发送到配对电脑失败"));
     } else if (realRuntimeActive) {
-      postJson("/api/runtime/dispatch", { text, decisions, messageId: userMessage.id })
+      postJson("/api/runtime/dispatch", { text, decisions, messageId: userMessage.id, roomId: activeRoom.id })
         .then((result) => {
           setState((current) => ({
             ...current,
@@ -1013,13 +1129,13 @@ export function App() {
         const speakers = decisions.filter((item) => item.decision === "speak");
         setState((current) => ({
           ...current,
-          agents: current.agents.map((agent) => ({ ...agent, status: speakers.some((item) => item.agentId === agent.id) ? "active" : "silent", statusLabel: speakers.some((item) => item.agentId === agent.id) ? "活跃中" : "静默中" })),
+          agentsByRoom: { ...current.agentsByRoom, [activeRoom.id]: (current.agentsByRoom?.[activeRoom.id] || []).map((agent) => ({ ...agent, status: speakers.some((item) => item.agentId === agent.id) ? "active" : "silent", statusLabel: speakers.some((item) => item.agentId === agent.id) ? "活跃中" : "静默中" })) },
           messagesByRoom: {
             ...current.messagesByRoom,
             [activeRoom.id]: [
               ...(current.messagesByRoom[activeRoom.id] || []),
               ...speakers.map((decision, index) => {
-                const agent = current.agents.find((item) => item.id === decision.agentId);
+                const agent = (current.agentsByRoom?.[activeRoom.id] || []).find((item) => item.id === decision.agentId);
                 return { id: `reply-${Date.now()}-${index}`, kind: "agent", agentId: agent.id, time: nowLabel(), text: createAgentReply(agent, text) };
               }),
             ],
@@ -1027,7 +1143,8 @@ export function App() {
         }));
       }, 650);
 
-      if (executionMode && shouldRequestCommand(text, decisions)) {
+      const commandAgent = commandRequestingAgent(decisions, agents);
+      if (executionMode && commandAgent && shouldRequestCommand(text, decisions, agents)) {
         window.setTimeout(() => {
           setState((current) => ({
             ...current,
@@ -1035,7 +1152,7 @@ export function App() {
               ...current.commandsByRoom,
               [activeRoom.id]: [
                 ...(current.commandsByRoom[activeRoom.id] || []),
-                { id: `command-${Date.now()}`, agentId: "developer", title: "为当前任务准备受控执行", command: "codex-team-room task run --approval once", summary: "开发成员已完成影响评估，等待你授予一次性写入权限。", target: activeRoom.path, impact: "待审批", risk: "中", status: "pending", time: nowLabel() },
+                { id: `command-${Date.now()}`, agentId: commandAgent.id, title: `由${commandAgent.name}准备受控执行`, command: "codex-team-room task run --approval once", summary: `${commandAgent.name}已完成影响评估，等待你授予一次性写入权限。`, target: activeRoom.path, impact: "待审批", risk: "中", status: "pending", time: nowLabel() },
               ],
             },
           }));
@@ -1055,7 +1172,7 @@ export function App() {
   };
 
   const approveCommand = async (command) => {
-    if (state.writeLock && state.writeLock.agentId !== command.agentId) {
+    if (writeLock && writeLock.agentId !== command.agentId) {
       setToast("已有成员持有写入锁，请先完成当前操作");
       return;
     }
@@ -1069,7 +1186,7 @@ export function App() {
     }
     setState((current) => ({
       ...current,
-      writeLock: { agentId: command.agentId, commandId: command.id, acquiredAt: new Date().toISOString() },
+      writeLocksByRoom: { ...current.writeLocksByRoom, [activeRoom.id]: { agentId: command.agentId, commandId: command.id, acquiredAt: new Date().toISOString() } },
       commandsByRoom: { ...current.commandsByRoom, [activeRoom.id]: (current.commandsByRoom[activeRoom.id] || []).map((item) => item.id === command.id ? { ...item, status: "approved" } : item) },
       messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `approved-${Date.now()}`, kind: "system", time: nowLabel(), text: "已授予开发一次性写入权限，并锁定项目写入权" }] },
     }));
@@ -1092,7 +1209,7 @@ export function App() {
   const completeCommand = (command) => {
     setState((current) => ({
       ...current,
-      writeLock: current.writeLock?.commandId === command.id ? null : current.writeLock,
+      writeLocksByRoom: { ...current.writeLocksByRoom, [activeRoom.id]: current.writeLocksByRoom?.[activeRoom.id]?.commandId === command.id ? null : current.writeLocksByRoom?.[activeRoom.id] || null },
       commandsByRoom: { ...current.commandsByRoom, [activeRoom.id]: (current.commandsByRoom[activeRoom.id] || []).map((item) => item.id === command.id ? { ...item, status: "completed" } : item) },
       messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `completed-${Date.now()}`, kind: "agent", agentId: command.agentId, time: nowLabel(), text: "受控操作已经完成，写入锁已释放，等待审核复核。" }] },
     }));
@@ -1100,9 +1217,59 @@ export function App() {
   };
 
   const saveAgent = (nextAgent) => {
-    setState((current) => ({ ...current, agents: current.agents.map((agent) => agent.id === nextAgent.id ? nextAgent : agent) }));
+    if (realRuntimeActive) {
+      setToast("请先断开真实成员运行时，再修改当前项目成员配置");
+      return;
+    }
+    const normalized = {
+      ...nextAgent,
+      name: nextAgent.name.trim() || "未命名成员",
+      role: nextAgent.role.trim() || "项目协作者",
+      systemPrompt: String(nextAgent.systemPrompt || createSafeMemberPrompt(nextAgent)).trim().slice(0, 12_000) || createSafeMemberPrompt(nextAgent),
+    };
+    if (normalized.threadBinding === "existing" && !threads.some((thread) => thread.kind === "codex" && thread.id === normalized.boundThreadId)) {
+      setToast("只能绑定当前项目列表中的已有对话；请刷新后重新选择");
+      return;
+    }
+    setState((current) => ({
+      ...current,
+      agentsByRoom: {
+        ...current.agentsByRoom,
+        [activeRoom.id]: newMember?.id === normalized.id
+          ? addRoomMember(current.agentsByRoom?.[activeRoom.id], normalized)
+          : replaceRoomMember(current.agentsByRoom?.[activeRoom.id], normalized),
+      },
+    }));
     setOpenAgentId(null);
-    setToast(`${nextAgent.name}配置已保存`);
+    setNewMember(null);
+    setToast(newMember?.id === normalized.id ? `${normalized.name}已加入当前项目` : `${normalized.name}配置已保存`);
+  };
+
+  const addMember = () => {
+    if (realRuntimeActive) {
+      setToast("请先断开真实成员运行时，再新增当前项目成员");
+      return;
+    }
+    setOpenAgentId(null);
+    setNewMember(createProjectMember());
+  };
+
+  const removeAgent = (agent) => {
+    if (realRuntimeActive) {
+      setToast("请先断开真实成员运行时，再移除当前项目成员");
+      return;
+    }
+    const confirmed = window.confirm(`只从“${activeRoom.name}”移除成员“${agent.name}”？\n\n不会删除任何 Codex 对话、项目文件或其他项目的成员配置。`);
+    if (!confirmed) return;
+    setState((current) => ({
+      ...current,
+      agentsByRoom: { ...current.agentsByRoom, [activeRoom.id]: removeRoomMember(current.agentsByRoom?.[activeRoom.id], agent.id) },
+      writeLocksByRoom: current.writeLocksByRoom?.[activeRoom.id]?.agentId === agent.id
+        ? { ...current.writeLocksByRoom, [activeRoom.id]: null }
+        : current.writeLocksByRoom,
+    }));
+    if (openAgentId === agent.id) setOpenAgentId(null);
+    setToast(`${agent.name}已从当前项目移除`);
   };
 
   const addKnowledge = (form) => {
@@ -1153,15 +1320,15 @@ export function App() {
 
   const renderCenter = () => {
     if (activeView === "knowledge") return <KnowledgeView entries={knowledge} onAdd={addKnowledge} />;
-    if (activeView === "agents") return <AgentSettingsView agents={state.agents} onOpenAgent={setOpenAgentId} />;
+    if (activeView === "agents") return <AgentSettingsView agents={agents} onOpenAgent={(agentId) => { setNewMember(null); setOpenAgentId(agentId); }} onAddMember={addMember} onRemoveAgent={removeAgent} />;
     if (activeView === "settings") return <SettingsView bridge={bridge} pairing={pairing} runtime={runtime} rooms={state.rooms} onConnectRuntime={connectRuntime} onDisconnectRuntime={disconnectRuntime} onExport={exportConfig} onReset={resetPrototype} />;
     if (activeThreadId !== "global") return <HistoryView history={history} loading={historyLoading} error={historyError} onAttach={attachHistory} />;
     return (
       <ChatView
         messages={messages}
         commands={commands}
-        agents={state.agents}
-        writeLock={state.writeLock}
+        agents={agents}
+        writeLock={writeLock}
         draft={draft}
         executionMode={executionMode}
         onDraftChange={setDraft}
@@ -1188,17 +1355,18 @@ export function App() {
         onSelectRoom={selectRoom}
         onSelectThread={selectThread}
         onOpenImport={openImport}
+        onRemoveRoom={removeRoom}
         onSelectView={(view) => { setActiveView(view); setHistory(null); }}
       />
       <main className="main-panel">
-        <RoomHeader room={activeRoom} activeView={activeView} activeThread={activeThread} />
+        <RoomHeader room={activeRoom} rooms={state.rooms} activeView={activeView} activeThread={activeThread} onSelectRoom={selectRoom} />
         <div className="main-content">{renderCenter()}</div>
       </main>
-      {activeView === "chat" && activeThreadId === "global" ? <AgentRoster agents={state.agents} onOpenAgent={setOpenAgentId} /> : null}
+      {activeView === "chat" && activeThreadId === "global" ? <AgentRoster agents={agents} onOpenAgent={(agentId) => { setNewMember(null); setOpenAgentId(agentId); }} /> : null}
 
       {importOpen ? <ImportProjectModal projects={projects} loading={projectsLoading} error={projectsError} connectedPaths={connectedPaths} onClose={() => setImportOpen(false)} onRefresh={loadProjects} onAttach={attachProject} /> : null}
-      {openAgent ? <AgentDrawer agent={openAgent} onClose={() => setOpenAgentId(null)} onSave={saveAgent} /> : null}
-      {inspectedCommand ? <CommandModal command={inspectedCommand} agent={state.agents.find((agent) => agent.id === inspectedCommand.agentId)} onClose={() => setInspectedCommandId(null)} /> : null}
+      {openAgent ? <AgentDrawer agent={openAgent} bindingThreads={threads.filter((thread) => thread.kind === "codex")} isNew={Boolean(newMember)} onClose={() => { setOpenAgentId(null); setNewMember(null); }} onSave={saveAgent} /> : null}
+      {inspectedCommand ? <CommandModal command={inspectedCommand} agent={agents.find((agent) => agent.id === inspectedCommand.agentId)} onClose={() => setInspectedCommandId(null)} /> : null}
       <Toast message={toast} />
     </div>
   );

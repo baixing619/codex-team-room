@@ -5,6 +5,8 @@ const JSON_HEADERS = {
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_INDEX_RESULT_BYTES = 1024 * 1024;
 const ONLINE_WINDOW_MS = 30_000;
+const CLAIM_LEASE_SECONDS = 30;
+const DEVICE_CLAIM_TABLES = new Set(["remote_tasks", "remote_approvals", "remote_index_requests"]);
 const ALLOWED_APPROVAL_DECISIONS = new Set(["accept", "decline"]);
 const ALLOWED_INDEX_REQUESTS = new Set(["projects", "threads", "messages"]);
 
@@ -149,7 +151,13 @@ async function handleOwnerApi(request, env, url) {
   return json({ error: "not_found" }, 404);
 }
 
+async function reclaimExpiredClaim(env, table) {
+  if (!DEVICE_CLAIM_TABLES.has(table)) throw new Error("invalid_claim_table");
+  await env.DB.prepare(`UPDATE ${table} SET status = 'pending', claimed_at = NULL, error = 'device_request_lease_expired' WHERE status = 'claimed' AND claimed_at < datetime('now', '-${CLAIM_LEASE_SECONDS} seconds')`).run();
+}
+
 async function claimNext(env, table, selectColumns) {
+  await reclaimExpiredClaim(env, table);
   const row = await env.DB.prepare(`SELECT ${selectColumns} FROM ${table} WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1`).first();
   if (!row) return null;
   const result = await env.DB.prepare(`UPDATE ${table} SET status = 'claimed', claimed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'`).bind(row.id).run();

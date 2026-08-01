@@ -147,6 +147,79 @@ test("relays an owner index request through the authenticated paired device", as
   assert.equal(statusBody.indexRequest.result.projects[0].name, "现有项目");
 });
 
+test("reclaims an expired device index claim so a retry is not stuck forever", async () => {
+  const statements = [];
+  const env = {
+    TEAM_ROOM_DEVICE_SECRET: "device-secret",
+    DB: {
+      batch: async () => [],
+      prepare(sql) {
+        let values = [];
+        return {
+          bind(...next) { values = next; return this; },
+          async run() {
+            statements.push({ sql, values });
+            if (sql.startsWith("UPDATE remote_index_requests SET status = 'claimed'")) return { meta: { changes: 1 } };
+            return { meta: { changes: 0 } };
+          },
+          async first() {
+            if (sql.includes("FROM remote_index_requests WHERE status = 'pending'")) {
+              return { id: "expired-index-1", request_type: "messages", request_json: JSON.stringify({ threadId: "thread-1" }), created_at: "2026-08-01 00:00:00" };
+            }
+            return null;
+          },
+        };
+      },
+    },
+  };
+
+  const response = await worker.fetch(new Request("https://example.test/api/device/index-requests", {
+    headers: { "x-team-room-device-secret": "device-secret" },
+  }), env);
+
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).indexRequest.id, "expired-index-1");
+  assert.ok(statements.some(({ sql }) => sql.includes("device_request_lease_expired")));
+});
+
+test("reclaims expired task and approval claims before returning them to the device", async () => {
+  for (const scenario of [
+    { table: "remote_tasks", pathname: "/api/device/tasks", property: "task", row: { id: "expired-task-1", room_id: "room-1", message_id: "message-1", cwd: "G:\\project", text: "继续", decisions_json: "[]", agents_json: "[]", created_at: "2026-08-01 00:00:00" } },
+    { table: "remote_approvals", pathname: "/api/device/approvals", property: "approval", row: { id: "expired-approval-1", request_id: "42", decision: "accept", created_at: "2026-08-01 00:00:00" } },
+  ]) {
+    const statements = [];
+    const env = {
+      TEAM_ROOM_DEVICE_SECRET: "device-secret",
+      DB: {
+        batch: async () => [],
+        prepare(sql) {
+          let values = [];
+          return {
+            bind(...next) { values = next; return this; },
+            async run() {
+              statements.push({ sql, values });
+              if (sql.startsWith(`UPDATE ${scenario.table} SET status = 'claimed'`)) return { meta: { changes: 1 } };
+              return { meta: { changes: 0 } };
+            },
+            async first() {
+              if (sql.includes(`FROM ${scenario.table} WHERE status = 'pending'`)) return scenario.row;
+              return null;
+            },
+          };
+        },
+      },
+    };
+
+    const response = await worker.fetch(new Request(`https://example.test${scenario.pathname}`, {
+      headers: { "x-team-room-device-secret": "device-secret" },
+    }), env);
+
+    assert.equal(response.status, 200);
+    assert.equal((await response.json())[scenario.property].id, scenario.row.id);
+    assert.ok(statements.some(({ sql }) => sql.startsWith(`UPDATE ${scenario.table} SET status = 'pending'`)));
+  }
+});
+
 test("keeps every source input required by Sites packaging", async () => {
   await access(new URL("../index.html", import.meta.url));
   await access(new URL("../worker/index.js", import.meta.url));
