@@ -1,6 +1,7 @@
 import { listProjects, listThreads, localBridgeStatus, readVisibleMessages } from "./codexSessionIndex.mjs";
 import { getCodexRuntimeStatus } from "./codexAppServerRuntime.mjs";
 import { teamRoomRuntime } from "./teamRoomRuntimeManager.mjs";
+import { RemotePairingBridge } from "./remotePairingBridge.mjs";
 
 function sendJson(response, status, value) {
   response.statusCode = status;
@@ -25,6 +26,9 @@ export function codexBridgePlugin() {
   return {
     name: "codex-team-room-local-bridge",
     configureServer(server) {
+      const remotePairing = new RemotePairingBridge({ runtime: teamRoomRuntime });
+      remotePairing.start();
+      server.httpServer?.once("close", () => remotePairing.stop());
       server.middlewares.use((request, response, next) => {
         if (!request.url?.startsWith("/api/")) return next();
 
@@ -38,6 +42,9 @@ export function codexBridgePlugin() {
           }
           if (request.method === "GET" && url.pathname === "/api/runtime/status") {
             return sendJson(response, 200, teamRoomRuntime.status());
+          }
+          if (request.method === "GET" && url.pathname === "/api/pair/local-status") {
+            return sendJson(response, 200, remotePairing.status());
           }
           if (request.method === "GET" && url.pathname === "/api/runtime/events") {
             return sendJson(response, 200, { events: teamRoomRuntime.listEvents(Number(url.searchParams.get("after") || 0)) });

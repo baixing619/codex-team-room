@@ -39,7 +39,11 @@ export class TeamRoomRuntimeManager {
 
   async connect({ cwd, agents, confirmed }) {
     if (confirmed !== true) throw new Error("Real runtime connection requires explicit confirmation");
-    if (this.connection) return this.status();
+    if (this.connection) {
+      if (this.cwd !== cwd) throw new Error("A different project is already connected");
+      this.agentById = new Map(agents.map((agent) => [agent.id, agent]));
+      return this.status();
+    }
     const runtime = this.statusProvider();
     if (!runtime.available || !runtime.executable) throw new Error(runtime.reason || "Codex CLI is unavailable");
     this.cwd = cwd;

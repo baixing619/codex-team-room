@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const root = path.resolve(import.meta.dirname, "..");
-const excludedDirectories = new Set([".git", "node_modules", "dist", "work", "screenshots", "qa"]);
+const excludedDirectories = new Set([".git", ".team-room", "node_modules", "dist", "work", "screenshots", "qa"]);
 const forbiddenNames = new Set(["auth.json", "session_index.jsonl"]);
 const textExtensions = new Set([".js", ".jsx", ".mjs", ".json", ".md", ".html", ".css", ".txt", ".yml", ".yaml"]);
 const findings = [];

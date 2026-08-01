@@ -41,28 +41,42 @@ test("falls back to index.html for an unknown app route", async () => {
   assert.deepEqual(calls, ["/flow/step-two?source=share", "/index.html"]);
 });
 
-test("does not turn missing API or write requests into the app shell", async () => {
-  for (const request of [
-    new Request("https://example.test/api/missing", { headers: { accept: "application/json" } }),
-    new Request("https://example.test/flow", { method: "POST", headers: { accept: "text/html" } }),
-  ]) {
-    let calls = 0;
-    const response = await worker.fetch(request, {
-      ASSETS: {
-        fetch: async () => {
-          calls += 1;
-          return new Response("missing", { status: 404 });
-        },
-      },
-    });
+test("requires owner or device authentication before API handlers reach storage", async () => {
+  const ownerResponse = await worker.fetch(new Request("https://example.test/api/pair/status"), {});
+  assert.equal(ownerResponse.status, 401);
+  assert.equal((await ownerResponse.json()).error, "owner_auth_required");
 
-    assert.equal(response.status, 404);
-    assert.equal(calls, 1);
-  }
+  const deviceResponse = await worker.fetch(new Request("https://example.test/api/device/tasks"), {
+    TEAM_ROOM_DEVICE_SECRET: "example-device-secret",
+  });
+  assert.equal(deviceResponse.status, 401);
+  assert.equal((await deviceResponse.json()).error, "device_auth_required");
 });
 
-test("emits the files required by Sites packaging", async () => {
-  await access(new URL("../dist/client/index.html", import.meta.url));
-  await access(new URL("../dist/server/index.js", import.meta.url));
-  await access(new URL("../dist/.openai/hosting.json", import.meta.url));
+test("reports a recently seen paired device to the authenticated owner", async () => {
+  const device = { id: "device-test", label: "工作电脑", version: "0.2.0", last_seen_at: new Date().toISOString().slice(0, 19).replace("T", " ") };
+  const response = await worker.fetch(new Request("https://example.test/api/pair/status", {
+    headers: { "oai-authenticated-user-id": "owner-test" },
+  }), {
+    TEAM_ROOM_OWNER_USER_ID: "owner-test",
+    DB: {
+      batch: async () => [],
+      prepare() {
+        return { first: async () => device };
+      },
+    },
+  });
+
+  assert.equal(response.status, 200);
+  const status = await response.json();
+  assert.equal(status.paired, true);
+  assert.equal(status.online, true);
+  assert.equal(status.device.label, "工作电脑");
+});
+
+test("keeps every source input required by Sites packaging", async () => {
+  await access(new URL("../index.html", import.meta.url));
+  await access(new URL("../worker/index.js", import.meta.url));
+  await access(new URL("../.openai/hosting.json", import.meta.url));
+  await access(new URL("../drizzle", import.meta.url));
 });

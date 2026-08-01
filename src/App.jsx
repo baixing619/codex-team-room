@@ -88,20 +88,30 @@ function Sidebar({
   activeThreadId,
   activeView,
   bridge,
+  pairing,
   onSelectRoom,
   onSelectThread,
   onOpenImport,
   onSelectView,
 }) {
   const privateCloud = isPrivateCloudHost();
-  const connectionLabel = bridge?.ok ? "本地 · 已连接" : privateCloud ? "私人云端 · 本机未配对" : "本地 · 演示模式";
+  const pairedOnline = privateCloud && pairing?.online;
+  const connectionLabel = bridge?.ok
+    ? "本地 · 已连接"
+    : pairedOnline
+      ? `私人云端 · ${pairing.device?.label || "本机"}在线`
+      : privateCloud && pairing?.paired
+        ? "私人云端 · 本机离线"
+        : privateCloud
+          ? "私人云端 · 本机未配对"
+          : "本地 · 演示模式";
   return (
     <aside className="sidebar">
       <div className="brand-block">
         <div className="brand-name">Codex Team Room</div>
         <div className="connection-line">
           {connectionLabel}
-          <span className={classNames("status-dot", bridge?.ok ? "status-dot--green" : "status-dot--gray")} />
+          <span className={classNames("status-dot", (bridge?.ok || pairedOnline) ? "status-dot--green" : "status-dot--gray")} />
         </div>
       </div>
 
@@ -528,7 +538,7 @@ function AgentSettingsView({ agents, onOpenAgent }) {
   );
 }
 
-function SettingsView({ bridge, runtime, rooms, onConnectRuntime, onDisconnectRuntime, onExport, onReset }) {
+function SettingsView({ bridge, pairing, runtime, rooms, onConnectRuntime, onDisconnectRuntime, onExport, onReset }) {
   const privateCloud = isPrivateCloudHost();
   return (
     <div className="content-view">
@@ -537,7 +547,7 @@ function SettingsView({ bridge, runtime, rooms, onConnectRuntime, onDisconnectRu
         <section className="settings-block">
           <div className="settings-icon"><Database size={22} /></div>
           <div className="settings-copy"><h3>本地 Codex 索引</h3><p>默认只扫描会话元数据；只有你打开具体线程时，才读取该线程的可见消息。</p></div>
-          <div className={classNames("settings-state", bridge?.ok && "is-good")}>{bridge?.ok ? `${bridge.indexedThreads} 条会话` : privateCloud ? "等待本机配对" : "演示模式"}</div>
+          <div className={classNames("settings-state", (bridge?.ok || pairing?.online) && "is-good")}>{bridge?.ok ? `${bridge.indexedThreads} 条会话` : privateCloud ? pairing?.online ? `${pairing.device?.label || "本机"}在线` : pairing?.paired ? "本机离线" : "等待本机配对" : "演示模式"}</div>
         </section>
         <section className="settings-block">
           <div className="settings-icon"><FolderOpen size={22} /></div>
@@ -643,6 +653,7 @@ export function App() {
   const [executionMode, setExecutionMode] = useState(true);
   const [bridge, setBridge] = useState(null);
   const [runtime, setRuntime] = useState(null);
+  const [pairing, setPairing] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
   const [projects, setProjects] = useState([]);
   const [projectsLoading, setProjectsLoading] = useState(false);
@@ -655,6 +666,7 @@ export function App() {
   const [toast, setToast] = useState("");
   const autoLoadedRooms = useRef(new Set());
   const runtimeEventCursor = useRef(0);
+  const remoteEventCursor = useRef(0);
 
   const activeRoom = state.rooms.find((room) => room.id === state.activeRoomId) || state.rooms[0];
   const threads = state.threadCache[activeRoom.id] || DEFAULT_THREADS;
@@ -666,6 +678,7 @@ export function App() {
   const inspectedCommand = commands.find((command) => command.id === inspectedCommandId) || null;
   const connectedPaths = useMemo(() => new Set(state.rooms.map((room) => room.path.toLowerCase())), [state.rooms]);
   const realRuntimeActive = Boolean(runtime?.connected && runtime.cwd?.toLowerCase() === activeRoom.path.toLowerCase());
+  const privateCloud = isPrivateCloudHost();
 
   useEffect(() => saveState(state), [state]);
   useEffect(() => {
@@ -690,6 +703,23 @@ export function App() {
       .then(setRuntime)
       .catch(() => setRuntime({ available: false, reason: "静态演示模式" }));
   }, []);
+  useEffect(() => {
+    if (!privateCloud) return undefined;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const response = await fetch("/api/pair/status");
+        if (!response.ok) throw new Error("pairing unavailable");
+        const value = await response.json();
+        if (!cancelled) setPairing(value);
+      } catch {
+        if (!cancelled) setPairing({ paired: false, online: false });
+      }
+    };
+    poll();
+    const interval = window.setInterval(poll, 3_000);
+    return () => { cancelled = true; window.clearInterval(interval); };
+  }, [privateCloud]);
   useEffect(() => {
     if (!toast) return undefined;
     const timeout = window.setTimeout(() => setToast(""), 2600);
@@ -739,6 +769,51 @@ export function App() {
     const interval = window.setInterval(poll, 800);
     return () => { cancelled = true; window.clearInterval(interval); };
   }, [runtime?.connected, activeRoom.id]);
+  useEffect(() => {
+    if (!privateCloud) return undefined;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const response = await fetch(`/api/remote/events?after=${remoteEventCursor.current}`);
+        if (!response.ok) return;
+        const data = await response.json();
+        if (cancelled || !data.events?.length) return;
+        remoteEventCursor.current = data.events.at(-1).sequence;
+        setState((current) => {
+          let next = current;
+          for (const event of data.events) {
+            const payload = event.payload || {};
+            if (event.event_type === "agentThreadBound") {
+              next = { ...next, agents: next.agents.map((agent) => agent.id === payload.agentId ? { ...agent, runtimeThreadId: payload.threadId } : agent) };
+            }
+            if (event.event_type === "agentMessage" && payload.text) {
+              next = { ...next, messagesByRoom: { ...next.messagesByRoom, [activeRoom.id]: [...(next.messagesByRoom[activeRoom.id] || []), { id: `remote-message-${event.sequence}`, kind: "agent", agentId: payload.agentId, time: nowLabel(), text: payload.text }] } };
+            }
+            if (event.event_type === "approvalRequested") {
+              const commandId = `remote-command-${payload.requestId}`;
+              const existing = next.commandsByRoom[activeRoom.id] || [];
+              if (!existing.some((command) => command.id === commandId)) {
+                const command = { id: commandId, source: "remote", runtimeRequestId: payload.requestId, agentId: payload.agentId, title: "Codex 请求受控执行", command: payload.command, summary: "来自已配对电脑的真实 Codex，等待一次性审批。", target: payload.target || "已配对项目", impact: "可能写入项目", risk: "中", status: "pending", time: nowLabel() };
+                next = { ...next, commandsByRoom: { ...next.commandsByRoom, [activeRoom.id]: [...existing, command] } };
+              }
+            }
+            if (event.event_type === "approvalResolved") {
+              next = { ...next, commandsByRoom: { ...next.commandsByRoom, [activeRoom.id]: (next.commandsByRoom[activeRoom.id] || []).map((command) => String(command.runtimeRequestId) === String(payload.requestId) ? { ...command, status: payload.decision === "accept" ? "approved" : "denied" } : command) } };
+            }
+            if (event.event_type === "writeItemCompleted") {
+              next = { ...next, writeLock: null, commandsByRoom: { ...next.commandsByRoom, [activeRoom.id]: (next.commandsByRoom[activeRoom.id] || []).map((command) => command.source === "remote" && command.agentId === payload.agentId && command.status === "approved" ? { ...command, status: "completed" } : command) } };
+            }
+          }
+          return next;
+        });
+      } catch {
+        // Keep the last visible state while the paired computer or network is temporarily unavailable.
+      }
+    };
+    poll();
+    const interval = window.setInterval(poll, 1_200);
+    return () => { cancelled = true; window.clearInterval(interval); };
+  }, [privateCloud, activeRoom.id]);
 
   const updateRoomThreads = (roomId, nextThreads) => {
     setState((current) => ({ ...current, threadCache: { ...current.threadCache, [roomId]: nextThreads } }));
@@ -880,7 +955,20 @@ export function App() {
       },
     }));
 
-    if (realRuntimeActive) {
+    if (privateCloud) {
+      if (!pairing?.paired) {
+        setToast("这台私人站点还没有和电脑配对");
+        return;
+      }
+      postJson("/api/remote/tasks", { text, decisions, agents: state.agents, roomId: activeRoom.id, messageId: userMessage.id })
+        .then(() => {
+          setState((current) => ({
+            ...current,
+            messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `remote-dispatch-${Date.now()}`, kind: "system", time: nowLabel(), text: pairing.online ? "已安全发送到配对电脑" : "电脑当前离线，任务已在私人队列中等待" }] },
+          }));
+        })
+        .catch((error) => setToast(error instanceof Error ? error.message : "发送到配对电脑失败"));
+    } else if (realRuntimeActive) {
       postJson("/api/runtime/dispatch", { text, decisions, messageId: userMessage.id })
         .then((result) => {
           setState((current) => ({
@@ -940,9 +1028,9 @@ export function App() {
       setToast("已有成员持有写入锁，请先完成当前操作");
       return;
     }
-    if (command.source === "runtime") {
+    if (command.source === "runtime" || command.source === "remote") {
       try {
-        await postJson("/api/runtime/approval", { requestId: command.runtimeRequestId, decision: "accept" });
+        await postJson(command.source === "remote" ? "/api/remote/approvals" : "/api/runtime/approval", { requestId: command.runtimeRequestId, decision: "accept" });
       } catch (error) {
         setToast(error instanceof Error ? error.message : "审批失败");
         return;
@@ -958,9 +1046,9 @@ export function App() {
   };
 
   const denyCommand = async (command) => {
-    if (command.source === "runtime") {
+    if (command.source === "runtime" || command.source === "remote") {
       try {
-        await postJson("/api/runtime/approval", { requestId: command.runtimeRequestId, decision: "decline" });
+        await postJson(command.source === "remote" ? "/api/remote/approvals" : "/api/runtime/approval", { requestId: command.runtimeRequestId, decision: "decline" });
       } catch (error) {
         setToast(error instanceof Error ? error.message : "拒绝失败");
         return;
@@ -1035,7 +1123,7 @@ export function App() {
   const renderCenter = () => {
     if (activeView === "knowledge") return <KnowledgeView entries={knowledge} onAdd={addKnowledge} />;
     if (activeView === "agents") return <AgentSettingsView agents={state.agents} onOpenAgent={setOpenAgentId} />;
-    if (activeView === "settings") return <SettingsView bridge={bridge} runtime={runtime} rooms={state.rooms} onConnectRuntime={connectRuntime} onDisconnectRuntime={disconnectRuntime} onExport={exportConfig} onReset={resetPrototype} />;
+    if (activeView === "settings") return <SettingsView bridge={bridge} pairing={pairing} runtime={runtime} rooms={state.rooms} onConnectRuntime={connectRuntime} onDisconnectRuntime={disconnectRuntime} onExport={exportConfig} onReset={resetPrototype} />;
     if (activeThreadId !== "global") return <HistoryView history={history} loading={historyLoading} error={historyError} onAttach={attachHistory} />;
     return (
       <ChatView
@@ -1065,6 +1153,7 @@ export function App() {
         activeThreadId={activeThreadId}
         activeView={activeView}
         bridge={bridge}
+        pairing={pairing}
         onSelectRoom={selectRoom}
         onSelectThread={selectThread}
         onOpenImport={openImport}

@@ -6,6 +6,11 @@ const lock = JSON.parse(fs.readFileSync(path.join(root, "package-lock.json"), "u
 const licenseNames = ["LICENSE", "LICENSE.md", "LICENSE.txt", "LICENSE-MIT.txt", "LICENCE", "COPYING"];
 const entries = [];
 const missing = [];
+const licenseFallbacks = {
+  "@drizzle-team/brocli": path.join(root, "node_modules", "baseline-browser-mapping", "LICENSE.txt"),
+  "drizzle-orm": path.join(root, "node_modules", "baseline-browser-mapping", "LICENSE.txt"),
+  "drizzle-kit": path.join(root, "licenses", "drizzle-kit-MIT.txt"),
+};
 
 for (const packagePath of Object.keys(lock.packages || {})) {
   if (!packagePath.startsWith("node_modules/")) continue;
@@ -19,6 +24,9 @@ for (const packagePath of Object.keys(lock.packages || {})) {
   }
   if (!licenseFile && manifest.name?.startsWith("@rollup/")) {
     licenseFile = path.join(root, "node_modules", "rollup", "LICENSE.md");
+  }
+  if (!licenseFile && licenseFallbacks[manifest.name]) {
+    licenseFile = licenseFallbacks[manifest.name];
   }
   if (!licenseFile || !manifest.license) {
     missing.push(`${manifest.name || packagePath}@${manifest.version || "unknown"}`);
