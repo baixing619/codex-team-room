@@ -1,0 +1,1077 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  ArrowsClockwise,
+  At,
+  BookOpenText,
+  CalendarBlank,
+  CaretDown,
+  ChatCircle,
+  ChatsCircle,
+  Check,
+  CheckCircle,
+  Code,
+  Database,
+  DotsThree,
+  Eye,
+  FolderOpen,
+  GearSix,
+  GithubLogo,
+  Hash,
+  Info,
+  LockKey,
+  MagnifyingGlass,
+  Paperclip,
+  PaperPlaneTilt,
+  Plus,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sparkle,
+  UsersThree,
+  WarningCircle,
+  X,
+} from "@phosphor-icons/react";
+import { DEFAULT_THREADS, MODEL_OPTIONS } from "./data/defaults.js";
+import { createAgentReply, decideParticipation, shouldRequestCommand } from "./lib/participation.js";
+import { loadState, resetState, saveState } from "./lib/storage.js";
+
+const VIEW_ITEMS = [
+  { id: "knowledge", label: "知识库", icon: BookOpenText },
+  { id: "agents", label: "成员配置", icon: UsersThree },
+  { id: "settings", label: "设置", icon: GearSix },
+];
+
+function classNames(...values) {
+  return values.filter(Boolean).join(" ");
+}
+
+function nowLabel() {
+  return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date());
+}
+
+function formatRelativeDate(value) {
+  if (!value) return "未知时间";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "历史记录";
+  return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date);
+}
+
+async function postJson(url, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const value = await response.json();
+  if (!response.ok) throw new Error(value.message || value.error || "请求失败");
+  return value;
+}
+
+function AgentAvatar({ agent, size = "medium" }) {
+  return (
+    <img
+      className={classNames("agent-avatar", `agent-avatar--${size}`)}
+      src={agent.avatar}
+      alt={`${agent.name}成员头像`}
+    />
+  );
+}
+
+function Sidebar({
+  rooms,
+  activeRoom,
+  threads,
+  activeThreadId,
+  activeView,
+  bridge,
+  onSelectRoom,
+  onSelectThread,
+  onOpenImport,
+  onSelectView,
+}) {
+  return (
+    <aside className="sidebar">
+      <div className="brand-block">
+        <div className="brand-name">Codex Team Room</div>
+        <div className="connection-line">
+          本地 · {bridge?.ok ? "已连接" : "演示模式"}
+          <span className={classNames("status-dot", bridge?.ok ? "status-dot--green" : "status-dot--gray")} />
+        </div>
+      </div>
+
+      <button className="outline-action" type="button" onClick={onOpenImport}>
+        <Plus size={18} weight="bold" />
+        接入现有项目
+      </button>
+
+      <section className="sidebar-section">
+        <div className="sidebar-label">项目房间</div>
+        <div className="room-list">
+          {rooms.map((room) => (
+            <button
+              key={room.id}
+              className={classNames("sidebar-row", room.id === activeRoom.id && activeView === "chat" && "is-active")}
+              type="button"
+              onClick={() => onSelectRoom(room.id)}
+              title={room.path}
+            >
+              <ChatsCircle size={18} />
+              <span>{room.name}</span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <section className="sidebar-section sidebar-section--threads">
+        <div className="sidebar-label sidebar-label--inline">
+          <span>对话线程</span>
+          <MagnifyingGlass size={18} />
+        </div>
+        <div className="thread-list">
+          {threads.map((thread) => (
+            <button
+              key={thread.id}
+              className={classNames("thread-row", activeView === "chat" && activeThreadId === thread.id && "is-active")}
+              type="button"
+              onClick={() => onSelectThread(thread)}
+            >
+              {thread.id === "global" ? <Hash size={16} weight="bold" /> : <ChatCircle size={16} />}
+              <span className="thread-title">{thread.title}</span>
+              <span className="thread-time">{thread.time || formatRelativeDate(thread.updatedAt)}</span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <nav className="utility-nav" aria-label="项目工具">
+        {VIEW_ITEMS.map(({ id, label, icon: Icon }) => (
+          <button
+            key={id}
+            type="button"
+            className={classNames("utility-row", activeView === id && "is-active")}
+            onClick={() => onSelectView(id)}
+          >
+            <Icon size={19} />
+            <span>{label}</span>
+          </button>
+        ))}
+      </nav>
+    </aside>
+  );
+}
+
+function RoomHeader({ room, activeView, activeThread }) {
+  const titles = {
+    knowledge: ["知识库", "保存团队确认过的事实、决定和安全边界。"],
+    agents: ["成员配置", "为每位成员单独配置职责、模型和权限。"],
+    settings: ["项目设置", "管理本地连接、隐私和开源发布状态。"],
+  };
+  const title = activeView === "chat" ? activeThread?.title || "项目全局对话" : titles[activeView]?.[0];
+  const subtitle =
+    activeView === "chat"
+      ? activeThread?.id && activeThread.id !== "global"
+        ? "历史对话以只读方式打开，可选择挂入团队公共上下文。"
+        : "围绕当前项目的全部协作与决策在此汇总，保持上下文一致。"
+      : titles[activeView]?.[1];
+
+  return (
+    <header className="room-header">
+      <div className="room-heading">
+        <div className="room-title-line">
+          <button className="room-switcher" type="button">
+            {room.name}
+            <CaretDown size={15} weight="bold" />
+          </button>
+          <span className="header-divider" />
+          <div className="channel-title">
+            {activeView === "chat" ? <Hash size={17} weight="bold" /> : null}
+            <span>{title}</span>
+          </div>
+        </div>
+        <p>{subtitle}</p>
+      </div>
+      <div className="header-actions">
+        <span>8月1日</span>
+        <CalendarBlank size={19} />
+        <span className="header-divider header-divider--short" />
+        <button className="icon-button" type="button" aria-label="更多选项">
+          <DotsThree size={22} weight="bold" />
+        </button>
+      </div>
+    </header>
+  );
+}
+
+function MessageItem({ message, agents }) {
+  if (message.kind === "divider") {
+    return (
+      <div className="date-divider">
+        <span />
+        <strong>{message.text}</strong>
+        <span />
+      </div>
+    );
+  }
+  if (message.kind === "system") {
+    return (
+      <div className="system-message">
+        <Sparkle size={17} />
+        <span>{message.text}</span>
+        {message.time ? <time>{message.time}</time> : null}
+      </div>
+    );
+  }
+  if (message.kind === "user") {
+    return (
+      <article className="message message--user">
+        <div className="user-avatar">你</div>
+        <div className="message-body">
+          <div className="message-meta">
+            <strong>你</strong>
+            <time>{message.time}</time>
+          </div>
+          <p>{message.text}</p>
+        </div>
+      </article>
+    );
+  }
+
+  const agent = agents.find((item) => item.id === message.agentId) || agents[0];
+  return (
+    <article className="message">
+      <AgentAvatar agent={agent} />
+      <div className="message-body">
+        <div className="message-meta">
+          <strong>{agent.name}</strong>
+          <time>{message.time}</time>
+        </div>
+        <p>{message.text}</p>
+      </div>
+    </article>
+  );
+}
+
+function CommandCard({ command, agent, writeLock, onInspect, onApprove, onDeny, onComplete }) {
+  const isApproved = command.status === "approved";
+  const isCompleted = command.status === "completed";
+  const isDenied = command.status === "denied";
+
+  return (
+    <div className={classNames("command-card", isApproved && "is-approved", isDenied && "is-denied")}>
+      <div className="command-card__top">
+        <div>
+          <strong>{agent.name}</strong>
+          <span>请求执行命令</span>
+        </div>
+        <time>{command.time}</time>
+      </div>
+      <div className="command-card__content">
+        <h3>{command.title}</h3>
+        <p>{command.summary}</p>
+        <div className="command-code"><Code size={16} />{command.command}</div>
+        <div className="command-facts">
+          <span><Database size={16} />目标：{command.target}</span>
+          <span>影响：{command.impact}</span>
+          <span className="risk-low">● 风险：{command.risk}</span>
+        </div>
+      </div>
+      <div className="command-card__actions">
+        <button className="secondary-button" type="button" onClick={() => onInspect(command)}>
+          <Eye size={17} />查看详情
+        </button>
+        <div className="command-decision">
+          {command.status === "pending" ? (
+            <>
+              <button className="primary-button" type="button" onClick={() => onApprove(command)}>
+                <LockKey size={17} />允许一次
+              </button>
+              <button className="secondary-button" type="button" onClick={() => onDeny(command)}>拒绝</button>
+            </>
+          ) : null}
+          {isApproved ? (
+            command.source === "runtime"
+              ? <span className="decision-label decision-label--success"><ArrowsClockwise className="spin" size={17} />Codex 执行中</span>
+              : <button className="success-button" type="button" onClick={() => onComplete(command)}><CheckCircle size={17} />完成并释放写入锁</button>
+          ) : null}
+          {isCompleted ? <span className="decision-label decision-label--success"><CheckCircle size={17} />已完成</span> : null}
+          {isDenied ? <span className="decision-label"><X size={17} />已拒绝</span> : null}
+        </div>
+      </div>
+      {writeLock?.agentId === command.agentId ? (
+        <div className="write-lock-line"><LockKey size={15} />{agent.name}当前持有项目写入锁</div>
+      ) : null}
+    </div>
+  );
+}
+
+function Composer({ value, onChange, onSend, executionMode, onToggleMode, disabled }) {
+  const handleKeyDown = (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      onSend();
+    }
+  };
+
+  return (
+    <div className="composer-wrap">
+      <div className="composer">
+        <button className="composer-tool composer-tool--mention" type="button" aria-label="提及成员"><At size={21} /></button>
+        <textarea
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="@ 成员或输入消息，Enter 发送，Shift + Enter 换行"
+          rows={1}
+          disabled={disabled}
+        />
+        <button className="composer-tool" type="button" aria-label="添加附件"><Paperclip size={22} /></button>
+        <button
+          className={classNames("composer-tool", executionMode && "is-active")}
+          type="button"
+          aria-label="切换执行申请"
+          onClick={onToggleMode}
+          title={executionMode ? "成员可申请执行" : "仅讨论"}
+        >
+          <Code size={22} />
+        </button>
+        <button className="send-button" type="button" onClick={onSend} disabled={disabled || !value.trim()} aria-label="发送消息">
+          <PaperPlaneTilt size={21} weight="fill" />
+        </button>
+      </div>
+      <div className="composer-caption">
+        <span>{executionMode ? "可申请执行：成员仍需经过审批才能写入" : "仅讨论：不会提出命令执行请求"}</span>
+      </div>
+    </div>
+  );
+}
+
+function ChatView({
+  messages,
+  commands,
+  agents,
+  writeLock,
+  draft,
+  executionMode,
+  onDraftChange,
+  onSend,
+  onToggleMode,
+  onInspect,
+  onApprove,
+  onDeny,
+  onComplete,
+}) {
+  const endRef = useRef(null);
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [messages.length, commands.length]);
+
+  return (
+    <div className="chat-layout">
+      <div className="message-scroll">
+        {messages.map((message) => <MessageItem key={message.id} message={message} agents={agents} />)}
+        {commands.map((command) => {
+          const agent = agents.find((item) => item.id === command.agentId) || agents[1];
+          return (
+            <CommandCard
+              key={command.id}
+              command={command}
+              agent={agent}
+              writeLock={writeLock}
+              onInspect={onInspect}
+              onApprove={onApprove}
+              onDeny={onDeny}
+              onComplete={onComplete}
+            />
+          );
+        })}
+        <div ref={endRef} />
+      </div>
+      <Composer
+        value={draft}
+        onChange={onDraftChange}
+        onSend={onSend}
+        executionMode={executionMode}
+        onToggleMode={onToggleMode}
+      />
+    </div>
+  );
+}
+
+function HistoryView({ history, loading, error, onAttach }) {
+  if (loading) return <div className="center-state"><ArrowsClockwise className="spin" size={28} />正在读取公开消息…</div>;
+  if (error) return <div className="center-state center-state--error"><WarningCircle size={28} />{error}</div>;
+  if (!history) return <div className="center-state"><ChatCircle size={28} />选择一个历史对话查看。</div>;
+
+  return (
+    <div className="history-view">
+      <div className="history-banner">
+        <div><ShieldCheck size={20} /><span>只读历史 · 尚未写入团队公共上下文</span></div>
+        <button className="primary-button" type="button" onClick={onAttach}>挂入公共上下文</button>
+      </div>
+      <div className="history-list">
+        {history.messages.length === 0 ? <div className="empty-panel">这个对话没有可导入的公开消息。</div> : null}
+        {history.messages.map((message) => (
+          <article key={message.id} className={classNames("history-message", `history-message--${message.role}`)}>
+            <strong>{message.role === "user" ? "你" : "Codex"}</strong>
+            <p>{message.text}</p>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AgentRoster({ agents, onOpenAgent }) {
+  return (
+    <aside className="agent-panel">
+      <div className="agent-panel__title">成员（{agents.length}）</div>
+      <div className="agent-roster">
+        {agents.map((agent) => (
+          <button className="agent-card" type="button" key={agent.id} onClick={() => onOpenAgent(agent.id)}>
+            <AgentAvatar agent={agent} size="large" />
+            <div className="agent-card__content">
+              <div className="agent-name-line">
+                <strong>{agent.name}</strong>
+                <span className={classNames("role-tag", `role-tag--${agent.color}`)}>{agent.name}</span>
+              </div>
+              <p>{agent.description}</p>
+              <div className="agent-status"><span className={classNames("status-dot", agent.status === "silent" ? "status-dot--gray" : "status-dot--green")} />{agent.statusLabel}</div>
+              <div className="agent-model">模型：{MODEL_OPTIONS.find((item) => item.value === agent.model)?.label || agent.model}</div>
+            </div>
+          </button>
+        ))}
+      </div>
+      <button className="silence-rule" type="button">
+        <Sparkle size={18} />
+        <span><strong>自动静默规则</strong><small>职责无关或无新增信息时不发言</small></span>
+        <CaretDown size={16} />
+      </button>
+    </aside>
+  );
+}
+
+function KnowledgeView({ entries, onAdd }) {
+  const [isAdding, setIsAdding] = useState(false);
+  const [form, setForm] = useState({ title: "", category: "已确认决定", body: "" });
+
+  const submit = (event) => {
+    event.preventDefault();
+    if (!form.title.trim() || !form.body.trim()) return;
+    onAdd(form);
+    setForm({ title: "", category: "已确认决定", body: "" });
+    setIsAdding(false);
+  };
+
+  return (
+    <div className="content-view">
+      <div className="content-toolbar">
+        <div>
+          <span className="eyebrow">公共知识</span>
+          <h2>团队共同依据</h2>
+        </div>
+        <button className="primary-button" type="button" onClick={() => setIsAdding((value) => !value)}><Plus size={17} />新增条目</button>
+      </div>
+
+      {isAdding ? (
+        <form className="knowledge-form" onSubmit={submit}>
+          <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="条目标题" autoFocus />
+          <select value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })}>
+            <option>已确认决定</option><option>安全规则</option><option>发布要求</option><option>项目事实</option>
+          </select>
+          <textarea value={form.body} onChange={(event) => setForm({ ...form, body: event.target.value })} placeholder="只记录已经确认、未来成员需要共同遵守的信息" rows={4} />
+          <div className="form-actions"><button className="secondary-button" type="button" onClick={() => setIsAdding(false)}>取消</button><button className="primary-button" type="submit">保存到公共知识</button></div>
+        </form>
+      ) : null}
+
+      <div className="knowledge-list">
+        {entries.map((entry) => (
+          <article className="knowledge-row" key={entry.id}>
+            <div className="knowledge-icon"><BookOpenText size={22} /></div>
+            <div>
+              <div className="knowledge-meta"><span>{entry.category}</span><time>{entry.updatedAt}</time></div>
+              <h3>{entry.title}</h3>
+              <p>{entry.body}</p>
+            </div>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AgentSettingsView({ agents, onOpenAgent }) {
+  return (
+    <div className="content-view">
+      <div className="content-toolbar">
+        <div><span className="eyebrow">独立角色</span><h2>成员与模型</h2></div>
+        <div className="privacy-chip"><ShieldCheck size={17} />每个成员单独授权</div>
+      </div>
+      <div className="agent-settings-list">
+        {agents.map((agent) => (
+          <button className="agent-settings-row" key={agent.id} type="button" onClick={() => onOpenAgent(agent.id)}>
+            <AgentAvatar agent={agent} size="large" />
+            <div className="agent-settings-main"><strong>{agent.name} · {agent.role}</strong><p>{agent.description}</p></div>
+            <div className="agent-settings-fact"><span>模型</span><strong>{MODEL_OPTIONS.find((item) => item.value === agent.model)?.label || agent.model}</strong></div>
+            <div className="agent-settings-fact"><span>推理</span><strong>{agent.reasoning}</strong></div>
+            <div className="agent-settings-fact"><span>权限</span><strong>{agent.permission}</strong></div>
+            <SlidersHorizontal size={20} />
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SettingsView({ bridge, runtime, rooms, onConnectRuntime, onDisconnectRuntime, onExport, onReset }) {
+  return (
+    <div className="content-view">
+      <div className="content-toolbar"><div><span className="eyebrow">本地优先</span><h2>连接、隐私与开源</h2></div></div>
+      <div className="settings-sections">
+        <section className="settings-block">
+          <div className="settings-icon"><Database size={22} /></div>
+          <div className="settings-copy"><h3>本地 Codex 索引</h3><p>默认只扫描会话元数据；只有你打开具体线程时，才读取该线程的可见消息。</p></div>
+          <div className={classNames("settings-state", bridge?.ok && "is-good")}>{bridge?.ok ? `${bridge.indexedThreads} 条会话` : "演示模式"}</div>
+        </section>
+        <section className="settings-block">
+          <div className="settings-icon"><FolderOpen size={22} /></div>
+          <div className="settings-copy"><h3>已接入项目</h3><p>项目保持在原目录；Team Room 只保存路径映射和共享状态。</p></div>
+          <div className="settings-state">{rooms.length} 个项目</div>
+        </section>
+        <section className="settings-block">
+          <div className="settings-icon"><Code size={22} /></div>
+          <div className="settings-copy"><h3>真实成员运行时</h3><p>{runtime?.available ? "已找到独立 Codex CLI，可通过 App Server 为成员绑定独立线程。" : "当前使用安全模拟；安装独立 Codex CLI 后即可启用 App Server 适配器。"}</p></div>
+          <div className={classNames("settings-state", runtime?.connected && "is-good")}>{runtime?.connected ? "真实模式" : runtime?.available ? "可启用" : "未启用"}</div>
+        </section>
+        <section className="settings-block">
+          <div className="settings-icon"><GithubLogo size={22} /></div>
+          <div className="settings-copy"><h3>开源发布准备</h3><p>不提交密钥、会话、数据库和用户项目；依赖许可证会生成第三方声明。</p></div>
+          <div className="settings-state is-good">合规审计中</div>
+        </section>
+      </div>
+      <div className="settings-actions">
+        {runtime?.available ? (
+          <button className={runtime.connected ? "danger-button" : "primary-button"} type="button" onClick={runtime.connected ? onDisconnectRuntime : onConnectRuntime}>
+            {runtime.connected ? "断开真实运行时" : "启用真实成员"}
+          </button>
+        ) : null}
+        <button className="secondary-button" type="button" onClick={onExport}>导出本地配置</button>
+        <button className="danger-button" type="button" onClick={onReset}>重置原型数据</button>
+      </div>
+    </div>
+  );
+}
+
+function ImportProjectModal({ projects, loading, error, connectedPaths, onClose, onRefresh, onAttach }) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal import-modal" role="dialog" aria-modal="true" aria-labelledby="import-title" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="modal-header"><div><span className="eyebrow">只读发现</span><h2 id="import-title">接入现有 Codex 项目</h2></div><button className="icon-button" onClick={onClose} type="button"><X size={21} /></button></header>
+        <div className="modal-note"><ShieldCheck size={19} /><span>这里只读取项目路径和对话数量，不会自动导入聊天正文。</span></div>
+        <div className="project-picker">
+          {loading ? <div className="center-state"><ArrowsClockwise className="spin" size={24} />正在扫描本地索引…</div> : null}
+          {error ? <div className="center-state center-state--error"><WarningCircle size={24} />{error}<button className="secondary-button" onClick={onRefresh} type="button">重试</button></div> : null}
+          {!loading && !error && projects.map((project) => {
+            const connected = connectedPaths.has(project.path.toLowerCase());
+            return (
+              <button className="project-option" key={project.path} type="button" onClick={() => !connected && onAttach(project)} disabled={connected}>
+                <div className="project-folder"><FolderOpen size={22} /></div>
+                <div><strong>{project.name}</strong><span>{project.path}</span></div>
+                <div className="project-count">{project.threadCount} 个对话</div>
+                <span className={classNames("project-action", connected && "is-connected")}>{connected ? "已接入" : "接入"}</span>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function AgentDrawer({ agent, onClose, onSave }) {
+  const [form, setForm] = useState(agent);
+  useEffect(() => setForm(agent), [agent]);
+  if (!agent) return null;
+
+  return (
+    <div className="drawer-backdrop" role="presentation" onMouseDown={onClose}>
+      <aside className="drawer" role="dialog" aria-modal="true" aria-label={`配置${agent.name}`} onMouseDown={(event) => event.stopPropagation()}>
+        <header className="drawer-header"><div><span className="eyebrow">成员配置</span><h2>{agent.name}</h2></div><button className="icon-button" type="button" onClick={onClose}><X size={21} /></button></header>
+        <div className="drawer-profile"><AgentAvatar agent={agent} size="xlarge" /><div><strong>{agent.role}</strong><p>{agent.description}</p></div></div>
+        <label className="field-label">成员职责<input value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })} /></label>
+        <label className="field-label">说明<textarea rows={3} value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
+        <label className="field-label">模型<select value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })}>{MODEL_OPTIONS.map((model) => <option key={model.value} value={model.value}>{model.label}</option>)}</select></label>
+        <label className="field-label">推理强度<select value={form.reasoning} onChange={(event) => setForm({ ...form, reasoning: event.target.value })}><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select></label>
+        <label className="field-label">项目权限<select value={form.permission} onChange={(event) => setForm({ ...form, permission: event.target.value })}><option value="read-only">只读</option><option value="request-write">可申请写入</option><option value="coordinate">协调与审批建议</option></select></label>
+        <label className="field-label">发言策略<select value={form.participation} onChange={(event) => setForm({ ...form, participation: event.target.value })}><option value="always">每条消息都路由</option><option value="relevant">职责相关时发言</option><option value="review">存在风险或需复核时发言</option><option value="knowledge">需要资料与知识时发言</option></select></label>
+        <div className="drawer-security"><ShieldCheck size={20} /><span>模型可以建议操作，但写入命令必须经过项目执行闸门。</span></div>
+        <div className="drawer-actions"><button className="secondary-button" type="button" onClick={onClose}>取消</button><button className="primary-button" type="button" onClick={() => onSave(form)}>保存配置</button></div>
+      </aside>
+    </div>
+  );
+}
+
+function CommandModal({ command, agent, onClose }) {
+  if (!command) return null;
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal command-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="modal-header"><div><span className="eyebrow">执行审批</span><h2>{command.title}</h2></div><button className="icon-button" type="button" onClick={onClose}><X size={21} /></button></header>
+        <div className="command-detail-grid"><span>申请成员</span><strong>{agent?.name}</strong><span>命令</span><code>{command.command}</code><span>目标</span><strong>{command.target}</strong><span>影响</span><strong>{command.impact}</strong><span>风险</span><strong>{command.risk}</strong><span>当前状态</span><strong>{command.status}</strong></div>
+        <div className="modal-note"><Info size={19} /><span>{command.source === "runtime" ? "这是 Codex App Server 的真实请求；只允许本次操作，服务端写入锁会阻止并发写入。" : "模拟模式只验证审批和单写入锁，不会在你的电脑上真正执行这条命令。"}</span></div>
+      </section>
+    </div>
+  );
+}
+
+function Toast({ message }) {
+  if (!message) return null;
+  return <div className="toast"><Check size={17} weight="bold" />{message}</div>;
+}
+
+export function App() {
+  const [state, setState] = useState(loadState);
+  const [activeView, setActiveView] = useState("chat");
+  const [activeThreadId, setActiveThreadId] = useState("global");
+  const [draft, setDraft] = useState("");
+  const [executionMode, setExecutionMode] = useState(true);
+  const [bridge, setBridge] = useState(null);
+  const [runtime, setRuntime] = useState(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [projects, setProjects] = useState([]);
+  const [projectsLoading, setProjectsLoading] = useState(false);
+  const [projectsError, setProjectsError] = useState("");
+  const [openAgentId, setOpenAgentId] = useState(null);
+  const [inspectedCommandId, setInspectedCommandId] = useState(null);
+  const [history, setHistory] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [toast, setToast] = useState("");
+  const autoLoadedRooms = useRef(new Set());
+  const runtimeEventCursor = useRef(0);
+
+  const activeRoom = state.rooms.find((room) => room.id === state.activeRoomId) || state.rooms[0];
+  const threads = state.threadCache[activeRoom.id] || DEFAULT_THREADS;
+  const activeThread = threads.find((thread) => thread.id === activeThreadId) || threads[0];
+  const messages = state.messagesByRoom[activeRoom.id] || [];
+  const commands = state.commandsByRoom[activeRoom.id] || [];
+  const knowledge = state.knowledgeByRoom[activeRoom.id] || [];
+  const openAgent = state.agents.find((agent) => agent.id === openAgentId) || null;
+  const inspectedCommand = commands.find((command) => command.id === inspectedCommandId) || null;
+  const connectedPaths = useMemo(() => new Set(state.rooms.map((room) => room.path.toLowerCase())), [state.rooms]);
+  const realRuntimeActive = Boolean(runtime?.connected && runtime.cwd?.toLowerCase() === activeRoom.path.toLowerCase());
+
+  useEffect(() => saveState(state), [state]);
+  useEffect(() => {
+    fetch("/api/health")
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("bridge unavailable")))
+      .then((health) => {
+        setBridge(health);
+        if (health.workspacePath) {
+          setState((current) => ({
+            ...current,
+            rooms: current.rooms.map((room) => room.source === "local" && room.path === "."
+              ? { ...room, path: health.workspacePath }
+              : room),
+          }));
+        }
+      })
+      .catch(() => setBridge({ ok: false, mode: "demo", indexedThreads: 0 }));
+  }, []);
+  useEffect(() => {
+    fetch("/api/runtime/status")
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("runtime unavailable")))
+      .then(setRuntime)
+      .catch(() => setRuntime({ available: false, reason: "静态演示模式" }));
+  }, []);
+  useEffect(() => {
+    if (!toast) return undefined;
+    const timeout = window.setTimeout(() => setToast(""), 2600);
+    return () => window.clearTimeout(timeout);
+  }, [toast]);
+  useEffect(() => {
+    if (!runtime?.connected) return undefined;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const response = await fetch(`/api/runtime/events?after=${runtimeEventCursor.current}`);
+        if (!response.ok) return;
+        const data = await response.json();
+        if (cancelled || !data.events?.length) return;
+        runtimeEventCursor.current = data.events.at(-1).sequence;
+        setState((current) => {
+          let next = current;
+          for (const event of data.events) {
+            if (event.type === "agentThreadBound") {
+              next = { ...next, agents: next.agents.map((agent) => agent.id === event.agentId ? { ...agent, runtimeThreadId: event.threadId } : agent) };
+            }
+            if (event.type === "agentMessage" && event.text) {
+              next = { ...next, messagesByRoom: { ...next.messagesByRoom, [activeRoom.id]: [...(next.messagesByRoom[activeRoom.id] || []), { id: `runtime-message-${event.sequence}`, kind: "agent", agentId: event.agentId, time: nowLabel(), text: event.text }] } };
+            }
+            if (event.type === "approvalRequested") {
+              const commandId = `runtime-command-${event.requestId}`;
+              const existing = next.commandsByRoom[activeRoom.id] || [];
+              if (!existing.some((command) => command.id === commandId)) {
+                const command = { id: commandId, source: "runtime", runtimeRequestId: event.requestId, agentId: event.agentId, title: "Codex 请求受控执行", command: event.command, summary: "来自真实 App Server 线程，等待一次性审批。", target: event.cwd, impact: "可能写入项目", risk: "中", status: "pending", time: nowLabel() };
+                next = { ...next, commandsByRoom: { ...next.commandsByRoom, [activeRoom.id]: [...existing, command] } };
+              }
+            }
+            if (event.type === "approvalResolved") {
+              next = { ...next, commandsByRoom: { ...next.commandsByRoom, [activeRoom.id]: (next.commandsByRoom[activeRoom.id] || []).map((command) => command.runtimeRequestId === event.requestId ? { ...command, status: event.decision === "accept" ? "approved" : "denied" } : command) } };
+            }
+            if (event.type === "writeItemCompleted") {
+              next = { ...next, writeLock: null, commandsByRoom: { ...next.commandsByRoom, [activeRoom.id]: (next.commandsByRoom[activeRoom.id] || []).map((command) => command.source === "runtime" && command.agentId === event.agentId && command.status === "approved" ? { ...command, status: "completed" } : command) } };
+            }
+          }
+          return next;
+        });
+      } catch {
+        // A temporary polling failure should not switch modes or duplicate events.
+      }
+    };
+    poll();
+    const interval = window.setInterval(poll, 800);
+    return () => { cancelled = true; window.clearInterval(interval); };
+  }, [runtime?.connected, activeRoom.id]);
+
+  const updateRoomThreads = (roomId, nextThreads) => {
+    setState((current) => ({ ...current, threadCache: { ...current.threadCache, [roomId]: nextThreads } }));
+  };
+
+  const fetchThreads = async (room) => {
+    try {
+      const response = await fetch(`/api/threads?project=${encodeURIComponent(room.path)}`);
+      if (!response.ok) throw new Error("无法读取对话索引");
+      const data = await response.json();
+      const nextThreads = [
+        { id: "global", title: "项目全局对话", time: "现在", kind: "room" },
+        ...data.threads.map((thread) => ({ ...thread, time: formatRelativeDate(thread.updatedAt), kind: "codex" })),
+      ];
+      updateRoomThreads(room.id, nextThreads);
+    } catch {
+      if (!state.threadCache[room.id]) updateRoomThreads(room.id, DEFAULT_THREADS);
+    }
+  };
+
+  useEffect(() => {
+    if (!bridge?.ok || !activeRoom || autoLoadedRooms.current.has(activeRoom.id)) return;
+    autoLoadedRooms.current.add(activeRoom.id);
+    fetchThreads(activeRoom);
+  }, [bridge?.ok, activeRoom?.id]);
+
+  const selectRoom = (roomId) => {
+    const room = state.rooms.find((item) => item.id === roomId);
+    setState((current) => ({ ...current, activeRoomId: roomId }));
+    setActiveView("chat");
+    setActiveThreadId("global");
+    setHistory(null);
+    if (room) fetchThreads(room);
+  };
+
+  const selectThread = async (thread) => {
+    setActiveView("chat");
+    setActiveThreadId(thread.id);
+    setHistory(null);
+    setHistoryError("");
+    if (thread.id === "global" || thread.kind === "demo") return;
+    setHistoryLoading(true);
+    try {
+      const response = await fetch(`/api/threads/${encodeURIComponent(thread.id)}/messages`);
+      if (!response.ok) throw new Error("无法读取这个历史对话");
+      setHistory(await response.json());
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : "读取失败");
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const loadProjects = async () => {
+    setProjectsLoading(true);
+    setProjectsError("");
+    try {
+      const response = await fetch("/api/projects");
+      if (!response.ok) throw new Error("本地索引暂不可用");
+      const data = await response.json();
+      setProjects(data.projects || []);
+    } catch (error) {
+      setProjectsError(error instanceof Error ? error.message : "扫描失败");
+    } finally {
+      setProjectsLoading(false);
+    }
+  };
+
+  const openImport = () => {
+    setImportOpen(true);
+    loadProjects();
+  };
+
+  const attachProject = (project) => {
+    const roomId = `room-${Date.now()}`;
+    const room = { id: roomId, name: project.name, path: project.path, source: "codex-index", connected: true };
+    setState((current) => ({
+      ...current,
+      rooms: [...current.rooms, room],
+      activeRoomId: roomId,
+      messagesByRoom: { ...current.messagesByRoom, [roomId]: [{ id: `welcome-${roomId}`, kind: "system", time: nowLabel(), text: `已以只读方式接入 ${project.name}，发现 ${project.threadCount} 个历史对话` }] },
+      commandsByRoom: { ...current.commandsByRoom, [roomId]: [] },
+      knowledgeByRoom: { ...current.knowledgeByRoom, [roomId]: [] },
+      threadCache: { ...current.threadCache, [roomId]: [{ id: "global", title: "项目全局对话", time: "现在", kind: "room" }] },
+    }));
+    setActiveView("chat");
+    setActiveThreadId("global");
+    setImportOpen(false);
+    fetchThreads(room);
+    setToast(`已接入 ${project.name}`);
+  };
+
+  const connectRuntime = async () => {
+    if (!runtime?.available) {
+      setToast("未找到可独立启动的 Codex CLI");
+      return;
+    }
+    const confirmed = window.confirm(`为“${activeRoom.name}”启动真实 Codex 成员？每位发言成员会使用自己的模型和独立线程；任何写入仍需你逐次批准。`);
+    if (!confirmed) return;
+    try {
+      runtimeEventCursor.current = 0;
+      const status = await postJson("/api/runtime/connect", { confirmed: true, cwd: activeRoom.path, agents: state.agents });
+      setRuntime(status);
+      setToast("真实成员运行时已连接");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "连接失败");
+    }
+  };
+
+  const disconnectRuntime = async () => {
+    try {
+      const status = await postJson("/api/runtime/disconnect", {});
+      setRuntime(status);
+      setState((current) => ({ ...current, writeLock: null }));
+      setToast("已断开真实运行时，回到安全模拟");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "断开失败");
+    }
+  };
+
+  const sendMessage = () => {
+    const text = draft.trim();
+    if (!text) return;
+    const decisions = decideParticipation(text, state.agents);
+    const userMessage = { id: `user-${Date.now()}`, kind: "user", time: nowLabel(), text };
+    const silentNames = decisions.filter((item) => item.decision === "silent").map((item) => state.agents.find((agent) => agent.id === item.agentId)?.name).filter(Boolean);
+
+    setDraft("");
+    setState((current) => ({
+      ...current,
+      agents: current.agents.map((agent) => ({ ...agent, status: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "thinking" : "silent", statusLabel: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "判断中" : "静默中" })),
+      messagesByRoom: {
+        ...current.messagesByRoom,
+        [activeRoom.id]: [
+          ...(current.messagesByRoom[activeRoom.id] || []),
+          userMessage,
+          ...(silentNames.length ? [{ id: `silent-${Date.now()}`, kind: "system", time: nowLabel(), text: `${silentNames.join("、")}判断与当前职责无关，保持静默` }] : []),
+        ],
+      },
+    }));
+
+    if (realRuntimeActive) {
+      postJson("/api/runtime/dispatch", { text, decisions, messageId: userMessage.id })
+        .then((result) => {
+          setState((current) => ({
+            ...current,
+            messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `runtime-dispatch-${Date.now()}`, kind: "system", time: nowLabel(), text: `已分派到 ${result.turns.length} 个真实 Codex 成员线程` }] },
+          }));
+        })
+        .catch((error) => setToast(error instanceof Error ? error.message : "真实成员分派失败"));
+    } else {
+      window.setTimeout(() => {
+        const speakers = decisions.filter((item) => item.decision === "speak");
+        setState((current) => ({
+          ...current,
+          agents: current.agents.map((agent) => ({ ...agent, status: speakers.some((item) => item.agentId === agent.id) ? "active" : "silent", statusLabel: speakers.some((item) => item.agentId === agent.id) ? "活跃中" : "静默中" })),
+          messagesByRoom: {
+            ...current.messagesByRoom,
+            [activeRoom.id]: [
+              ...(current.messagesByRoom[activeRoom.id] || []),
+              ...speakers.map((decision, index) => {
+                const agent = current.agents.find((item) => item.id === decision.agentId);
+                return { id: `reply-${Date.now()}-${index}`, kind: "agent", agentId: agent.id, time: nowLabel(), text: createAgentReply(agent, text) };
+              }),
+            ],
+          },
+        }));
+      }, 650);
+
+      if (executionMode && shouldRequestCommand(text, decisions)) {
+        window.setTimeout(() => {
+          setState((current) => ({
+            ...current,
+            commandsByRoom: {
+              ...current.commandsByRoom,
+              [activeRoom.id]: [
+                ...(current.commandsByRoom[activeRoom.id] || []),
+                { id: `command-${Date.now()}`, agentId: "developer", title: "为当前任务准备受控执行", command: "codex-team-room task run --approval once", summary: "开发成员已完成影响评估，等待你授予一次性写入权限。", target: activeRoom.path, impact: "待审批", risk: "中", status: "pending", time: nowLabel() },
+              ],
+            },
+          }));
+        }, 1050);
+      }
+    }
+  };
+
+  const updateCommand = (commandId, status) => {
+    setState((current) => ({
+      ...current,
+      commandsByRoom: {
+        ...current.commandsByRoom,
+        [activeRoom.id]: (current.commandsByRoom[activeRoom.id] || []).map((command) => command.id === commandId ? { ...command, status } : command),
+      },
+    }));
+  };
+
+  const approveCommand = async (command) => {
+    if (state.writeLock && state.writeLock.agentId !== command.agentId) {
+      setToast("已有成员持有写入锁，请先完成当前操作");
+      return;
+    }
+    if (command.source === "runtime") {
+      try {
+        await postJson("/api/runtime/approval", { requestId: command.runtimeRequestId, decision: "accept" });
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : "审批失败");
+        return;
+      }
+    }
+    setState((current) => ({
+      ...current,
+      writeLock: { agentId: command.agentId, commandId: command.id, acquiredAt: new Date().toISOString() },
+      commandsByRoom: { ...current.commandsByRoom, [activeRoom.id]: (current.commandsByRoom[activeRoom.id] || []).map((item) => item.id === command.id ? { ...item, status: "approved" } : item) },
+      messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `approved-${Date.now()}`, kind: "system", time: nowLabel(), text: "已授予开发一次性写入权限，并锁定项目写入权" }] },
+    }));
+    setToast("已批准一次并加锁");
+  };
+
+  const denyCommand = async (command) => {
+    if (command.source === "runtime") {
+      try {
+        await postJson("/api/runtime/approval", { requestId: command.runtimeRequestId, decision: "decline" });
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : "拒绝失败");
+        return;
+      }
+    }
+    updateCommand(command.id, "denied");
+    setToast("执行请求已拒绝");
+  };
+
+  const completeCommand = (command) => {
+    setState((current) => ({
+      ...current,
+      writeLock: current.writeLock?.commandId === command.id ? null : current.writeLock,
+      commandsByRoom: { ...current.commandsByRoom, [activeRoom.id]: (current.commandsByRoom[activeRoom.id] || []).map((item) => item.id === command.id ? { ...item, status: "completed" } : item) },
+      messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `completed-${Date.now()}`, kind: "agent", agentId: command.agentId, time: nowLabel(), text: "受控操作已经完成，写入锁已释放，等待审核复核。" }] },
+    }));
+    setToast("操作完成，写入锁已释放");
+  };
+
+  const saveAgent = (nextAgent) => {
+    setState((current) => ({ ...current, agents: current.agents.map((agent) => agent.id === nextAgent.id ? nextAgent : agent) }));
+    setOpenAgentId(null);
+    setToast(`${nextAgent.name}配置已保存`);
+  };
+
+  const addKnowledge = (form) => {
+    const entry = { id: `knowledge-${Date.now()}`, ...form, updatedAt: `今天 ${nowLabel()}` };
+    setState((current) => ({ ...current, knowledgeByRoom: { ...current.knowledgeByRoom, [activeRoom.id]: [entry, ...(current.knowledgeByRoom[activeRoom.id] || [])] } }));
+    setToast("知识条目已保存");
+  };
+
+  const attachHistory = () => {
+    if (!history) return;
+    const entry = {
+      id: `knowledge-history-${Date.now()}`,
+      title: history.thread.title,
+      category: "历史对话",
+      body: `已挂载 ${history.messages.length} 条可见消息作为只读历史依据。原始对话保持不变。`,
+      updatedAt: `今天 ${nowLabel()}`,
+    };
+    setState((current) => ({
+      ...current,
+      knowledgeByRoom: { ...current.knowledgeByRoom, [activeRoom.id]: [entry, ...(current.knowledgeByRoom[activeRoom.id] || [])] },
+      messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `history-${Date.now()}`, kind: "system", time: nowLabel(), text: `已将历史对话“${history.thread.title}”挂入公共上下文` }] },
+    }));
+    setActiveThreadId("global");
+    setHistory(null);
+    setToast("历史对话已挂入公共上下文");
+  };
+
+  const exportConfig = () => {
+    const sanitized = { ...state, messagesByRoom: {}, commandsByRoom: {} };
+    const blob = new Blob([JSON.stringify(sanitized, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "codex-team-room-config.json";
+    anchor.click();
+    URL.revokeObjectURL(url);
+    setToast("已导出不含聊天记录的配置");
+  };
+
+  const resetPrototype = () => {
+    if (!window.confirm("重置本地原型数据？这个操作不会删除任何 Codex 对话或项目文件。")) return;
+    const next = resetState();
+    setState(next);
+    setActiveView("chat");
+    setActiveThreadId("global");
+    setToast("原型数据已重置");
+  };
+
+  const renderCenter = () => {
+    if (activeView === "knowledge") return <KnowledgeView entries={knowledge} onAdd={addKnowledge} />;
+    if (activeView === "agents") return <AgentSettingsView agents={state.agents} onOpenAgent={setOpenAgentId} />;
+    if (activeView === "settings") return <SettingsView bridge={bridge} runtime={runtime} rooms={state.rooms} onConnectRuntime={connectRuntime} onDisconnectRuntime={disconnectRuntime} onExport={exportConfig} onReset={resetPrototype} />;
+    if (activeThreadId !== "global") return <HistoryView history={history} loading={historyLoading} error={historyError} onAttach={attachHistory} />;
+    return (
+      <ChatView
+        messages={messages}
+        commands={commands}
+        agents={state.agents}
+        writeLock={state.writeLock}
+        draft={draft}
+        executionMode={executionMode}
+        onDraftChange={setDraft}
+        onSend={sendMessage}
+        onToggleMode={() => setExecutionMode((value) => !value)}
+        onInspect={(command) => setInspectedCommandId(command.id)}
+        onApprove={approveCommand}
+        onDeny={denyCommand}
+        onComplete={completeCommand}
+      />
+    );
+  };
+
+  return (
+    <div className={classNames("app-shell", !(activeView === "chat" && activeThreadId === "global") && "app-shell--wide")}>
+      <Sidebar
+        rooms={state.rooms}
+        activeRoom={activeRoom}
+        threads={threads}
+        activeThreadId={activeThreadId}
+        activeView={activeView}
+        bridge={bridge}
+        onSelectRoom={selectRoom}
+        onSelectThread={selectThread}
+        onOpenImport={openImport}
+        onSelectView={(view) => { setActiveView(view); setHistory(null); }}
+      />
+      <main className="main-panel">
+        <RoomHeader room={activeRoom} activeView={activeView} activeThread={activeThread} />
+        <div className="main-content">{renderCenter()}</div>
+      </main>
+      {activeView === "chat" && activeThreadId === "global" ? <AgentRoster agents={state.agents} onOpenAgent={setOpenAgentId} /> : null}
+
+      {importOpen ? <ImportProjectModal projects={projects} loading={projectsLoading} error={projectsError} connectedPaths={connectedPaths} onClose={() => setImportOpen(false)} onRefresh={loadProjects} onAttach={attachProject} /> : null}
+      {openAgent ? <AgentDrawer agent={openAgent} onClose={() => setOpenAgentId(null)} onSave={saveAgent} /> : null}
+      {inspectedCommand ? <CommandModal command={inspectedCommand} agent={state.agents.find((agent) => agent.id === inspectedCommand.agentId)} onClose={() => setInspectedCommandId(null)} /> : null}
+      <Toast message={toast} />
+    </div>
+  );
+}
