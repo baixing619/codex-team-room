@@ -4,6 +4,7 @@ import {
   At,
   BookOpenText,
   CalendarBlank,
+  Camera,
   CaretDown,
   ChatCircle,
   ChatsCircle,
@@ -12,6 +13,7 @@ import {
   Code,
   Database,
   Eye,
+  File as FileIcon,
   FolderOpen,
   GearSix,
   GithubLogo,
@@ -30,15 +32,23 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { DEFAULT_THREADS, MODEL_OPTIONS } from "./data/defaults.js";
-import { commandRequestingAgent, createAgentReply, decideParticipation, shouldRequestCommand } from "./lib/participation.js";
+import { decideParticipation } from "./lib/participation.js";
 import { addRoomMember, createProjectMember, createRoomAgents, createSafeMemberPrompt, removeRoomMember, replaceRoomMember } from "./lib/roomAgents.js";
 import { loadState, resetState, saveState } from "./lib/storage.js";
+import { buildRoomSharedContext, formatAttachmentSize, validateSelectedFiles } from "./lib/taskPayload.js";
+import { applyCloudSnapshot, createCloudSnapshot } from "./lib/cloudState.js";
 
 const VIEW_ITEMS = [
   { id: "knowledge", label: "知识库", icon: BookOpenText },
   { id: "agents", label: "成员配置", icon: UsersThree },
   { id: "settings", label: "设置", icon: GearSix },
 ];
+
+const PERMISSION_LABELS = {
+  "read-only": "只读分析",
+  "request-write": "可申请写入",
+  coordinate: "协调建议",
+};
 
 function classNames(...values) {
   return values.filter(Boolean).join(" ");
@@ -88,11 +98,12 @@ async function requestRemoteIndex(type, body = {}) {
 }
 
 function AgentAvatar({ agent, size = "medium" }) {
+  const safeAgent = agent || { name: "已移除成员", avatar: "/assets/agents/agent-researcher.png" };
   return (
     <img
       className={classNames("agent-avatar", `agent-avatar--${size}`)}
-      src={agent.avatar}
-      alt={`${agent.name}成员头像`}
+      src={safeAgent.avatar}
+      alt={`${safeAgent.name}成员头像`}
     />
   );
 }
@@ -121,7 +132,7 @@ function Sidebar({
         ? "私人云端 · 本机离线"
         : privateCloud
           ? "私人云端 · 本机未配对"
-          : "本地 · 演示模式";
+          : "本地 · 未连接";
   return (
     <aside className="sidebar">
       <div className="brand-block">
@@ -303,13 +314,20 @@ function MessageItem({ message, agents }) {
             <strong>你</strong>
             <time>{message.time}</time>
           </div>
-          <p>{message.text}</p>
+          {message.text ? <p>{message.text}</p> : null}
+          {message.attachments?.length ? (
+            <div className="message-attachments">
+              {message.attachments.map((attachment) => (
+                <span key={attachment.id || attachment.name}><FileIcon size={16} />{attachment.name}<small>{formatAttachmentSize(attachment.size)}</small></span>
+              ))}
+            </div>
+          ) : null}
         </div>
       </article>
     );
   }
 
-  const agent = agents.find((item) => item.id === message.agentId) || agents[0];
+  const agent = agents.find((item) => item.id === message.agentId) || { id: message.agentId, name: "已移除成员", avatar: "/assets/agents/agent-researcher.png" };
   return (
     <article className="message">
       <AgentAvatar agent={agent} />
@@ -324,7 +342,7 @@ function MessageItem({ message, agents }) {
   );
 }
 
-function CommandCard({ command, agent, writeLock, onInspect, onApprove, onDeny, onComplete }) {
+function CommandCard({ command, agent, writeLock, onInspect, onApprove, onDeny }) {
   const isApproved = command.status === "approved";
   const isCompleted = command.status === "completed";
   const isDenied = command.status === "denied";
@@ -362,9 +380,9 @@ function CommandCard({ command, agent, writeLock, onInspect, onApprove, onDeny, 
             </>
           ) : null}
           {isApproved ? (
-            command.source === "runtime"
+            ["runtime", "remote"].includes(command.source)
               ? <span className="decision-label decision-label--success"><ArrowsClockwise className="spin" size={17} />Codex 执行中</span>
-              : <button className="success-button" type="button" onClick={() => onComplete(command)}><CheckCircle size={17} />完成并释放写入锁</button>
+              : <span className="command-status-note">等待真实 Codex 返回完成状态</span>
           ) : null}
           {isCompleted ? <span className="decision-label decision-label--success"><CheckCircle size={17} />已完成</span> : null}
           {isDenied ? <span className="decision-label"><X size={17} />已拒绝</span> : null}
@@ -377,7 +395,11 @@ function CommandCard({ command, agent, writeLock, onInspect, onApprove, onDeny, 
   );
 }
 
-function Composer({ value, onChange, onSend, executionMode, onToggleMode, disabled }) {
+function Composer({ value, onChange, onSend, executionMode, onToggleMode, disabled, agents, attachments, onFilesSelected, onRemoveAttachment, sending, connectionLabel }) {
+  const textareaRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const cameraInputRef = useRef(null);
+  const [mentionOpen, setMentionOpen] = useState(false);
   const handleKeyDown = (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -385,19 +407,66 @@ function Composer({ value, onChange, onSend, executionMode, onToggleMode, disabl
     }
   };
 
+  const insertMention = (agent) => {
+    const textarea = textareaRef.current;
+    const start = textarea?.selectionStart ?? value.length;
+    const end = textarea?.selectionEnd ?? value.length;
+    const mention = `@${agent.name} `;
+    onChange(`${value.slice(0, start)}${mention}${value.slice(end)}`);
+    setMentionOpen(false);
+    window.requestAnimationFrame(() => {
+      textarea?.focus();
+      textarea?.setSelectionRange(start + mention.length, start + mention.length);
+    });
+  };
+
+  const receiveFiles = (fileList) => {
+    onFilesSelected(fileList);
+  };
+
   return (
     <div className="composer-wrap">
-      <div className="composer">
-        <button className="composer-tool composer-tool--mention" type="button" aria-label="提及成员"><At size={21} /></button>
+      {attachments.length ? (
+        <div className="attachment-tray" aria-label="待发送附件">
+          {attachments.map((attachment) => (
+            <div className="attachment-chip" key={attachment.clientId}>
+              {attachment.previewUrl ? <img src={attachment.previewUrl} alt="" /> : <FileIcon size={20} />}
+              <span><strong>{attachment.name}</strong><small>{formatAttachmentSize(attachment.size)}</small></span>
+              <button type="button" onClick={() => onRemoveAttachment(attachment.clientId)} aria-label={`移除${attachment.name}`}><X size={15} /></button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <div
+        className={classNames("composer", disabled && "is-disabled")}
+        onDragOver={(event) => event.preventDefault()}
+        onDrop={(event) => { event.preventDefault(); receiveFiles(event.dataTransfer.files); }}
+      >
+        <div className="mention-control">
+          <button className="composer-tool composer-tool--mention" type="button" aria-label="提及成员" onClick={() => setMentionOpen((open) => !open)} disabled={disabled}><At size={21} /></button>
+          {mentionOpen ? (
+            <div className="mention-menu" role="menu" aria-label="选择要提及的成员">
+              {agents.map((agent) => <button key={agent.id} type="button" role="menuitem" onClick={() => insertMention(agent)}><AgentAvatar agent={agent} /><span><strong>{agent.name}</strong><small>{agent.role}</small></span></button>)}
+            </div>
+          ) : null}
+        </div>
         <textarea
+          ref={textareaRef}
           value={value}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={handleKeyDown}
+          onPaste={(event) => {
+            const files = Array.from(event.clipboardData.files || []);
+            if (files.length) receiveFiles(files);
+          }}
           placeholder="@ 成员或输入消息，Enter 发送，Shift + Enter 换行"
           rows={1}
           disabled={disabled}
         />
-        <button className="composer-tool" type="button" aria-label="添加附件"><Paperclip size={22} /></button>
+        <input ref={fileInputRef} className="visually-hidden" type="file" multiple accept="image/*,audio/*,text/*,.md,.mdx,.csv,.tsv,.log,.json,.jsonl,.yaml,.yml,.xml,.html,.css,.js,.jsx,.mjs,.cjs,.ts,.tsx,.py,.ps1,.sh,.bat,.cmd,.sql,.toml,.ini,.java,.go,.rs,.c,.h,.cpp,.hpp,.cs,.php,.rb,.swift,.kt,.gradle" onChange={(event) => { receiveFiles(event.target.files); event.target.value = ""; }} />
+        <input ref={cameraInputRef} className="visually-hidden" type="file" accept="image/*" capture="environment" onChange={(event) => { receiveFiles(event.target.files); event.target.value = ""; }} />
+        <button className="composer-tool" type="button" aria-label="选择文件或照片" title="选择文件或照片" onClick={() => fileInputRef.current?.click()} disabled={disabled}><Paperclip size={22} /></button>
+        <button className="composer-tool" type="button" aria-label="拍照" title="拍照" onClick={() => cameraInputRef.current?.click()} disabled={disabled}><Camera size={22} /></button>
         <button
           className={classNames("composer-tool", executionMode && "is-active")}
           type="button"
@@ -407,12 +476,12 @@ function Composer({ value, onChange, onSend, executionMode, onToggleMode, disabl
         >
           <Code size={22} />
         </button>
-        <button className="send-button" type="button" onClick={onSend} disabled={disabled || !value.trim()} aria-label="发送消息">
-          <PaperPlaneTilt size={21} weight="fill" />
+        <button className="send-button" type="button" onClick={onSend} disabled={disabled || (!value.trim() && !attachments.length)} aria-label="发送消息">
+          {sending ? <ArrowsClockwise className="spin" size={20} /> : <PaperPlaneTilt size={21} weight="fill" />}
         </button>
       </div>
       <div className="composer-caption">
-        <span>{executionMode ? "当前项目团队调度：只分派给需发言的成员，不会向历史对话群发；写入仍需审批" : "仅讨论：不会提出命令执行请求，也不会向历史对话群发"}</span>
+        <span>{connectionLabel} · {executionMode ? "成员可申请写入，仍需逐次审批" : "仅分析，本轮强制只读"} · 支持图片、音频、文本和代码附件</span>
       </div>
     </div>
   );
@@ -431,7 +500,12 @@ function ChatView({
   onInspect,
   onApprove,
   onDeny,
-  onComplete,
+  attachments,
+  onFilesSelected,
+  onRemoveAttachment,
+  sending,
+  canSend,
+  connectionLabel,
 }) {
   const endRef = useRef(null);
   useEffect(() => {
@@ -443,7 +517,7 @@ function ChatView({
       <div className="message-scroll">
         {messages.map((message) => <MessageItem key={message.id} message={message} agents={agents} />)}
         {commands.map((command) => {
-          const agent = agents.find((item) => item.id === command.agentId) || agents[1];
+          const agent = agents.find((item) => item.id === command.agentId) || { id: command.agentId, name: "已移除成员", avatar: "/assets/agents/agent-researcher.png" };
           return (
             <CommandCard
               key={command.id}
@@ -453,7 +527,6 @@ function ChatView({
               onInspect={onInspect}
               onApprove={onApprove}
               onDeny={onDeny}
-              onComplete={onComplete}
             />
           );
         })}
@@ -465,6 +538,13 @@ function ChatView({
         onSend={onSend}
         executionMode={executionMode}
         onToggleMode={onToggleMode}
+        agents={agents}
+        attachments={attachments}
+        onFilesSelected={onFilesSelected}
+        onRemoveAttachment={onRemoveAttachment}
+        sending={sending}
+        disabled={!canSend || sending}
+        connectionLabel={connectionLabel}
       />
     </div>
   );
@@ -478,17 +558,19 @@ function HistoryView({ history, loading, error, onAttach }) {
   return (
     <div className="history-view">
       <div className="history-banner">
-        <div><ShieldCheck size={20} /><span>只读历史 · 尚未写入团队公共上下文</span></div>
+        <div><ShieldCheck size={20} /><span>只读历史：查看不会修改原对话；挂入后会复制可见正文到当前项目共享上下文</span></div>
         <button className="primary-button" type="button" onClick={onAttach}>挂入公共上下文</button>
       </div>
-      <div className="history-list">
-        {history.messages.length === 0 ? <div className="empty-panel">这个对话没有可导入的公开消息。</div> : null}
-        {history.messages.map((message) => (
-          <article key={message.id} className={classNames("history-message", `history-message--${message.role}`)}>
-            <strong>{message.role === "user" ? "你" : "Codex"}</strong>
-            <p>{message.text}</p>
-          </article>
-        ))}
+      <div className="history-scroll" tabIndex={0} aria-label="历史消息滚动区域">
+        <div className="history-list">
+          {history.messages.length === 0 ? <div className="empty-panel">这个对话没有可导入的公开消息。</div> : null}
+          {history.messages.map((message) => (
+            <article key={message.id} className={classNames("history-message", `history-message--${message.role}`)}>
+              <strong>{message.role === "user" ? "你" : "Codex"}</strong>
+              <p>{message.text}</p>
+            </article>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -586,7 +668,7 @@ function AgentSettingsView({ agents, onOpenAgent, onAddMember, onRemoveAgent }) 
             <div className="agent-settings-main"><strong>{agent.name} · {agent.role}</strong><p>{agent.description}</p></div>
             <div className="agent-settings-fact"><span>模型</span><strong>{MODEL_OPTIONS.find((item) => item.value === agent.model)?.label || agent.model}</strong></div>
             <div className="agent-settings-fact"><span>推理</span><strong>{agent.reasoning}</strong></div>
-            <div className="agent-settings-fact"><span>权限</span><strong>{agent.permission}</strong></div>
+            <div className="agent-settings-fact"><span>权限</span><strong>{PERMISSION_LABELS[agent.permission] || agent.permission}</strong></div>
             <SlidersHorizontal size={20} />
             </button>
             <button className="agent-settings-remove" type="button" aria-label={`从当前项目移除${agent.name}`} title="只从当前项目移除" onClick={() => onRemoveAgent(agent)}> <X size={18} weight="bold" /> </button>
@@ -597,7 +679,7 @@ function AgentSettingsView({ agents, onOpenAgent, onAddMember, onRemoveAgent }) 
   );
 }
 
-function SettingsView({ bridge, pairing, runtime, rooms, onConnectRuntime, onDisconnectRuntime, onExport, onReset }) {
+function SettingsView({ bridge, pairing, runtime, rooms, syncStatus, onConnectRuntime, onDisconnectRuntime, onExport, onReset }) {
   const privateCloud = isPrivateCloudHost();
   return (
     <div className="content-view">
@@ -606,7 +688,7 @@ function SettingsView({ bridge, pairing, runtime, rooms, onConnectRuntime, onDis
         <section className="settings-block">
           <div className="settings-icon"><Database size={22} /></div>
           <div className="settings-copy"><h3>本地 Codex 索引</h3><p>默认只扫描会话元数据；只有你打开具体线程时，才读取该线程的可见消息。</p></div>
-          <div className={classNames("settings-state", (bridge?.ok || pairing?.online) && "is-good")}>{bridge?.ok ? `${bridge.indexedThreads} 条会话` : privateCloud ? pairing?.online ? `${pairing.device?.label || "本机"}在线` : pairing?.paired ? "本机离线" : "等待本机配对" : "演示模式"}</div>
+          <div className={classNames("settings-state", (bridge?.ok || pairing?.online) && "is-good")}>{bridge?.ok ? `${bridge.indexedThreads} 条会话` : privateCloud ? pairing?.online ? `${pairing.device?.label || "本机"}在线` : pairing?.paired ? "本机离线" : "等待本机配对" : "本地索引未连接"}</div>
         </section>
         <section className="settings-block">
           <div className="settings-icon"><FolderOpen size={22} /></div>
@@ -614,14 +696,19 @@ function SettingsView({ bridge, pairing, runtime, rooms, onConnectRuntime, onDis
           <div className="settings-state">{rooms.length} 个项目</div>
         </section>
         <section className="settings-block">
+          <div className="settings-icon"><ArrowsClockwise size={22} /></div>
+          <div className="settings-copy"><h3>跨浏览器同步</h3><p>项目房间、成员配置、知识库、近期群聊和对话绑定保存在你的私人站点；手机与电脑使用同一份状态。</p></div>
+          <div className={classNames("settings-state", syncStatus === "已同步" && "is-good")}>{syncStatus}</div>
+        </section>
+        <section className="settings-block">
           <div className="settings-icon"><Code size={22} /></div>
-          <div className="settings-copy"><h3>真实成员运行时</h3><p>{runtime?.available ? "已找到独立 Codex CLI，可通过 App Server 为成员绑定独立线程。" : "当前使用安全模拟；安装独立 Codex CLI 后即可启用 App Server 适配器。"}</p></div>
+          <div className="settings-copy"><h3>真实成员运行时</h3><p>{privateCloud ? "任务经私人配对电脑进入 Codex App Server；不会生成模拟回复。" : runtime?.available ? "已找到独立 Codex CLI，可通过 App Server 为成员绑定独立线程。" : "未连接真实 Codex 时发送功能保持关闭，不生成模拟回复。"}</p></div>
           <div className={classNames("settings-state", runtime?.connected && "is-good")}>{runtime?.connected ? "真实模式" : runtime?.available ? "可启用" : "未启用"}</div>
         </section>
         <section className="settings-block">
           <div className="settings-icon"><GithubLogo size={22} /></div>
           <div className="settings-copy"><h3>开源发布准备</h3><p>不提交密钥、会话、数据库和用户项目；依赖许可证会生成第三方声明。</p></div>
-          <div className="settings-state is-good">合规审计中</div>
+          <div className="settings-state is-good">开源检查已启用</div>
         </section>
       </div>
       <div className="settings-actions">
@@ -631,7 +718,7 @@ function SettingsView({ bridge, pairing, runtime, rooms, onConnectRuntime, onDis
           </button>
         ) : null}
         <button className="secondary-button" type="button" onClick={onExport}>导出本地配置</button>
-        <button className="danger-button" type="button" onClick={onReset}>重置原型数据</button>
+        <button className="danger-button" type="button" onClick={onReset}>重置本机 Team Room 数据</button>
       </div>
     </div>
   );
@@ -694,9 +781,9 @@ function AgentDrawer({ agent, onClose, onSave, bindingThreads = [], isNew = fals
         <label className="field-label">说明<textarea rows={3} value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
         <label className="field-label">模型<select value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })}>{MODEL_OPTIONS.map((model) => <option key={model.value} value={model.value}>{model.label}</option>)}</select></label>
         <label className="field-label">推理强度<select value={form.reasoning} onChange={(event) => setForm({ ...form, reasoning: event.target.value })}><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select></label>
-        <label className="field-label">项目权限<select value={form.permission} onChange={(event) => setForm({ ...form, permission: event.target.value })}><option value="read-only">只读</option><option value="request-write">可申请写入</option><option value="coordinate">协调与审批建议</option></select></label>
+        <label className="field-label">项目权限<select value={form.permission} onChange={(event) => setForm({ ...form, permission: event.target.value })}><option value="read-only">只读分析（不能改文件或执行写入）</option><option value="request-write">可申请写入（每次必须由你批准）</option><option value="coordinate">协调与审批建议（不直接写入）</option></select><small>只读只限制这个成员对项目文件和命令的操作；不影响它读取当前项目共享上下文、分析附件或发言。</small></label>
         <label className="field-label">发言策略<select value={form.participation} onChange={(event) => setForm({ ...form, participation: event.target.value })}><option value="always">每条消息都路由</option><option value="relevant">职责相关时发言</option><option value="review">存在风险或需复核时发言</option><option value="knowledge">需要资料与知识时发言</option></select></label>
-        <label className="field-label">绑定对话<select value={form.threadBinding === "existing" && form.boundThreadId ? form.boundThreadId : "auto"} onChange={(event) => setForm({ ...form, threadBinding: event.target.value === "auto" ? "auto" : "existing", boundThreadId: event.target.value === "auto" ? null : event.target.value })}><option value="auto">自动创建独立对话（默认）</option>{bindingThreads.map((thread) => <option key={thread.id} value={thread.id}>{thread.title}</option>)}</select><small>默认会为此成员在当前项目创建独立 Codex 对话；选择历史对话后只复用这一条，不会向其他历史对话群发。</small></label>
+        <label className="field-label">绑定对话<select value={form.threadBinding === "existing" && form.boundThreadId ? form.boundThreadId : "auto"} onChange={(event) => setForm({ ...form, threadBinding: event.target.value === "auto" ? "auto" : "existing", boundThreadId: event.target.value === "auto" ? null : event.target.value })}><option value="auto">自动创建独立对话（默认）</option>{bindingThreads.map((thread) => <option key={thread.id} value={thread.id}>{thread.title}</option>)}</select><small>默认会为此成员创建并持续复用独立 Codex 对话；选择历史对话只复用这一条，不会群发，但原对话历史仍会影响回答。需要全新角色时请选择自动创建。</small></label>
         <label className="field-label">成员提示词<textarea rows={7} value={form.systemPrompt || createSafeMemberPrompt(form)} onChange={(event) => { setPromptEdited(true); setForm({ ...form, systemPrompt: event.target.value }); }} /><small>提示词会作为这个成员后续 Codex turn 的开发者指令传入；它只保存于当前项目房间。</small></label>
         <div className="drawer-security"><ShieldCheck size={20} /><span>模型可以建议操作，但写入命令必须经过项目执行闸门；成员不能跨项目读取或转发上下文。</span></div>
         <div className="drawer-actions"><button className="secondary-button" type="button" onClick={onClose}>取消</button><button className="primary-button" type="button" onClick={() => onSave({ ...form, systemPrompt: (form.systemPrompt || createSafeMemberPrompt(form)).trim() || createSafeMemberPrompt(form) })}>{isNew ? "添加成员" : "保存配置"}</button></div>
@@ -712,7 +799,7 @@ function CommandModal({ command, agent, onClose }) {
       <section className="modal command-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
         <header className="modal-header"><div><span className="eyebrow">执行审批</span><h2>{command.title}</h2></div><button className="icon-button" type="button" onClick={onClose}><X size={21} /></button></header>
         <div className="command-detail-grid"><span>申请成员</span><strong>{agent?.name}</strong><span>命令</span><code>{command.command}</code><span>目标</span><strong>{command.target}</strong><span>影响</span><strong>{command.impact}</strong><span>风险</span><strong>{command.risk}</strong><span>当前状态</span><strong>{command.status}</strong></div>
-        <div className="modal-note"><Info size={19} /><span>{command.source === "runtime" ? "这是 Codex App Server 的真实请求；只允许本次操作，服务端写入锁会阻止并发写入。" : "模拟模式只验证审批和单写入锁，不会在你的电脑上真正执行这条命令。"}</span></div>
+        <div className="modal-note"><Info size={19} /><span>这是 Codex App Server 的真实请求；只允许本次操作，服务端写入锁会阻止并发写入。</span></div>
       </section>
     </div>
   );
@@ -728,10 +815,13 @@ export function App() {
   const [activeView, setActiveView] = useState("chat");
   const [activeThreadId, setActiveThreadId] = useState("global");
   const [draft, setDraft] = useState("");
+  const [attachments, setAttachments] = useState([]);
+  const [sending, setSending] = useState(false);
   const [executionMode, setExecutionMode] = useState(true);
   const [bridge, setBridge] = useState(null);
   const [runtime, setRuntime] = useState(null);
   const [pairing, setPairing] = useState(null);
+  const [syncStatus, setSyncStatus] = useState("检查中");
   const [importOpen, setImportOpen] = useState(false);
   const [projects, setProjects] = useState([]);
   const [projectsLoading, setProjectsLoading] = useState(false);
@@ -744,8 +834,15 @@ export function App() {
   const [historyError, setHistoryError] = useState("");
   const [toast, setToast] = useState("");
   const autoLoadedRooms = useRef(new Set());
+  const attachmentUrls = useRef(new Set());
   const runtimeEventCursor = useRef(0);
   const remoteEventCursor = useRef(0);
+  const stateRef = useRef(state);
+  const cloudRevision = useRef(0);
+  const cloudHydrated = useRef(false);
+  const cloudSnapshotSignature = useRef("");
+  const cloudSaveTimer = useRef(null);
+  const cloudWriteBusy = useRef(false);
 
   const activeRoom = state.rooms.find((room) => room.id === state.activeRoomId) || state.rooms[0];
   const threads = state.threadCache[activeRoom.id] || DEFAULT_THREADS;
@@ -760,8 +857,20 @@ export function App() {
   const connectedPaths = useMemo(() => new Set(state.rooms.map((room) => room.path.toLowerCase())), [state.rooms]);
   const realRuntimeActive = Boolean(runtime?.connected && runtime.cwd?.toLowerCase() === activeRoom.path.toLowerCase());
   const privateCloud = isPrivateCloudHost();
+  const syncEndpoint = privateCloud ? "/api/state" : pairing?.configured ? "/api/sync/state" : null;
+  const canSendReal = privateCloud ? Boolean(pairing?.paired) : realRuntimeActive;
+  const connectionLabel = privateCloud
+    ? pairing?.online ? "真实 Codex 在线" : pairing?.paired ? "真实 Codex 离线排队" : "尚未配对真实 Codex"
+    : realRuntimeActive ? "真实 Codex 已连接" : "真实 Codex 未连接";
 
-  useEffect(() => saveState(state), [state]);
+  useEffect(() => {
+    stateRef.current = state;
+    saveState(state);
+  }, [state]);
+  useEffect(() => () => {
+    for (const url of attachmentUrls.current) URL.revokeObjectURL(url);
+    attachmentUrls.current.clear();
+  }, []);
   useEffect(() => {
     fetch("/api/health")
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("bridge unavailable")))
@@ -776,31 +885,120 @@ export function App() {
           }));
         }
       })
-      .catch(() => setBridge({ ok: false, mode: "demo", indexedThreads: 0 }));
+      .catch(() => setBridge({ ok: false, mode: "unavailable", indexedThreads: 0 }));
   }, []);
   useEffect(() => {
     fetch("/api/runtime/status")
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("runtime unavailable")))
       .then(setRuntime)
-      .catch(() => setRuntime({ available: false, reason: "静态演示模式" }));
+      .catch(() => setRuntime({ available: false, reason: "真实 Codex 运行时未连接" }));
   }, []);
   useEffect(() => {
-    if (!privateCloud) return undefined;
     let cancelled = false;
     const poll = async () => {
       try {
-        const response = await fetch("/api/pair/status");
+        const response = await fetch(privateCloud ? "/api/pair/status" : "/api/pair/local-status");
         if (!response.ok) throw new Error("pairing unavailable");
         const value = await response.json();
-        if (!cancelled) setPairing(value);
+        if (!cancelled) setPairing(privateCloud
+          ? value
+          : { ...value, paired: Boolean(value.configured), online: Boolean(value.running && !value.lastError) });
       } catch {
-        if (!cancelled) setPairing({ paired: false, online: false });
+        if (!cancelled) setPairing({ paired: false, online: false, configured: false });
       }
     };
     poll();
     const interval = window.setInterval(poll, 3_000);
     return () => { cancelled = true; window.clearInterval(interval); };
   }, [privateCloud]);
+  useEffect(() => {
+    if (!syncEndpoint) {
+      setSyncStatus("未启用");
+      cloudHydrated.current = false;
+      return undefined;
+    }
+    let cancelled = false;
+    const pull = async ({ initial = false } = {}) => {
+      try {
+        const response = await fetch(syncEndpoint, { headers: { "cache-control": "no-cache" } });
+        const value = await response.json();
+        if (!response.ok) throw new Error(value.message || value.error || "sync_read_failed");
+        if (cancelled) return;
+        if (value.state && Number(value.revision) > cloudRevision.current) {
+          cloudRevision.current = Number(value.revision) || 0;
+          cloudSnapshotSignature.current = JSON.stringify(value.state);
+          setState((current) => applyCloudSnapshot(current, value.state));
+        } else if (initial && !value.state) {
+          const snapshot = createCloudSnapshot(stateRef.current);
+          const created = await fetch(syncEndpoint, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ state: snapshot, baseRevision: 0 }),
+          });
+          const createdValue = await created.json();
+          if (!created.ok) throw new Error(createdValue.message || createdValue.error || "sync_create_failed");
+          cloudRevision.current = Number(createdValue.revision) || 1;
+          cloudSnapshotSignature.current = JSON.stringify(snapshot);
+        }
+        cloudHydrated.current = true;
+        setSyncStatus("已同步");
+      } catch {
+        if (!cancelled) setSyncStatus("暂时离线");
+      }
+    };
+    cloudRevision.current = 0;
+    cloudHydrated.current = false;
+    setSyncStatus("同步中");
+    pull({ initial: true });
+    const interval = window.setInterval(() => pull(), 2_500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [syncEndpoint]);
+  useEffect(() => {
+    if (!syncEndpoint || !cloudHydrated.current) return undefined;
+    const snapshot = createCloudSnapshot(state);
+    const signature = JSON.stringify(snapshot);
+    if (signature === cloudSnapshotSignature.current) return undefined;
+    if (cloudSaveTimer.current) window.clearTimeout(cloudSaveTimer.current);
+    setSyncStatus("同步中");
+    cloudSaveTimer.current = window.setTimeout(async () => {
+      if (cloudWriteBusy.current) return;
+      cloudWriteBusy.current = true;
+      try {
+        const response = await fetch(syncEndpoint, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ state: snapshot, baseRevision: cloudRevision.current }),
+        });
+        const value = await response.json();
+        if (response.status === 409) {
+          const latestResponse = await fetch(syncEndpoint, { headers: { "cache-control": "no-cache" } });
+          const latest = await latestResponse.json();
+          if (latestResponse.ok && latest.state) {
+            cloudRevision.current = Number(latest.revision) || 0;
+            cloudSnapshotSignature.current = JSON.stringify(latest.state);
+            setState((current) => applyCloudSnapshot(current, latest.state));
+          }
+          setToast("另一台设备刚更新了房间；已载入最新状态，请重试刚才的冲突操作");
+          setSyncStatus("已同步");
+          return;
+        }
+        if (!response.ok) throw new Error(value.message || value.error || "sync_write_failed");
+        cloudRevision.current = Number(value.revision) || cloudRevision.current + 1;
+        cloudSnapshotSignature.current = signature;
+        setSyncStatus("已同步");
+      } catch {
+        setSyncStatus("暂时离线");
+      } finally {
+        cloudWriteBusy.current = false;
+      }
+    }, 600);
+    return () => {
+      if (cloudSaveTimer.current) window.clearTimeout(cloudSaveTimer.current);
+    };
+  }, [state, syncEndpoint]);
   useEffect(() => {
     if (!toast) return undefined;
     const timeout = window.setTimeout(() => setToast(""), 2600);
@@ -825,7 +1023,11 @@ export function App() {
               next = { ...next, agentsByRoom: { ...next.agentsByRoom, [roomId]: (next.agentsByRoom?.[roomId] || []).map((agent) => agent.id === event.agentId ? { ...agent, boundThreadId: event.threadId, threadBinding: event.bindingMode || agent.threadBinding || "auto" } : agent) } };
             }
             if (event.type === "agentMessage" && event.text) {
-              next = { ...next, messagesByRoom: { ...next.messagesByRoom, [roomId]: [...(next.messagesByRoom[roomId] || []), { id: `runtime-message-${event.sequence}`, kind: "agent", agentId: event.agentId, time: nowLabel(), text: event.text }] } };
+              const messageId = `runtime-message-${event.sequence}`;
+              const existingMessages = next.messagesByRoom[roomId] || [];
+              if (!existingMessages.some((message) => message.id === messageId)) {
+                next = { ...next, messagesByRoom: { ...next.messagesByRoom, [roomId]: [...existingMessages, { id: messageId, kind: "agent", agentId: event.agentId, threadId: event.threadId || null, time: nowLabel(), text: event.text }] } };
+              }
             }
             if (event.type === "approvalRequested") {
               const commandId = `runtime-command-${event.requestId}`;
@@ -872,7 +1074,11 @@ export function App() {
               next = { ...next, agentsByRoom: { ...next.agentsByRoom, [roomId]: (next.agentsByRoom?.[roomId] || []).map((agent) => agent.id === payload.agentId ? { ...agent, boundThreadId: payload.threadId, threadBinding: payload.bindingMode || agent.threadBinding || "auto" } : agent) } };
             }
             if (event.event_type === "agentMessage" && payload.text) {
-              next = { ...next, messagesByRoom: { ...next.messagesByRoom, [roomId]: [...(next.messagesByRoom[roomId] || []), { id: `remote-message-${event.sequence}`, kind: "agent", agentId: payload.agentId, time: nowLabel(), text: payload.text }] } };
+              const messageId = `remote-message-${event.sequence}`;
+              const existingMessages = next.messagesByRoom[roomId] || [];
+              if (!existingMessages.some((message) => message.id === messageId)) {
+                next = { ...next, messagesByRoom: { ...next.messagesByRoom, [roomId]: [...existingMessages, { id: messageId, kind: "agent", agentId: payload.agentId, threadId: payload.threadId || null, time: nowLabel(), text: payload.text }] } };
+              }
             }
             if (event.event_type === "approvalRequested") {
               const commandId = `remote-command-${payload.requestId}`;
@@ -961,6 +1167,7 @@ export function App() {
     setHistory(null);
     setOpenAgentId(null);
     setNewMember(null);
+    clearSelectedAttachments();
     if (room) fetchThreads(room, { notifyOnError: true });
   };
 
@@ -976,7 +1183,7 @@ export function App() {
     setActiveThreadId(thread.id);
     setHistory(null);
     setHistoryError("");
-    if (thread.id === "global" || thread.kind === "demo") return;
+    if (thread.id === "global") return;
     setHistoryLoading(true);
     try {
       if (privateCloud) {
@@ -1032,7 +1239,7 @@ export function App() {
       ...current,
       rooms: [...current.rooms, room],
       activeRoomId: roomId,
-      messagesByRoom: { ...current.messagesByRoom, [roomId]: [{ id: `welcome-${roomId}`, kind: "system", time: nowLabel(), text: `已以只读方式接入 ${project.name}，发现 ${project.threadCount} 个历史对话` }] },
+      messagesByRoom: { ...current.messagesByRoom, [roomId]: [{ id: `welcome-${roomId}`, kind: "system", time: nowLabel(), text: `已安全接入 ${project.name}，发现 ${project.threadCount} 个历史对话；查看历史不会修改原对话` }] },
       commandsByRoom: { ...current.commandsByRoom, [roomId]: [] },
       knowledgeByRoom: { ...current.knowledgeByRoom, [roomId]: [] },
       threadCache: { ...current.threadCache, [roomId]: [{ id: "global", title: "团队调度台", time: "现在", kind: "room" }] },
@@ -1100,93 +1307,106 @@ export function App() {
       const status = await postJson("/api/runtime/disconnect", {});
       setRuntime(status);
       setState((current) => ({ ...current, writeLocksByRoom: { ...current.writeLocksByRoom, [activeRoom.id]: null } }));
-      setToast("已断开真实运行时，回到安全模拟");
+      setToast("已断开真实运行时；发送功能已关闭");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "断开失败");
     }
   };
 
-  const sendMessage = () => {
-    const text = draft.trim();
-    if (!text) return;
+  const addSelectedFiles = (fileList) => {
+    const { accepted, errors } = validateSelectedFiles(fileList, attachments.length);
+    if (errors.length) setToast(errors[0]);
+    if (!accepted.length) return;
+    setAttachments((current) => [...current, ...accepted.map((file) => {
+      const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : null;
+      if (previewUrl) attachmentUrls.current.add(previewUrl);
+      return { clientId: `attachment-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, name: file.name, type: file.type || "application/octet-stream", size: file.size, file, previewUrl };
+    })]);
+  };
+
+  const removeSelectedAttachment = (clientId) => {
+    setAttachments((current) => {
+      const removed = current.find((item) => item.clientId === clientId);
+      if (removed?.previewUrl) {
+        URL.revokeObjectURL(removed.previewUrl);
+        attachmentUrls.current.delete(removed.previewUrl);
+      }
+      return current.filter((item) => item.clientId !== clientId);
+    });
+  };
+
+  const clearSelectedAttachments = () => {
+    for (const attachment of attachments) {
+      if (attachment.previewUrl) {
+        URL.revokeObjectURL(attachment.previewUrl);
+        attachmentUrls.current.delete(attachment.previewUrl);
+      }
+    }
+    setAttachments([]);
+  };
+
+  const uploadAttachment = async (attachment) => {
+    const response = await fetch("/api/attachments", {
+      method: "POST",
+      headers: { "content-type": attachment.type, "x-file-name": encodeURIComponent(attachment.name) },
+      body: attachment.file,
+    });
+    const value = await response.json();
+    if (!response.ok || !value.attachment?.id) throw new Error(value.error || `附件上传失败：${attachment.name}`);
+    return value.attachment;
+  };
+
+  const sendMessage = async () => {
+    const visibleText = draft.trim();
+    if ((!visibleText && !attachments.length) || sending) return;
     if (!agents.length) {
       setToast("当前项目没有成员；请先在成员配置中新增成员");
       return;
     }
-    const decisions = decideParticipation(text, agents);
-    const userMessage = { id: `user-${Date.now()}`, kind: "user", time: nowLabel(), text };
-    const silentNames = decisions.filter((item) => item.decision === "silent").map((item) => agents.find((agent) => agent.id === item.agentId)?.name).filter(Boolean);
+    if (!canSendReal) {
+      setToast(privateCloud ? "请先完成私人电脑配对" : "请先在设置中启用真实 Codex 成员");
+      return;
+    }
 
-    setDraft("");
-    setState((current) => ({
-      ...current,
-      agentsByRoom: { ...current.agentsByRoom, [activeRoom.id]: (current.agentsByRoom?.[activeRoom.id] || []).map((agent) => ({ ...agent, status: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "thinking" : "silent", statusLabel: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "判断中" : "静默中" })) },
-      messagesByRoom: {
-        ...current.messagesByRoom,
-        [activeRoom.id]: [
+    setSending(true);
+    let uploaded = [];
+    try {
+      uploaded = await Promise.all(attachments.map(uploadAttachment));
+      const text = visibleText || `请查看并处理附件：${uploaded.map((item) => item.name).join("、")}`;
+      const decisions = decideParticipation(text, agents);
+      const dispatchAgents = executionMode ? agents : agents.map((agent) => agent.permission === "request-write" ? { ...agent, permission: "read-only" } : agent);
+      const messageId = `user-${Date.now()}`;
+      const contextId = globalThis.crypto?.randomUUID ? `context-${globalThis.crypto.randomUUID()}` : `context-${Date.now()}`;
+      const sharedContext = buildRoomSharedContext({ room: activeRoom, messages, knowledge, agents, contextId });
+      const silentNames = decisions.filter((item) => item.decision === "silent").map((item) => agents.find((agent) => agent.id === item.agentId)?.name).filter(Boolean);
+      let dispatchLabel;
+
+      if (privateCloud) {
+        await postJson("/api/remote/tasks", { text, decisions, agents: dispatchAgents, attachments: uploaded, sharedContext, roomId: activeRoom.id, messageId, cwd: activeRoom.path });
+        dispatchLabel = pairing.online ? "已发送到配对电脑的真实 Codex" : "真实任务已排队，电脑上线后执行";
+      } else {
+        const result = await postJson("/api/runtime/dispatch", { text, decisions, attachments: uploaded, sharedContext, executionMode, messageId, roomId: activeRoom.id });
+        dispatchLabel = `已分派到 ${result.turns.length} 个真实 Codex 成员对话 · 上下文 ${contextId.slice(-8)}`;
+      }
+
+      const userMessage = { id: messageId, kind: "user", time: nowLabel(), text: visibleText, attachments: uploaded.map(({ id, name, type, size }) => ({ id, name, type, size })) };
+      setState((current) => ({
+        ...current,
+        agentsByRoom: { ...current.agentsByRoom, [activeRoom.id]: (current.agentsByRoom?.[activeRoom.id] || []).map((agent) => ({ ...agent, status: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "thinking" : "silent", statusLabel: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "真实处理中" : "本轮静默" })) },
+        messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [
           ...(current.messagesByRoom[activeRoom.id] || []),
           userMessage,
-          ...(silentNames.length ? [{ id: `silent-${Date.now()}`, kind: "system", time: nowLabel(), text: `${silentNames.join("、")}判断与当前职责无关，保持静默` }] : []),
-        ],
-      },
-    }));
-
-    if (privateCloud) {
-      if (!pairing?.paired) {
-        setToast("这台私人站点还没有和电脑配对");
-        return;
-      }
-      postJson("/api/remote/tasks", { text, decisions, agents, roomId: activeRoom.id, messageId: userMessage.id, cwd: activeRoom.path })
-        .then(() => {
-          setState((current) => ({
-            ...current,
-            messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `remote-dispatch-${Date.now()}`, kind: "system", time: nowLabel(), text: pairing.online ? "已安全发送到配对电脑" : "电脑当前离线，任务已在私人队列中等待" }] },
-          }));
-        })
-        .catch((error) => setToast(error instanceof Error ? error.message : "发送到配对电脑失败"));
-    } else if (realRuntimeActive) {
-      postJson("/api/runtime/dispatch", { text, decisions, messageId: userMessage.id, roomId: activeRoom.id })
-        .then((result) => {
-          setState((current) => ({
-            ...current,
-            messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `runtime-dispatch-${Date.now()}`, kind: "system", time: nowLabel(), text: `已分派到 ${result.turns.length} 个真实 Codex 成员线程` }] },
-          }));
-        })
-        .catch((error) => setToast(error instanceof Error ? error.message : "真实成员分派失败"));
-    } else {
-      window.setTimeout(() => {
-        const speakers = decisions.filter((item) => item.decision === "speak");
-        setState((current) => ({
-          ...current,
-          agentsByRoom: { ...current.agentsByRoom, [activeRoom.id]: (current.agentsByRoom?.[activeRoom.id] || []).map((agent) => ({ ...agent, status: speakers.some((item) => item.agentId === agent.id) ? "active" : "silent", statusLabel: speakers.some((item) => item.agentId === agent.id) ? "活跃中" : "静默中" })) },
-          messagesByRoom: {
-            ...current.messagesByRoom,
-            [activeRoom.id]: [
-              ...(current.messagesByRoom[activeRoom.id] || []),
-              ...speakers.map((decision, index) => {
-                const agent = (current.agentsByRoom?.[activeRoom.id] || []).find((item) => item.id === decision.agentId);
-                return { id: `reply-${Date.now()}-${index}`, kind: "agent", agentId: agent.id, time: nowLabel(), text: createAgentReply(agent, text) };
-              }),
-            ],
-          },
-        }));
-      }, 650);
-
-      const commandAgent = commandRequestingAgent(decisions, agents);
-      if (executionMode && commandAgent && shouldRequestCommand(text, decisions, agents)) {
-        window.setTimeout(() => {
-          setState((current) => ({
-            ...current,
-            commandsByRoom: {
-              ...current.commandsByRoom,
-              [activeRoom.id]: [
-                ...(current.commandsByRoom[activeRoom.id] || []),
-                { id: `command-${Date.now()}`, agentId: commandAgent.id, title: `由${commandAgent.name}准备受控执行`, command: "codex-team-room task run --approval once", summary: `${commandAgent.name}已完成影响评估，等待你授予一次性写入权限。`, target: activeRoom.path, impact: "待审批", risk: "中", status: "pending", time: nowLabel() },
-              ],
-            },
-          }));
-        }, 1050);
-      }
+          ...(silentNames.length ? [{ id: `silent-${Date.now()}`, kind: "system", time: nowLabel(), text: `${silentNames.join("、")}按当前项目发言策略保持静默` }] : []),
+          { id: `dispatch-${Date.now()}`, kind: "system", time: nowLabel(), text: dispatchLabel },
+        ] },
+      }));
+      setDraft("");
+      clearSelectedAttachments();
+    } catch (error) {
+      await Promise.all(uploaded.map((attachment) => fetch(`/api/attachments/${encodeURIComponent(attachment.id)}`, { method: "DELETE" }).catch(() => null)));
+      setToast(error instanceof Error ? error.message : "真实任务发送失败");
+    } finally {
+      setSending(false);
     }
   };
 
@@ -1235,27 +1455,20 @@ export function App() {
     setToast("执行请求已拒绝");
   };
 
-  const completeCommand = (command) => {
-    setState((current) => ({
-      ...current,
-      writeLocksByRoom: { ...current.writeLocksByRoom, [activeRoom.id]: current.writeLocksByRoom?.[activeRoom.id]?.commandId === command.id ? null : current.writeLocksByRoom?.[activeRoom.id] || null },
-      commandsByRoom: { ...current.commandsByRoom, [activeRoom.id]: (current.commandsByRoom[activeRoom.id] || []).map((item) => item.id === command.id ? { ...item, status: "completed" } : item) },
-      messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `completed-${Date.now()}`, kind: "agent", agentId: command.agentId, time: nowLabel(), text: "受控操作已经完成，写入锁已释放，等待审核复核。" }] },
-    }));
-    setToast("操作完成，写入锁已释放");
-  };
-
   const saveAgent = (nextAgent) => {
     if (realRuntimeActive) {
       setToast("请先断开真实成员运行时，再修改当前项目成员配置");
       return;
     }
+    const previousAgent = agents.find((agent) => agent.id === nextAgent.id) || null;
     const normalized = {
       ...nextAgent,
       name: nextAgent.name.trim() || "未命名成员",
       role: nextAgent.role.trim() || "项目协作者",
       systemPrompt: String(nextAgent.systemPrompt || createSafeMemberPrompt(nextAgent)).trim().slice(0, 12_000) || createSafeMemberPrompt(nextAgent),
     };
+    const promptChanged = previousAgent && previousAgent.systemPrompt !== normalized.systemPrompt;
+    if (promptChanged && normalized.threadBinding === "auto") normalized.boundThreadId = null;
     if (normalized.threadBinding === "existing" && !threads.some((thread) => thread.kind === "codex" && thread.id === normalized.boundThreadId)) {
       setToast("只能绑定当前项目列表中的已有对话；请刷新后重新选择");
       return;
@@ -1271,7 +1484,11 @@ export function App() {
     }));
     setOpenAgentId(null);
     setNewMember(null);
-    setToast(newMember?.id === normalized.id ? `${normalized.name}已加入当前项目` : `${normalized.name}配置已保存`);
+    setToast(newMember?.id === normalized.id
+      ? `${normalized.name}已加入当前项目`
+      : promptChanged && normalized.threadBinding === "auto"
+        ? `${normalized.name}提示词已保存；下次将创建新的独立对话以确保生效`
+        : `${normalized.name}配置已保存`);
   };
 
   const addMember = () => {
@@ -1311,11 +1528,12 @@ export function App() {
 
   const attachHistory = () => {
     if (!history) return;
+    const visibleTranscript = history.messages.slice(-120).map((message) => `${message.role === "user" ? "用户" : "Codex"}：${String(message.text || "").slice(0, 4_000)}`).join("\n\n").slice(0, 40_000);
     const entry = {
       id: `knowledge-history-${Date.now()}`,
       title: history.thread.title,
       category: "历史对话",
-      body: `已挂载 ${history.messages.length} 条可见消息作为只读历史依据。原始对话保持不变。`,
+      body: `来源对话：${history.thread.title}\n已复制 ${Math.min(history.messages.length, 120)} 条可见消息到当前项目共享上下文；原始对话保持不变。\n\n${visibleTranscript}`,
       updatedAt: `今天 ${nowLabel()}`,
     };
     setState((current) => ({
@@ -1341,18 +1559,20 @@ export function App() {
   };
 
   const resetPrototype = () => {
-    if (!window.confirm("重置本地原型数据？这个操作不会删除任何 Codex 对话或项目文件。")) return;
+    if (!window.confirm(syncEndpoint
+      ? "重置已同步的 Team Room 配置与房间状态？这个变化会同步到你的其他浏览器，但不会删除任何 Codex 对话或项目文件。"
+      : "重置这台设备上的 Team Room 配置与房间状态？这个操作不会删除任何 Codex 对话或项目文件。")) return;
     const next = resetState();
     setState(next);
     setActiveView("chat");
     setActiveThreadId("global");
-    setToast("原型数据已重置");
+    setToast("本机 Team Room 数据已重置");
   };
 
   const renderCenter = () => {
     if (activeView === "knowledge") return <KnowledgeView entries={knowledge} onAdd={addKnowledge} />;
     if (activeView === "agents") return <AgentSettingsView agents={agents} onOpenAgent={openAgentEditor} onAddMember={addMember} onRemoveAgent={removeAgent} />;
-    if (activeView === "settings") return <SettingsView bridge={bridge} pairing={pairing} runtime={runtime} rooms={state.rooms} onConnectRuntime={connectRuntime} onDisconnectRuntime={disconnectRuntime} onExport={exportConfig} onReset={resetPrototype} />;
+    if (activeView === "settings") return <SettingsView bridge={bridge} pairing={pairing} runtime={runtime} rooms={state.rooms} syncStatus={syncStatus} onConnectRuntime={connectRuntime} onDisconnectRuntime={disconnectRuntime} onExport={exportConfig} onReset={resetPrototype} />;
     if (activeThreadId !== "global") return <HistoryView history={history} loading={historyLoading} error={historyError} onAttach={attachHistory} />;
     return (
       <ChatView
@@ -1368,7 +1588,12 @@ export function App() {
         onInspect={(command) => setInspectedCommandId(command.id)}
         onApprove={approveCommand}
         onDeny={denyCommand}
-        onComplete={completeCommand}
+        attachments={attachments}
+        onFilesSelected={addSelectedFiles}
+        onRemoveAttachment={removeSelectedAttachment}
+        sending={sending}
+        canSend={canSendReal}
+        connectionLabel={connectionLabel}
       />
     );
   };

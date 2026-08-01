@@ -63,6 +63,31 @@ test("dispatch creates one persistent thread per speaking member", async () => {
   assert.equal(manager.status().agentThreads.developer, "thread-developer");
 });
 
+test("independent member conversations receive the same context id and execution-off is enforced server-side", async () => {
+  const { manager, protocol, agents } = createManager();
+  await manager.connect({ cwd: "G:\\project", roomId: "room-proof", agents, confirmed: true });
+  const sharedContext = {
+    id: "context-shared-proof",
+    roomId: "room-proof",
+    roomName: "真实项目",
+    recentMessages: [{ role: "agent", agentName: "审核", sourceThreadId: "thread-reviewer", text: "发现一个风险" }],
+  };
+  const result = await manager.dispatch({
+    text: "请共同确认",
+    decisions: [{ agentId: "coordinator", decision: "speak" }, { agentId: "developer", decision: "speak" }],
+    messageId: "message-proof",
+    roomId: "room-proof",
+    sharedContext,
+    executionMode: false,
+  });
+
+  assert.deepEqual(result.turns.map((turn) => turn.threadId).sort(), ["thread-coordinator", "thread-developer"]);
+  assert.equal(new Set(protocol.startedTurns.map((turn) => turn.sharedContext.id)).size, 1);
+  assert.ok(protocol.startedTurns.every((turn) => turn.sharedContext.id === "context-shared-proof"));
+  assert.equal(protocol.startedTurns.find((turn) => turn.agent.id === "developer").agent.permission, "read-only");
+  assert.equal(protocol.startedTurns.find((turn) => turn.agent.id === "coordinator").agent.permission, "coordinate");
+});
+
 test("an explicit current-project binding is resumed, while an automatic member gets its own thread", async () => {
   const { manager, protocol, agents } = createManager();
   agents[1] = { ...agents[1], boundThreadId: "thread-existing-project", threadBinding: "existing" };
@@ -144,6 +169,14 @@ test("async runtime messages keep the room and task that started their turn", as
   assert.equal(event.type, "agentMessage");
   assert.equal(event.roomId, "room-a");
   assert.equal(event.taskId, "task-a");
+  assert.equal(protocol.resumedThreads.length, 0);
+  await manager.dispatch({
+    text: "继续验证",
+    decisions: [{ agentId: "developer", decision: "speak" }],
+    messageId: "message-b",
+    roomId: "room-a",
+    taskId: "task-b",
+  });
   assert.equal(protocol.resumedThreads.length, 1);
 });
 

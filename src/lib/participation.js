@@ -21,7 +21,6 @@ function lexicalHints(agent) {
   }
   return [...hints];
 }
-
 function participationFor(agent) {
   if (["always", "relevant", "review", "knowledge"].includes(agent.participation)) return agent.participation;
   return agent.id === "coordinator" ? "always" : "relevant";
@@ -57,28 +56,4 @@ export function decideParticipation(text, agents) {
 
     return { agentId: agent.id, decision: shouldSpeak ? "speak" : "silent", reason };
   });
-}
-
-export function createAgentReply(agent, text) {
-  const shortText = text.length > 44 ? `${text.slice(0, 44)}…` : text;
-  const replies = {
-    coordinator: `收到。我会围绕“${shortText}”协调分工，并把确认结果同步到公共上下文。`,
-    developer: "我可以负责实现部分。我会先列出影响范围，涉及写入时再提交审批。",
-    reviewer: "我会独立检查边界、风险和验收条件，不直接修改文件。",
-    researcher: "我会核对相关资料，并把可复用结论整理进知识库。",
-  };
-  return replies[agent.id] ?? `${agent.name || "成员"}会按当前项目中的${agent.role || "协作职责"}处理。`;
-}
-
-export function commandRequestingAgent(decisions, agents) {
-  const agentsById = new Map((agents || []).map((agent) => [agent.id, agent]));
-  return (decisions || [])
-    .filter((item) => item.decision === "speak")
-    .map((item) => agentsById.get(item.agentId))
-    .find((agent) => agent?.permission === "request-write") || null;
-}
-
-export function shouldRequestCommand(text, decisions, agents) {
-  const actionWords = ["执行", "运行", "修改", "实现", "修复", "构建", "安装", "提交"];
-  return Boolean(commandRequestingAgent(decisions, agents)) && actionWords.some((word) => String(text || "").includes(word));
 }

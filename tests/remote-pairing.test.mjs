@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { createServer } from "node:http";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { decodeUtf8Base64, encodeUtf8Base64, RemotePairingBridge, sanitizeRuntimeEvent, windowsNativeRequest } from "../server/remotePairingBridge.mjs";
 
@@ -224,6 +227,66 @@ test("paired bridge refuses existing thread bindings that are not part of the re
 
   assert.deepEqual(runtime.connectCalls, []);
   assert.deepEqual(results, [{ ok: false, error: "remote_thread_binding_not_found" }]);
+});
+
+test("remote attachment downloads pass absolute local paths and shared context to runtime dispatch on repeat processing", async () => {
+  const taskId = `task-attachment-repeat-${process.pid}`;
+  const attachmentDirectory = path.join(os.tmpdir(), "codex-team-room-attachments", taskId);
+  fs.rmSync(attachmentDirectory, { recursive: true, force: true });
+  const runtime = {
+    connectCalls: [],
+    dispatchCalls: [],
+    async connect(value) { this.connectCalls.push(value); },
+    async dispatch(value) { this.dispatchCalls.push(value); },
+  };
+  const taskResults = [];
+  let downloadCount = 0;
+  const sharedContext = { id: "shared-remote-attachment", roomName: "远程附件", recentMessages: [{ role: "user", text: "请读取附件" }] };
+  const bridge = new RemotePairingBridge({
+    runtime,
+    fetchImpl: async (url, options = {}) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/api/device/attachments/attachment-1") {
+        downloadCount += 1;
+        return Response.json({ name: "资料.txt", type: "text/plain", dataBase64: Buffer.from("远程附件内容").toString("base64") });
+      }
+      if (pathname.endsWith(`/api/device/tasks/${taskId}/result`)) {
+        taskResults.push(JSON.parse(options.body));
+        return Response.json({ ok: true });
+      }
+      throw new Error(`unexpected_request:${pathname}`);
+    },
+    indexProvider: { listProjects: () => [{ path: "G:\\project-two", exists: true }] },
+  });
+  bridge.config = { siteUrl: "https://private.example", deviceSecret: "device-secret", siwcBypassToken: "bypass-token", cwd: "G:\\project", deviceId: "device-1", deviceLabel: "工作电脑" };
+  const task = {
+    id: taskId,
+    room_id: "room-two",
+    cwd: "G:\\project-two",
+    text: "处理远程附件",
+    message_id: "message-attachment",
+    decisions: [{ agentId: "coordinator", decision: "speak" }],
+    agents: [{ id: "coordinator" }],
+    attachments: [{ id: "attachment-1", name: "资料.txt", type: "text/plain" }],
+    sharedContext,
+  };
+
+  try {
+    await bridge.processTask(task);
+    await bridge.processTask(task);
+
+    assert.equal(runtime.dispatchCalls.length, 2);
+    assert.deepEqual(runtime.dispatchCalls[0].sharedContext, sharedContext);
+    assert.equal(runtime.dispatchCalls[0].attachments.length, 1);
+    const [attachment] = runtime.dispatchCalls[0].attachments;
+    assert.equal(path.isAbsolute(attachment.path), true);
+    assert.equal(fs.readFileSync(attachment.path, "utf8"), "远程附件内容");
+    assert.equal(runtime.dispatchCalls[1].attachments[0].path, attachment.path);
+    assert.equal(downloadCount, 2);
+    assert.deepEqual(taskResults, [{ ok: true }, { ok: true }]);
+  } finally {
+    fs.rmSync(attachmentDirectory, { recursive: true, force: true });
+  }
 });
 
 test("Windows-native request fallback handles a Cloudflare block without exposing a second API", async () => {

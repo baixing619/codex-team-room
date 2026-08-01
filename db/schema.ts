@@ -8,6 +8,13 @@ export const pairedDevices = sqliteTable("paired_devices", {
   lastSeenAt: text("last_seen_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
 
+export const ownerState = sqliteTable("owner_state", {
+  userId: text("user_id").primaryKey(),
+  revision: integer("revision").notNull().default(1),
+  stateJson: text("state_json").notNull(),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});
+
 export const remoteTasks = sqliteTable("remote_tasks", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull(),
@@ -17,6 +24,8 @@ export const remoteTasks = sqliteTable("remote_tasks", {
   text: text("text").notNull(),
   decisionsJson: text("decisions_json").notNull(),
   agentsJson: text("agents_json").notNull(),
+  attachmentsJson: text("attachments_json").notNull().default("[]"),
+  sharedContextJson: text("shared_context_json").notNull().default("{}"),
   status: text("status").notNull().default("pending"),
   error: text("error"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),

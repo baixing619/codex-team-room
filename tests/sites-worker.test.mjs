@@ -46,6 +46,116 @@ function createIndexRequestDb() {
   };
 }
 
+function createAttachmentTaskEnv() {
+  const objects = new Map();
+  const tasks = new Map();
+  const deletedObjects = [];
+  const attachments = {
+    async put(key, value, options) {
+      objects.set(key, {
+        bytes: new Uint8Array(value),
+        customMetadata: { ...options.customMetadata },
+      });
+    },
+    async head(key) {
+      const object = objects.get(key);
+      return object ? { size: object.bytes.byteLength, customMetadata: { ...object.customMetadata } } : null;
+    },
+    async get(key) {
+      const object = objects.get(key);
+      if (!object) return null;
+      return {
+        customMetadata: { ...object.customMetadata },
+        arrayBuffer: async () => object.bytes.slice().buffer,
+      };
+    },
+    async delete(key) {
+      deletedObjects.push(key);
+      objects.delete(key);
+    },
+  };
+  const db = {
+    batch: async () => [],
+    prepare(sql) {
+      let values = [];
+      return {
+        bind(...next) { values = next; return this; },
+        async run() {
+          if (sql.startsWith("INSERT INTO remote_tasks")) {
+            const [id, user_id, room_id, message_id, cwd, text, decisions_json, agents_json, attachments_json, shared_context_json] = values;
+            tasks.set(id, { id, user_id, room_id, message_id, cwd, text, decisions_json, agents_json, attachments_json, shared_context_json, status: "pending", created_at: "2026-08-01 00:00:00" });
+            return { meta: { changes: 1 } };
+          }
+          if (sql.startsWith("UPDATE remote_tasks SET status = 'claimed'")) {
+            const task = tasks.get(values[0]);
+            if (!task || task.status !== "pending") return { meta: { changes: 0 } };
+            task.status = "claimed";
+            return { meta: { changes: 1 } };
+          }
+          if (sql.startsWith("UPDATE remote_tasks SET status = ?")) {
+            const [status, error, id] = values;
+            const task = tasks.get(id);
+            if (task?.status === "claimed") Object.assign(task, { status, error });
+            return { meta: { changes: task ? 1 : 0 } };
+          }
+          return { meta: { changes: 0 } };
+        },
+        async first() {
+          if (sql.includes("FROM remote_tasks WHERE status = 'pending'")) {
+            return Array.from(tasks.values()).find((task) => task.status === "pending") || null;
+          }
+          if (sql.startsWith("SELECT attachments_json FROM remote_tasks WHERE id = ?")) {
+            const task = tasks.get(values[0]);
+            return task ? { attachments_json: task.attachments_json } : null;
+          }
+          return null;
+        },
+      };
+    },
+  };
+  return {
+    env: { DB: db, ATTACHMENTS: attachments, TEAM_ROOM_DEVICE_SECRET: "device-secret" },
+    objects,
+    tasks,
+    deletedObjects,
+  };
+}
+
+function createOwnerStateEnv() {
+  let row = null;
+  return {
+    TEAM_ROOM_DEVICE_SECRET: "device-secret",
+    DB: {
+      batch: async () => [],
+      prepare(sql) {
+        let values = [];
+        return {
+          bind(...next) { values = next; return this; },
+          async run() {
+            if (sql.startsWith("INSERT INTO owner_state")) {
+              if (row) throw new Error("unique_constraint");
+              const [user_id, revision, state_json] = values;
+              row = { user_id, revision, state_json, updated_at: "2026-08-01 00:00:00" };
+              return { meta: { changes: 1 } };
+            }
+            if (sql.startsWith("UPDATE owner_state SET revision")) {
+              const [revision, state_json, user_id, expectedRevision] = values;
+              if (!row || row.user_id !== user_id || row.revision !== expectedRevision) return { meta: { changes: 0 } };
+              row = { ...row, revision, state_json, updated_at: "2026-08-01 00:00:01" };
+              return { meta: { changes: 1 } };
+            }
+            return { meta: { changes: 0 } };
+          },
+          async first() {
+            if (sql.startsWith("SELECT revision, state_json, updated_at FROM owner_state")) return row ? { ...row } : null;
+            return null;
+          },
+        };
+      },
+    },
+  };
+}
+
 test("serves existing static assets without a fallback", async () => {
   const calls = [];
   const response = await worker.fetch(new Request("https://example.test/assets/app.js"), {
@@ -218,6 +328,113 @@ test("reclaims expired task and approval claims before returning them to the dev
     assert.equal((await response.json())[scenario.property].id, scenario.row.id);
     assert.ok(statements.some(({ sql }) => sql.startsWith(`UPDATE ${scenario.table} SET status = 'pending'`)));
   }
+});
+
+test("owner and paired device share cloud state with revision CAS conflict protection", async () => {
+  const env = createOwnerStateEnv();
+  const ownerHeaders = { origin: "https://example.test", "content-type": "application/json" };
+  const deviceHeaders = { "x-team-room-device-secret": "device-secret", "content-type": "application/json" };
+
+  const empty = await worker.fetch(new Request("https://example.test/api/state", { headers: ownerHeaders }), env);
+  assert.deepEqual(await empty.json(), { state: null, revision: 0, updatedAt: null });
+
+  const phoneState = { rooms: [{ id: "phone-room", name: "手机项目" }], messagesByRoom: { "phone-room": [{ id: "phone-message", text: "手机同步消息" }] } };
+  const created = await worker.fetch(new Request("https://example.test/api/state", {
+    method: "PUT",
+    headers: ownerHeaders,
+    body: JSON.stringify({ state: phoneState, baseRevision: 0 }),
+  }), env);
+  assert.equal(created.status, 200);
+  assert.equal((await created.json()).revision, 1);
+
+  const deviceRead = await worker.fetch(new Request("https://example.test/api/device/state", { headers: deviceHeaders }), env);
+  const deviceState = await deviceRead.json();
+  assert.deepEqual(deviceState.state, phoneState);
+  assert.equal(deviceState.revision, 1);
+
+  const computerState = { rooms: [{ id: "desktop-room", name: "电脑项目" }] };
+  const updated = await worker.fetch(new Request("https://example.test/api/state", {
+    method: "PUT",
+    headers: ownerHeaders,
+    body: JSON.stringify({ state: computerState, baseRevision: 1 }),
+  }), env);
+  assert.equal(updated.status, 200);
+  assert.equal((await updated.json()).revision, 2);
+
+  const stale = await worker.fetch(new Request("https://example.test/api/state", {
+    method: "PUT",
+    headers: ownerHeaders,
+    body: JSON.stringify({ state: { rooms: [{ id: "stale-room" }] }, baseRevision: 1 }),
+  }), env);
+  assert.equal(stale.status, 409);
+  assert.deepEqual(await stale.json(), {
+    error: "sync_conflict",
+    state: computerState,
+    revision: 2,
+    updatedAt: "2026-08-01 00:00:01",
+  });
+
+  const ownerRead = await worker.fetch(new Request("https://example.test/api/state", { headers: ownerHeaders }), env);
+  assert.deepEqual(await ownerRead.json(), { state: computerState, revision: 2, updatedAt: "2026-08-01 00:00:01" });
+});
+
+test("stores uploaded R2 attachments and shared context with a task, serves them to the device, then deletes objects on completion", async () => {
+  const { env, objects, tasks, deletedObjects } = createAttachmentTaskEnv();
+  const upload = await worker.fetch(new Request("https://example.test/api/attachments", {
+    method: "POST",
+    headers: {
+      origin: "https://example.test",
+      "content-type": "text/plain",
+      "x-file-name": encodeURIComponent("计划.txt"),
+    },
+    body: "附件内容",
+  }), env);
+  assert.equal(upload.status, 201);
+  const attachment = (await upload.json()).attachment;
+
+  const sharedContext = { id: "shared-attachment-context", roomName: "附件协作", recentMessages: [{ role: "user", text: "请读取附件" }] };
+  const created = await worker.fetch(new Request("https://example.test/api/remote/tasks", {
+    method: "POST",
+    headers: { origin: "https://example.test", "content-type": "application/json" },
+    body: JSON.stringify({
+      roomId: "room-attachment",
+      messageId: "message-attachment",
+      cwd: "G:\\attachment-project",
+      text: "请处理附件",
+      decisions: [{ agentId: "coordinator", decision: "speak" }],
+      agents: [{ id: "coordinator" }],
+      attachments: [{ id: attachment.id, name: "不可信名称.txt" }],
+      sharedContext,
+    }),
+  }), env);
+  assert.equal(created.status, 201);
+  const taskId = (await created.json()).task.id;
+  const storedTask = tasks.get(taskId);
+  assert.deepEqual(JSON.parse(storedTask.attachments_json), [{ id: attachment.id, name: "计划.txt", type: "text/plain", size: 12 }]);
+  assert.deepEqual(JSON.parse(storedTask.shared_context_json), sharedContext);
+
+  const claimed = await worker.fetch(new Request("https://example.test/api/device/tasks", {
+    headers: { "x-team-room-device-secret": "device-secret" },
+  }), env);
+  const deviceTask = (await claimed.json()).task;
+  assert.deepEqual(deviceTask.attachments, [{ id: attachment.id, name: "计划.txt", type: "text/plain", size: 12 }]);
+  assert.deepEqual(deviceTask.sharedContext, sharedContext);
+
+  const downloaded = await worker.fetch(new Request(`https://example.test/api/device/attachments/${attachment.id}`, {
+    headers: { "x-team-room-device-secret": "device-secret" },
+  }), env);
+  assert.equal(downloaded.status, 200);
+  assert.equal(Buffer.from((await downloaded.json()).dataBase64, "base64").toString("utf8"), "附件内容");
+
+  const completed = await worker.fetch(new Request(`https://example.test/api/device/tasks/${taskId}/result`, {
+    method: "POST",
+    headers: { "x-team-room-device-secret": "device-secret", "content-type": "application/json" },
+    body: JSON.stringify({ ok: true }),
+  }), env);
+  assert.equal(completed.status, 200);
+  assert.equal(objects.has(`site-owner/${attachment.id}`), false);
+  assert.deepEqual(deletedObjects, [`site-owner/${attachment.id}`]);
+  assert.equal(tasks.get(taskId).status, "completed");
 });
 
 test("keeps every source input required by Sites packaging", async () => {

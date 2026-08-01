@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
+import { buildTurnInput } from "./sharedContext.mjs";
 
 const SAFE_APPROVAL_DECISIONS = new Set(["accept", "decline", "cancel"]);
 
@@ -81,7 +82,7 @@ export class CodexAppServerProtocol extends EventEmitter {
   async initialize() {
     if (this.initialized) return;
     await this.rpc.request("initialize", {
-      clientInfo: { name: "codex-team-room", title: "Codex Team Room", version: "0.1.0" },
+      clientInfo: { name: "codex-team-room", title: "Codex Team Room", version: "0.3.0" },
       capabilities: { experimentalApi: true },
     });
     this.rpc.notify("initialized", {});
@@ -115,12 +116,12 @@ export class CodexAppServerProtocol extends EventEmitter {
     return result.thread;
   }
 
-  async startAgentTurn({ threadId, agent, cwd, text, clientUserMessageId }) {
+  async startAgentTurn({ threadId, agent, cwd, text, clientUserMessageId, sharedContext, attachments }) {
     await this.initialize();
     const result = await this.rpc.request("turn/start", {
       threadId,
       clientUserMessageId,
-      input: [{ type: "text", text }],
+      input: buildTurnInput({ text, sharedContext, attachments }),
       cwd,
       model: agent.model,
       effort: agent.reasoning,
