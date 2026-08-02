@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const pairedDevices = sqliteTable("paired_devices", {
   id: text("id").primaryKey(),
@@ -31,29 +31,31 @@ export const remoteTasks = sqliteTable("remote_tasks", {
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   claimedAt: text("claimed_at"),
   completedAt: text("completed_at"),
-}, (table) => [index("idx_remote_tasks_status_created").on(table.status, table.createdAt)]);
+}, (table) => [index("idx_remote_tasks_status_created").on(table.status, table.createdAt), uniqueIndex("idx_remote_tasks_user_message").on(table.userId, table.messageId)]);
 
 export const remoteEvents = sqliteTable("remote_events", {
   sequence: integer("sequence").primaryKey({ autoIncrement: true }),
   userId: text("user_id").notNull(),
   deviceId: text("device_id").notNull(),
+  eventId: text("event_id"),
   taskId: text("task_id"),
   eventType: text("event_type").notNull(),
   payloadJson: text("payload_json").notNull(),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-}, (table) => [index("idx_remote_events_user_sequence").on(table.userId, table.sequence)]);
+}, (table) => [index("idx_remote_events_user_sequence").on(table.userId, table.sequence), uniqueIndex("idx_remote_events_user_device_event").on(table.userId, table.deviceId, table.eventId)]);
 
 export const remoteApprovals = sqliteTable("remote_approvals", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull(),
   requestId: text("request_id").notNull(),
+  approvalKey: text("approval_key"),
   decision: text("decision").notNull(),
   status: text("status").notNull().default("pending"),
   error: text("error"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   claimedAt: text("claimed_at"),
   completedAt: text("completed_at"),
-}, (table) => [index("idx_remote_approvals_status_created").on(table.status, table.createdAt)]);
+}, (table) => [index("idx_remote_approvals_status_created").on(table.status, table.createdAt), uniqueIndex("idx_remote_approvals_user_key").on(table.userId, table.approvalKey)]);
 
 export const remoteIndexRequests = sqliteTable("remote_index_requests", {
   id: text("id").primaryKey(),

@@ -9,9 +9,19 @@ const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const MAX_ATTACHMENTS = 4;
 const ONLINE_WINDOW_MS = 30_000;
 const CLAIM_LEASE_SECONDS = 30;
+const APPROVAL_EXPIRY_SECONDS = 300;
 const DEVICE_CLAIM_TABLES = new Set(["remote_tasks", "remote_approvals", "remote_index_requests"]);
 const ALLOWED_APPROVAL_DECISIONS = new Set(["accept", "decline"]);
 const ALLOWED_INDEX_REQUESTS = new Set(["projects", "threads", "messages"]);
+const TASK_RUNNING_STATUS = "running";
+const TASK_TERMINAL_STATUSES = new Set(["succeeded", "failed"]);
+
+function sanitizeTaskError(value) {
+  return String(value || "remote_task_failed")
+    .replace(/[A-Za-z]:[\\/][^\s\]\)\}>,;]+/g, "[本机路径已隐藏]")
+    .replace(/(?:sk|ghp|github_pat|xox[baprs])-[-A-Za-z0-9_]+/gi, "[凭据已隐藏]")
+    .slice(0, 1000);
+}
 
 function json(value, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: JSON_HEADERS });
@@ -71,15 +81,27 @@ async function ensureDatabase(env) {
     env.DB.prepare("CREATE TABLE IF NOT EXISTS paired_devices (id TEXT PRIMARY KEY, label TEXT NOT NULL, version TEXT, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"),
     env.DB.prepare("CREATE TABLE IF NOT EXISTS owner_state (user_id TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 1, state_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"),
     env.DB.prepare("CREATE TABLE IF NOT EXISTS remote_tasks (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, room_id TEXT NOT NULL, message_id TEXT NOT NULL, cwd TEXT, text TEXT NOT NULL, decisions_json TEXT NOT NULL, agents_json TEXT NOT NULL, attachments_json TEXT NOT NULL DEFAULT '[]', shared_context_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending', error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, claimed_at TEXT, completed_at TEXT)"),
-    env.DB.prepare("CREATE TABLE IF NOT EXISTS remote_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, device_id TEXT NOT NULL, task_id TEXT, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"),
-    env.DB.prepare("CREATE TABLE IF NOT EXISTS remote_approvals (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, request_id TEXT NOT NULL, decision TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, claimed_at TEXT, completed_at TEXT)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS remote_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, device_id TEXT NOT NULL, task_id TEXT, event_id TEXT, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS remote_approvals (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, request_id TEXT NOT NULL, approval_key TEXT, decision TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, claimed_at TEXT, completed_at TEXT)"),
     env.DB.prepare("CREATE TABLE IF NOT EXISTS remote_index_requests (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, request_type TEXT NOT NULL, request_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', result_json TEXT, error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, claimed_at TEXT, completed_at TEXT)"),
     env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_remote_tasks_status_created ON remote_tasks(status, created_at)"),
+    env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_tasks_user_message ON remote_tasks(user_id, message_id)"),
     env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_remote_events_user_sequence ON remote_events(user_id, sequence)"),
+    env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_events_user_device_event ON remote_events(user_id, device_id, event_id)"),
     env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_remote_approvals_status_created ON remote_approvals(status, created_at)"),
+    env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_approvals_user_key ON remote_approvals(user_id, approval_key)"),
     env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_remote_index_requests_status_created ON remote_index_requests(status, created_at)"),
   ]);
+  // Existing private deployments may already have the original table. D1 has
+  // no IF NOT EXISTS form for ADD COLUMN, so tolerate the already-migrated case.
+  try { await env.DB.prepare("ALTER TABLE remote_approvals ADD COLUMN approval_key TEXT").run(); } catch {}
   env.__teamRoomSchemaReady = true;
+}
+
+async function appendRemoteEvent(env, { userId, deviceId, taskId, type, payload, eventId }) {
+  const safeEventId = String(eventId || `${deviceId}:${taskId || "none"}:${type}`).slice(0, 240);
+  await env.DB.prepare("INSERT OR IGNORE INTO remote_events (user_id, device_id, task_id, event_id, event_type, payload_json) VALUES (?, ?, ?, ?, ?, ?)")
+    .bind(userId, deviceId, taskId ? String(taskId).slice(0, 160) : null, safeEventId, String(type || "unknown").slice(0, 120), JSON.stringify(payload || {})).run();
 }
 
 async function readOwnerState(env, userId = "site-owner") {
@@ -202,17 +224,34 @@ async function handleOwnerApi(request, env, url) {
     if (!text || text.length > 20_000) return json({ error: "invalid_task_text" }, 400);
     if (!decisions.length || !agents.length) return json({ error: "task_members_required" }, 400);
     if (!cwd) return json({ error: "task_project_required" }, 400);
-    const id = crypto.randomUUID();
     const messageId = typeof body.messageId === "string" && body.messageId ? body.messageId.slice(0, 160) : crypto.randomUUID();
     const roomId = typeof body.roomId === "string" && body.roomId ? body.roomId.slice(0, 160) : "default";
-    await env.DB.prepare("INSERT INTO remote_tasks (id, user_id, room_id, message_id, cwd, text, decisions_json, agents_json, attachments_json, shared_context_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .bind(id, userId, roomId, messageId, cwd, text, JSON.stringify(decisions), JSON.stringify(agents), JSON.stringify(attachments), JSON.stringify(sharedContext)).run();
+    const existing = await env.DB.prepare("SELECT id, room_id, message_id, cwd, text, decisions_json, agents_json, attachments_json, shared_context_json, status, error, created_at, claimed_at, completed_at FROM remote_tasks WHERE user_id = ? AND message_id = ? LIMIT 1")
+      .bind(userId, messageId).first().catch(() => null);
+    if (existing) return json({ task: parseRow(existing), reused: true });
+    const id = crypto.randomUUID();
+    try {
+      await env.DB.prepare("INSERT INTO remote_tasks (id, user_id, room_id, message_id, cwd, text, decisions_json, agents_json, attachments_json, shared_context_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(id, userId, roomId, messageId, cwd, text, JSON.stringify(decisions), JSON.stringify(agents), JSON.stringify(attachments), JSON.stringify(sharedContext)).run();
+    } catch {
+      const duplicate = await env.DB.prepare("SELECT id, room_id, message_id, cwd, text, decisions_json, agents_json, attachments_json, shared_context_json, status, error, created_at, claimed_at, completed_at FROM remote_tasks WHERE user_id = ? AND message_id = ? LIMIT 1")
+        .bind(userId, messageId).first();
+      if (duplicate) return json({ task: parseRow(duplicate), reused: true });
+      throw new Error("task_create_failed");
+    }
     return json({ task: { id, status: "pending", messageId } }, 201);
+  }
+
+  const remoteTaskStatus = url.pathname.match(/^\/api\/remote\/tasks\/([^/]+)$/);
+  if (request.method === "GET" && remoteTaskStatus) {
+    const row = await env.DB.prepare("SELECT id, room_id, message_id, status, error, created_at, claimed_at, completed_at FROM remote_tasks WHERE id = ? AND user_id = ?")
+      .bind(decodeURIComponent(remoteTaskStatus[1]), userId).first();
+    return row ? json({ task: parseRow(row) }) : json({ error: "task_not_found" }, 404);
   }
 
   if (request.method === "GET" && url.pathname === "/api/remote/events") {
     const after = Math.max(0, Number(url.searchParams.get("after") || 0) || 0);
-    const result = await env.DB.prepare("SELECT sequence, task_id, event_type, payload_json, created_at FROM remote_events WHERE user_id = ? AND sequence > ? ORDER BY sequence ASC LIMIT 200")
+    const result = await env.DB.prepare("SELECT sequence, task_id, event_id, event_type, payload_json, created_at FROM remote_events WHERE user_id = ? AND sequence > ? ORDER BY sequence ASC LIMIT 200")
       .bind(userId, after).all();
     return json({ events: (result.results || []).map(parseRow) });
   }
@@ -220,12 +259,30 @@ async function handleOwnerApi(request, env, url) {
   if (request.method === "POST" && url.pathname === "/api/remote/approvals") {
     const body = await readJson(request);
     const requestId = String(body.requestId ?? "").slice(0, 160);
+    const approvalKey = String(body.approvalKey || "").slice(0, 200);
     const decision = String(body.decision || "");
     if (!requestId || !ALLOWED_APPROVAL_DECISIONS.has(decision)) return json({ error: "invalid_approval" }, 400);
+    const existingSql = approvalKey
+      ? "SELECT id, request_id, decision, status, error, created_at, claimed_at, completed_at, approval_key FROM remote_approvals WHERE user_id = ? AND approval_key = ? AND status IN ('pending', 'claimed', 'completed') ORDER BY created_at DESC LIMIT 1"
+      : "SELECT id, request_id, decision, status, error, created_at, claimed_at, completed_at, approval_key FROM remote_approvals WHERE user_id = ? AND request_id = ? AND status IN ('pending', 'claimed', 'completed') ORDER BY created_at DESC LIMIT 1";
+    const existing = await env.DB.prepare(existingSql).bind(userId, approvalKey || requestId).first().catch(() => null);
+    if (existing) return json({ approval: parseRow(existing), reused: true });
     const id = crypto.randomUUID();
-    await env.DB.prepare("INSERT INTO remote_approvals (id, user_id, request_id, decision) VALUES (?, ?, ?, ?)")
-      .bind(id, userId, requestId, decision).run();
-    return json({ approval: { id, requestId, decision, status: "pending" } }, 201);
+    try {
+      await env.DB.prepare("INSERT INTO remote_approvals (id, user_id, request_id, decision, approval_key) VALUES (?, ?, ?, ?, ?)")
+        .bind(id, userId, requestId, decision, approvalKey || null).run();
+    } catch {
+      await env.DB.prepare("INSERT INTO remote_approvals (id, user_id, request_id, decision) VALUES (?, ?, ?, ?)")
+        .bind(id, userId, requestId, decision).run();
+    }
+    return json({ approval: { id, requestId, approvalKey: approvalKey || null, decision, status: "pending" } }, 201);
+  }
+
+  const approvalStatus = url.pathname.match(/^\/api\/remote\/approvals\/([^/]+)$/);
+  if (request.method === "GET" && approvalStatus) {
+    const row = await env.DB.prepare("SELECT id, request_id, decision, status, error, created_at, claimed_at, completed_at, approval_key FROM remote_approvals WHERE id = ? AND user_id = ?")
+      .bind(decodeURIComponent(approvalStatus[1]), userId).first();
+    return row ? json({ approval: parseRow(row) }) : json({ error: "approval_not_found" }, 404);
   }
 
   return json({ error: "not_found" }, 404);
@@ -233,9 +290,13 @@ async function handleOwnerApi(request, env, url) {
 
 async function reclaimExpiredClaim(env, table) {
   if (!DEVICE_CLAIM_TABLES.has(table)) throw new Error("invalid_claim_table");
-  await env.DB.prepare(`UPDATE ${table} SET status = 'pending', claimed_at = NULL, error = 'device_request_lease_expired' WHERE status = 'claimed' AND claimed_at < datetime('now', '-${CLAIM_LEASE_SECONDS} seconds')`).run();
+  const statuses = table === "remote_tasks" ? "('claimed', 'running')" : "('claimed')";
+  await env.DB.prepare(`UPDATE ${table} SET status = 'pending', claimed_at = NULL, error = 'device_request_lease_expired' WHERE status IN ${statuses} AND claimed_at < datetime('now', '-${CLAIM_LEASE_SECONDS} seconds')`).run();
   if (table === "remote_index_requests") {
     await env.DB.prepare("UPDATE remote_index_requests SET status = 'failed', error = 'index_request_expired', completed_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND created_at < datetime('now', '-2 minutes')").run();
+  }
+  if (table === "remote_approvals") {
+    await env.DB.prepare(`UPDATE remote_approvals SET status = 'failed', error = 'approval_expired', completed_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND created_at < datetime('now', '-${APPROVAL_EXPIRY_SECONDS} seconds')`).run();
   }
 }
 
@@ -279,7 +340,7 @@ async function handleDeviceApi(request, env, url) {
   }
 
   if (request.method === "GET" && url.pathname === "/api/device/tasks") {
-    const task = await claimNext(env, "remote_tasks", "id, room_id, message_id, cwd, text, decisions_json, agents_json, attachments_json, shared_context_json, created_at");
+    const task = await claimNext(env, "remote_tasks", "id, room_id, message_id, cwd, text, decisions_json, agents_json, attachments_json, shared_context_json, status, created_at, claimed_at");
     return json({ task });
   }
 
@@ -300,21 +361,59 @@ async function handleDeviceApi(request, env, url) {
   }
 
   const taskResult = url.pathname.match(/^\/api\/device\/tasks\/([^/]+)\/result$/);
+  const taskStatus = url.pathname.match(/^\/api\/device\/tasks\/([^/]+)\/status$/);
+  if (request.method === "POST" && taskStatus) {
+    const body = await readJson(request);
+    const taskId = decodeURIComponent(taskStatus[1]);
+    const status = String(body.status || "");
+    if (status !== TASK_RUNNING_STATUS) return json({ error: "invalid_task_status" }, 400);
+    const row = await env.DB.prepare("SELECT id, user_id, room_id, message_id, status FROM remote_tasks WHERE id = ?").bind(taskId).first();
+    if (!row) return json({ error: "task_not_found" }, 404);
+    if (!["claimed", "running"].includes(row.status) && !TASK_TERMINAL_STATUSES.has(row.status)) return json({ error: "invalid_task_transition" }, 409);
+    if (TASK_TERMINAL_STATUSES.has(row.status)) return json({ ok: true, status: row.status });
+    const result = await env.DB.prepare("UPDATE remote_tasks SET status = 'running', claimed_at = CURRENT_TIMESTAMP, error = NULL WHERE id = ? AND status IN ('claimed', 'running')")
+      .bind(taskId).run();
+    if (result.meta?.changes !== 0) {
+      await appendRemoteEvent(env, {
+        userId: row.user_id,
+        deviceId: body.deviceId || request.headers.get("x-team-room-device-id") || "paired-device",
+        taskId,
+        eventId: `${taskId}:taskStarted`,
+        type: "taskStarted",
+        payload: { taskId, roomId: row.room_id, messageId: row.message_id, status: "running", error: null },
+      });
+    }
+    return json({ ok: true, status: "running" });
+  }
   if (request.method === "POST" && taskResult) {
     const body = await readJson(request);
-    const status = body.ok === true ? "completed" : "failed";
-    const error = body.ok === true ? null : String(body.error || "device_task_failed").slice(0, 1000);
+    const requestedStatus = body.status === "succeeded" || body.status === "failed" ? body.status : body.ok === true ? "succeeded" : "failed";
+    const error = requestedStatus === "succeeded" ? null : sanitizeTaskError(body.error || "device_task_failed");
     const taskId = decodeURIComponent(taskResult[1]);
-    const storedTask = await env.DB.prepare("SELECT attachments_json FROM remote_tasks WHERE id = ?").bind(taskId).first();
-    await env.DB.prepare("UPDATE remote_tasks SET status = ?, error = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'claimed'")
-      .bind(status, error, taskId).run();
-    if (env.ATTACHMENTS && storedTask?.attachments_json) {
+    const attachmentRow = await env.DB.prepare("SELECT attachments_json FROM remote_tasks WHERE id = ?").bind(taskId).first();
+    const taskMeta = await env.DB.prepare("SELECT id, user_id, room_id, message_id, status FROM remote_tasks WHERE id = ?").bind(taskId).first().catch(() => null);
+    const storedTask = taskMeta ? { ...taskMeta, attachments_json: attachmentRow?.attachments_json } : attachmentRow;
+    if (!storedTask) return json({ error: "task_not_found" }, 404);
+    if (TASK_TERMINAL_STATUSES.has(storedTask.status)) return json({ ok: true, status: storedTask.status, reused: true });
+    const result = await env.DB.prepare("UPDATE remote_tasks SET status = ?, error = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('claimed', 'running')")
+      .bind(requestedStatus, error, taskId).run();
+    if (result.meta?.changes !== 0) {
+      await appendRemoteEvent(env, {
+        userId: storedTask.user_id,
+        deviceId: body.deviceId || request.headers.get("x-team-room-device-id") || "paired-device",
+        taskId,
+        eventId: `${taskId}:task${requestedStatus === "succeeded" ? "Completed" : "Failed"}`,
+        type: requestedStatus === "succeeded" ? "taskCompleted" : "taskFailed",
+        payload: { taskId, roomId: storedTask.room_id, messageId: storedTask.message_id, status: requestedStatus, error },
+      });
+    }
+    if (result.meta?.changes !== 0 && env.ATTACHMENTS && storedTask.attachments_json) {
       try {
         const attachments = JSON.parse(storedTask.attachments_json);
         await Promise.all((Array.isArray(attachments) ? attachments : []).map((item) => env.ATTACHMENTS.delete(`site-owner/${item.id}`)));
       } catch {}
     }
-    return json({ ok: true });
+    return json({ ok: true, status: requestedStatus });
   }
 
   if (request.method === "POST" && url.pathname === "/api/device/events") {
@@ -326,14 +425,18 @@ async function handleDeviceApi(request, env, url) {
     if (!taskId) return json({ error: "event_task_required" }, 400);
     const taskOwner = await env.DB.prepare("SELECT user_id FROM remote_tasks WHERE id = ?").bind(String(taskId)).first();
     if (!taskOwner?.user_id) return json({ error: "event_task_not_found" }, 409);
-    const statements = events.map((event) => env.DB.prepare("INSERT INTO remote_events (user_id, device_id, task_id, event_type, payload_json) VALUES (?, ?, ?, ?, ?)")
-      .bind(taskOwner.user_id, deviceId, event.taskId ? String(event.taskId).slice(0, 160) : null, String(event.type || "unknown").slice(0, 120), JSON.stringify(event.payload || {})));
+    const statements = events.map((event) => {
+      const taskIdForEvent = event.taskId ? String(event.taskId).slice(0, 160) : taskId;
+      const eventId = String(event.eventId || event.payload?.eventId || `${deviceId}:${taskIdForEvent || "none"}:${event.type}:${event.payload?.sequence || ""}`).slice(0, 240);
+      return env.DB.prepare("INSERT OR IGNORE INTO remote_events (user_id, device_id, task_id, event_id, event_type, payload_json) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(taskOwner.user_id, deviceId, taskIdForEvent, eventId, String(event.type || "unknown").slice(0, 120), JSON.stringify(event.payload || {}));
+    });
     await env.DB.batch(statements);
     return json({ accepted: statements.length });
   }
 
   if (request.method === "GET" && url.pathname === "/api/device/approvals") {
-    const approval = await claimNext(env, "remote_approvals", "id, request_id, decision, created_at");
+    const approval = await claimNext(env, "remote_approvals", "id, request_id, decision, approval_key, created_at");
     return json({ approval });
   }
 

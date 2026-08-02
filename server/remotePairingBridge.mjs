@@ -3,12 +3,17 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { MAX_ATTACHMENT_BYTES, safeAttachmentName } from "./localAttachmentStore.mjs";
+import { sanitizeTaskText } from "../src/lib/taskAssignments.js";
 
 const POLL_INTERVAL_MS = 1_500;
 const HEARTBEAT_INTERVAL_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_TRANSPORT_ATTEMPTS = 2;
 const RETRYABLE_HTTP_STATUSES = new Set([502, 503, 504, 599]);
+
+function safeRemoteTaskError(value) {
+  return sanitizeTaskText(value instanceof Error ? value.message : value, 1000) || "remote_task_failed";
+}
 
 const POWERSHELL_REQUEST_SCRIPT = `
 $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
@@ -158,15 +163,28 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
     roomId: event.roomId || null,
     taskId: event.taskId || null,
     agentId: event.agentId || null,
+    ...(event.eventId ? { eventId: event.eventId } : {}),
   };
-  if (event.type === "agentMessage") return { ...common, text: event.text || "", threadId: event.threadId, turnId: event.turnId };
-  if (event.type === "approvalRequested") {
-    return { ...common, requestId: event.requestId, method: event.method, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, command: event.command, target: projectLabel };
+  if (["taskStarted", "taskWaitingApproval", "taskCompleted", "taskFailed"].includes(event.type)) {
+    return { ...common, status: event.status, error: event.error || null };
   }
-  if (event.type === "approvalResolved") return { ...common, requestId: event.requestId, decision: event.decision };
+  if (event.type === "agentMessage") return {
+    ...common,
+    text: event.text || "",
+    threadId: event.threadId,
+    turnId: event.turnId,
+    ...(event.public !== undefined ? { public: event.public !== false } : {}),
+    ...(event.internal !== undefined ? { internal: event.internal === true } : {}),
+    ...(event.assignmentId ? { assignmentId: event.assignmentId } : {}),
+  };
+  if (event.type === "approvalRequested") {
+    return { ...common, requestId: event.requestId, approvalKey: event.approvalKey, method: event.method, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, command: event.command, target: projectLabel, operationType: event.operationType, requiresWriteLock: event.requiresWriteLock, canAccept: event.canAccept };
+  }
+  if (event.type === "approvalResolved") return { ...common, requestId: event.requestId, approvalKey: event.approvalKey, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, decision: event.decision, requiresWriteLock: event.requiresWriteLock };
+  if (event.type === "approvalFailed") return { ...common, requestId: event.requestId, approvalKey: event.approvalKey, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, error: event.error || "approval_failed" };
   if (event.type === "agentThreadBound") return { ...common, threadId: event.threadId, model: event.model, bindingMode: event.bindingMode };
   if (event.type === "turnStarted") return { ...common, threadId: event.threadId, turnId: event.turnId, messageId: event.messageId };
-  if (event.type === "turnCompleted") return { ...common, threadId: event.threadId, status: event.turn?.status || "completed" };
+  if (event.type === "turnCompleted") return { ...common, threadId: event.threadId, turnId: event.turnId, status: event.turn?.status || event.status || "completed" };
   if (event.type === "writeItemCompleted") return { ...common, threadId: event.threadId, item: { type: event.item?.type, status: event.item?.status } };
   return common;
 }
@@ -185,6 +203,8 @@ export class RemotePairingBridge {
     this.eventCursor = 0;
     this.lastHeartbeatAt = 0;
     this.lastTaskId = null;
+    this.activeTasks = new Map();
+    this.finishedTasks = new Map();
     this.lastError = null;
     this.nativePreferred = false;
     this.requestTimeoutMs = Math.max(1, Number(requestTimeoutMs) || REQUEST_TIMEOUT_MS);
@@ -215,6 +235,13 @@ export class RemotePairingBridge {
     if (this.interval) this.timers.clearInterval(this.interval);
     this.interval = null;
     return this.status();
+  }
+
+  async updateTaskStatus(taskId, status, error = null) {
+    return this.request(`/api/device/tasks/${encodeURIComponent(taskId)}/status`, {
+      method: "POST",
+      body: JSON.stringify({ status, error, deviceId: this.config?.deviceId || null }),
+    });
   }
 
   async request(pathname, options = {}) {
@@ -297,7 +324,7 @@ export class RemotePairingBridge {
     this.lastHeartbeatAt = Date.now();
   }
 
-  async processTask(task) {
+  async executeTask(task) {
     this.lastTaskId = task.id;
     try {
       const cwd = task.cwd || this.config.cwd;
@@ -323,14 +350,45 @@ export class RemotePairingBridge {
       const attachments = await this.downloadTaskAttachments(task);
       await this.runtime.connect({ cwd, agents: task.agents, confirmed: true, roomId, taskId: task.id });
       await this.runtime.dispatch({ text: task.text, decisions: task.decisions, messageId: task.message_id, roomId, taskId: task.id, sharedContext: task.sharedContext, attachments });
-      await this.request(`/api/device/tasks/${encodeURIComponent(task.id)}/result`, { method: "POST", body: JSON.stringify({ ok: true }) });
+      if (typeof this.runtime.waitForTask !== "function") {
+        await this.request(`/api/device/tasks/${encodeURIComponent(task.id)}/result`, { method: "POST", body: JSON.stringify({ ok: true }) });
+        return { status: "succeeded", error: null };
+      }
+      await this.updateTaskStatus(task.id, "running");
+      const result = typeof this.runtime.waitForTask === "function"
+        ? await this.runtime.waitForTask(task.id)
+        : { status: "succeeded", error: null };
+      const succeeded = result?.status === "succeeded" || result?.status === "completed";
+      await this.request(`/api/device/tasks/${encodeURIComponent(task.id)}/result`, {
+        method: "POST",
+        body: JSON.stringify({ status: succeeded ? "succeeded" : "failed", error: succeeded ? null : safeRemoteTaskError(result?.error), deviceId: this.config?.deviceId || null }),
+      });
+      return result;
     } catch (error) {
       await this.request(`/api/device/tasks/${encodeURIComponent(task.id)}/result`, {
         method: "POST",
-        body: JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+        body: JSON.stringify({ status: "failed", error: safeRemoteTaskError(error), deviceId: this.config?.deviceId || null }),
       });
       throw error;
     }
+  }
+
+  async processTask(task) {
+    if (!task?.id) throw new Error("remote_task_id_required");
+    if (this.finishedTasks.has(task.id)) return this.finishedTasks.get(task.id);
+    const existing = this.activeTasks.get(task.id);
+    if (existing) return existing;
+    const promise = this.executeTask(task).then((result) => {
+      this.finishedTasks.set(task.id, result);
+      return result;
+    }).catch((error) => {
+      this.finishedTasks.set(task.id, { status: "failed", error: safeRemoteTaskError(error) });
+      throw error;
+    }).finally(() => {
+      if (this.activeTasks.get(task.id) === promise) this.activeTasks.delete(task.id);
+    });
+    this.activeTasks.set(task.id, promise);
+    return promise;
   }
 
   async downloadTaskAttachments(task) {
@@ -360,21 +418,42 @@ export class RemotePairingBridge {
       method: "POST",
       body: JSON.stringify({
         deviceId: this.config.deviceId,
-        events: events.map((event) => ({ taskId: event.taskId || this.lastTaskId, type: event.type, payload: sanitizeRuntimeEvent(event) })),
+        events: events.map((event) => ({
+          taskId: event.taskId || this.lastTaskId,
+          type: event.type,
+          ...(event.eventId ? { eventId: event.eventId } : {}),
+          payload: sanitizeRuntimeEvent(event),
+        })),
       }),
     });
     this.eventCursor = events.at(-1).sequence;
   }
 
   async processApproval(approval) {
+    const requestId = safeApprovalRequestId(approval.request_id);
     try {
-      this.runtime.resolveApproval({ requestId: safeApprovalRequestId(approval.request_id), decision: approval.decision });
+      this.runtime.resolveApproval({ requestId, decision: approval.decision });
       await this.request(`/api/device/approvals/${encodeURIComponent(approval.id)}/result`, { method: "POST", body: JSON.stringify({ ok: true }) });
     } catch (error) {
-      await this.request(`/api/device/approvals/${encodeURIComponent(approval.id)}/result`, {
-        method: "POST",
-        body: JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }),
-      });
+      const alreadyEmitted = this.runtime.listEvents(0).some((event) => event.type === "approvalFailed" && String(event.requestId) === String(requestId));
+      if (!alreadyEmitted) {
+        this.runtime.emitRoomEvent("approvalFailed", {
+          requestId,
+          approvalKey: approval.approval_key || null,
+          agentId: approval.agent_id || null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      // Emit first so the following tick can still upload the failure if the
+      // result acknowledgement itself is unavailable.
+      try {
+        await this.request(`/api/device/approvals/${encodeURIComponent(approval.id)}/result`, {
+          method: "POST",
+          body: JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+        });
+      } catch {
+        // The event queue remains the durable retry path.
+      }
       throw error;
     }
   }
@@ -429,13 +508,18 @@ export class RemotePairingBridge {
         this.request("/api/device/approvals"),
         this.optionalRequest("/api/device/index-requests", { indexRequest: null }),
       ]);
-      if (task) await this.processTask(task);
+      if (task) this.processTask(task).catch((error) => { this.lastError = error instanceof Error ? error.message : String(error); });
       if (approval) await this.processApproval(approval);
       if (indexRequest) await this.drainIndexRequests(indexRequest);
       await this.uploadEvents();
       this.lastError = null;
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
+      try {
+        await this.uploadEvents();
+      } catch (uploadError) {
+        this.lastError = uploadError instanceof Error ? uploadError.message : String(uploadError);
+      }
     } finally {
       this.busy = false;
     }

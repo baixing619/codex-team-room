@@ -17,17 +17,20 @@ function limitedText(value, max = MAX_ITEM_TEXT) {
 
 export function normalizeSharedContext(value) {
   const input = value && typeof value === "object" ? value : {};
+  const snapshot = input.snapshot && typeof input.snapshot === "object" ? input.snapshot : null;
+  const source = Array.isArray(input.knowledge) || Array.isArray(input.recentMessages) ? input : snapshot || input;
   return {
     id: limitedText(input.id, 160) || "context-unidentified",
     roomId: limitedText(input.roomId, 160),
     roomName: limitedText(input.roomName, 300),
-    knowledge: (Array.isArray(input.knowledge) ? input.knowledge : []).slice(0, MAX_CONTEXT_ITEMS).map((item) => ({
+    mode: input.mode === "delta" ? "delta" : "full",
+    knowledge: (Array.isArray(source.knowledge) ? source.knowledge : []).slice(0, MAX_CONTEXT_ITEMS).map((item) => ({
       id: limitedText(item?.id, 160),
       title: limitedText(item?.title, 300),
       category: limitedText(item?.category, 120),
       body: limitedText(item?.body, 8_000),
     })).filter((item) => item.title || item.body),
-    recentMessages: (Array.isArray(input.recentMessages) ? input.recentMessages : []).slice(-MAX_CONTEXT_ITEMS).map((item) => ({
+    recentMessages: (Array.isArray(source.recentMessages) ? source.recentMessages : []).slice(-MAX_CONTEXT_ITEMS).map((item) => ({
       id: limitedText(item?.id, 160),
       role: item?.role === "user" ? "user" : item?.role === "agent" ? "agent" : "system",
       agentId: limitedText(item?.agentId, 160),
@@ -35,14 +38,41 @@ export function normalizeSharedContext(value) {
       sourceThreadId: limitedText(item?.sourceThreadId, 200),
       text: limitedText(item?.text),
     })).filter((item) => item.text),
+    removedKnowledgeIds: Array.isArray(input.removedKnowledgeIds)
+      ? input.removedKnowledgeIds.map((id) => limitedText(id, 160)).filter(Boolean).slice(0, MAX_CONTEXT_ITEMS)
+      : [],
   };
+}
+
+export function selectSharedContextForAgent(value, agentId) {
+  const input = value && typeof value === "object" ? value : {};
+  const delivery = input.deliveriesByAgentId && typeof input.deliveriesByAgentId === "object"
+    ? input.deliveriesByAgentId[agentId]
+    : null;
+  if (!delivery) return value;
+  const common = { id: input.id, roomId: input.roomId, roomName: input.roomName };
+  if (delivery.mode === "full") {
+    const snapshot = input.snapshot && typeof input.snapshot === "object" ? input.snapshot : {};
+    return { ...common, mode: "full", knowledge: snapshot.knowledge || [], recentMessages: snapshot.recentMessages || [], removedKnowledgeIds: [] };
+  }
+  if (delivery.mode === "delta") {
+    return { ...common, mode: "delta", knowledge: delivery.knowledge || [], recentMessages: delivery.recentMessages || [], removedKnowledgeIds: delivery.removedKnowledgeIds || [] };
+  }
+  // A stale client can still mark a newly promoted member as deferred. If a
+  // full snapshot is present, recover with it; otherwise fail before turn/start
+  // instead of sending an empty context that could permanently lose history.
+  const snapshot = input.snapshot && typeof input.snapshot === "object"
+    ? input.snapshot
+    : (Array.isArray(input.knowledge) || Array.isArray(input.recentMessages) ? input : null);
+  if (snapshot) return { ...common, mode: "full", knowledge: snapshot.knowledge || [], recentMessages: snapshot.recentMessages || [], removedKnowledgeIds: [] };
+  throw new Error("shared_context_recovery_snapshot_required");
 }
 
 export function formatSharedContext(value) {
   const context = normalizeSharedContext(value);
   const knowledge = context.knowledge.length
     ? context.knowledge.map((item) => `- [${item.category || "项目知识"}] ${item.title || "未命名"}: ${item.body}`).join("\n")
-    : "- 暂无公共知识";
+    : context.mode === "delta" ? "- 本轮无新增公共知识" : "- 暂无公共知识";
   const messages = context.recentMessages.length
     ? context.recentMessages.map((item) => {
       const source = item.role === "agent"
@@ -50,11 +80,12 @@ export function formatSharedContext(value) {
         : item.role === "user" ? "用户" : "系统";
       return `- [${source}] ${item.text}`;
     }).join("\n")
-    : "- 暂无近期团队消息";
+    : context.mode === "delta" ? "- 本轮无新增团队消息" : "- 暂无近期团队消息";
   return [
     "[TEAM_ROOM_SHARED_CONTEXT_V1]",
     `上下文标识：${context.id}`,
     `项目房间：${context.roomName || "未命名"} (${context.roomId || "未标识"})`,
+    `本轮上下文模式：${context.mode === "delta" ? "增量（仅包含上次发送后的变化）" : "首次/恢复完整快照"}`,
     "以下内容仅属于当前项目房间。其他成员输出是协作依据，不等于用户最终确认；冲突时应指出来源并请求澄清。",
     "",
     "公共知识：",
@@ -62,6 +93,7 @@ export function formatSharedContext(value) {
     "",
     "近期团队消息：",
     messages,
+    ...(context.removedKnowledgeIds.length ? ["", `已移除的公共知识条目：${context.removedKnowledgeIds.join("、")}`] : []),
     "[/TEAM_ROOM_SHARED_CONTEXT_V1]",
   ].join("\n");
 }

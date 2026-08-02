@@ -36,7 +36,9 @@ import { decideParticipation } from "./lib/participation.js";
 import { addRoomMember, createProjectMember, createRoomAgents, createSafeMemberPrompt, removeRoomMember, replaceRoomMember } from "./lib/roomAgents.js";
 import { loadState, resetState, saveState } from "./lib/storage.js";
 import { buildRoomSharedContext, formatAttachmentSize, validateSelectedFiles } from "./lib/taskPayload.js";
+import { acknowledgeContextDelivery, applyContextCursorUpdates, bindContextCursorToThread } from "./lib/contextCursors.js";
 import { applyCloudSnapshot, createCloudSnapshot } from "./lib/cloudState.js";
+import { applyApprovalLifecycleEvent, approvalRoute, classifyApprovalRequest, isApprovalActive, isApprovalTerminal, mergeApprovalCommands, normalizeApprovalCommand, reconcileApprovalState } from "./lib/approvalLifecycle.js";
 
 const VIEW_ITEMS = [
   { id: "knowledge", label: "知识库", icon: BookOpenText },
@@ -68,6 +70,43 @@ function formatRelativeDate(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "历史记录";
   return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date);
+}
+
+function recordAgentThreadBinding(state, roomId, agentId, threadId) {
+  if (!roomId || !agentId || !threadId) return state;
+  const currentCursors = state.contextCursorsByRoom?.[roomId] || {};
+  const nextCursors = bindContextCursorToThread(currentCursors, agentId, threadId);
+  if (nextCursors === currentCursors) return state;
+  return {
+    ...state,
+    contextCursorsByRoom: { ...state.contextCursorsByRoom, [roomId]: nextCursors },
+  };
+}
+
+function taskStatusText(status, error = null) {
+  if (status === "succeeded" || status === "completed") return "任务已完成";
+  if (status === "failed") return `任务失败：${String(error || "真实任务失败").slice(0, 220)}`;
+  if (status === "waiting_approval") return "任务执行中：等待一次性审批";
+  if (status === "running" || status === "claimed") return "任务执行中";
+  return "任务已排队";
+}
+
+function applyTaskStatusEvent(state, { roomId, taskId, status, error = null, type = "taskStarted" } = {}) {
+  if (!roomId || !taskId) return state;
+  const messages = state.messagesByRoom?.[roomId] || [];
+  const messageId = `task-status-${taskId}`;
+  const nextMessage = { id: messageId, kind: "system", taskId, taskStatus: status, time: nowLabel(), text: taskStatusText(status, error) };
+  const index = messages.findIndex((message) => message.id === messageId || (message.taskId === taskId && message.kind === "system"));
+  const nextMessages = index >= 0 ? messages.map((message, itemIndex) => itemIndex === index ? { ...message, ...nextMessage } : message) : [...messages, nextMessage];
+  return { ...state, messagesByRoom: { ...state.messagesByRoom, [roomId]: nextMessages } };
+}
+
+function applyCoordinatorActionBlocked(state, { roomId, taskId, sequence = "now" } = {}) {
+  if (!roomId) return state;
+  const messages = state.messagesByRoom?.[roomId] || [];
+  const messageId = `coordinator-action-blocked-${taskId || sequence}`;
+  if (messages.some((message) => message.id === messageId)) return state;
+  return { ...state, messagesByRoom: { ...state.messagesByRoom, [roomId]: [...messages, { id: messageId, kind: "system", taskId: taskId || null, time: nowLabel(), text: "总控的本机操作已自动取消，正在转为分析与委派。" }] } };
 }
 
 async function postJson(url, body) {
@@ -346,16 +385,24 @@ function MessageItem({ message, agents }) {
 }
 
 function CommandCard({ command, agent, writeLock, onInspect, onApprove, onDeny }) {
+  const isSubmitted = command.status === "submitted";
   const isApproved = command.status === "approved";
   const isCompleted = command.status === "completed";
   const isDenied = command.status === "denied";
+  const isFailed = command.status === "failed";
+  const isExpired = ["expired", "cancelled", "interrupted"].includes(command.status);
+  const classification = classifyApprovalRequest({ method: command.approvalMethod, agentPermission: agent.permission });
+  const canApprove = command.canAccept !== false && !isApprovalTerminal(command.status);
+  const lockBelongs = writeLock?.approvalKey
+    ? writeLock.approvalKey === command.approvalKey
+    : writeLock?.commandId === command.id;
 
   return (
-    <div className={classNames("command-card", isApproved && "is-approved", isDenied && "is-denied")}>
+    <div className={classNames("command-card", isApproved && "is-approved", isDenied && "is-denied", (isFailed || isExpired) && "is-terminal")}>
       <div className="command-card__top">
         <div>
           <strong>{agent.name}</strong>
-          <span>请求执行命令</span>
+          <span>{command.operationType || classification.operationType}审批</span>
         </div>
         <time>{command.time}</time>
       </div>
@@ -374,24 +421,26 @@ function CommandCard({ command, agent, writeLock, onInspect, onApprove, onDeny }
           <Eye size={17} />查看详情
         </button>
         <div className="command-decision">
-          {command.status === "pending" ? (
+          {command.status === "pending" && canApprove ? (
             <>
               <button className="primary-button" type="button" onClick={() => onApprove(command)}>
-                <LockKey size={17} />允许一次
+                <LockKey size={17} />{command.requiresWriteLock ? "允许一次" : "允许只读一次"}
               </button>
               <button className="secondary-button" type="button" onClick={() => onDeny(command)}>拒绝</button>
             </>
           ) : null}
+          {command.status === "pending" && !canApprove ? <span className="decision-label"><X size={17} />当前成员权限不允许此操作</span> : null}
+          {isSubmitted ? <span className="decision-label"><ArrowsClockwise className="spin" size={17} />审批已发送，等待电脑确认</span> : null}
           {isApproved ? (
-            ["runtime", "remote"].includes(command.source)
-              ? <span className="decision-label decision-label--success"><ArrowsClockwise className="spin" size={17} />Codex 执行中</span>
-              : <span className="command-status-note">等待真实 Codex 返回完成状态</span>
+            <span className="decision-label decision-label--success"><ArrowsClockwise className="spin" size={17} />{command.requiresWriteLock ? "Codex 正在执行" : "Codex 正在只读执行"}</span>
           ) : null}
           {isCompleted ? <span className="decision-label decision-label--success"><CheckCircle size={17} />已完成</span> : null}
           {isDenied ? <span className="decision-label"><X size={17} />已拒绝</span> : null}
+          {isFailed ? <span className="decision-label"><X size={17} />审批失败{command.error ? `：${command.error}` : ""}</span> : null}
+          {isExpired ? <span className="decision-label"><X size={17} />已过期或已中断</span> : null}
         </div>
       </div>
-      {writeLock?.agentId === command.agentId ? (
+      {lockBelongs && command.requiresWriteLock ? (
         <div className="write-lock-line"><LockKey size={15} />{agent.name}当前持有项目写入锁</div>
       ) : null}
     </div>
@@ -875,6 +924,12 @@ export function App() {
     stateRef.current = state;
     saveState(state);
   }, [state]);
+  useEffect(() => {
+    setState((current) => reconcileApprovalState(current, {
+      privateCloud,
+      runtimeConnected: privateCloud ? null : runtime?.connected,
+    }));
+  }, [privateCloud, runtime?.connected]);
   useEffect(() => () => {
     for (const url of attachmentUrls.current) URL.revokeObjectURL(url);
     attachmentUrls.current.clear();
@@ -904,10 +959,19 @@ export function App() {
       setRuntime({ available: false, reason: "由已配对电脑提供真实 Codex 运行时" });
       return;
     }
-    fetch("/api/runtime/status")
-      .then((response) => response.ok ? response.json() : Promise.reject(new Error("runtime unavailable")))
-      .then(setRuntime)
-      .catch(() => setRuntime({ available: false, reason: "真实 Codex 运行时未连接" }));
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const response = await fetch("/api/runtime/status", { headers: { "cache-control": "no-cache" } });
+        const value = response.ok ? await response.json() : { available: false, connected: false, reason: "真实 Codex 运行时未连接" };
+        if (!cancelled) setRuntime(value);
+      } catch {
+        if (!cancelled) setRuntime({ available: false, connected: false, reason: "真实 Codex 运行时未连接" });
+      }
+    };
+    poll();
+    const interval = window.setInterval(poll, 2_500);
+    return () => { cancelled = true; window.clearInterval(interval); };
   }, [privateCloud]);
   useEffect(() => {
     let cancelled = false;
@@ -943,7 +1007,10 @@ export function App() {
         if (value.state && Number(value.revision) > cloudRevision.current) {
           cloudRevision.current = Number(value.revision) || 0;
           cloudSnapshotSignature.current = JSON.stringify(value.state);
-          setState((current) => applyCloudSnapshot(current, value.state));
+          setState((current) => reconcileApprovalState(applyCloudSnapshot(current, value.state), {
+            privateCloud,
+            runtimeConnected: privateCloud ? null : runtime?.connected,
+          }));
         } else if (initial && !value.state) {
           const snapshot = createCloudSnapshot(stateRef.current);
           const created = await fetch(syncEndpoint, {
@@ -995,7 +1062,10 @@ export function App() {
           if (latestResponse.ok && latest.state) {
             cloudRevision.current = Number(latest.revision) || 0;
             cloudSnapshotSignature.current = JSON.stringify(latest.state);
-            setState((current) => applyCloudSnapshot(current, latest.state));
+            setState((current) => reconcileApprovalState(applyCloudSnapshot(current, latest.state), {
+              privateCloud,
+              runtimeConnected: privateCloud ? null : runtime?.connected,
+            }));
           }
           setToast("另一台设备刚更新了房间；已载入最新状态，请重试刚才的冲突操作");
           setSyncStatus("已同步");
@@ -1037,8 +1107,16 @@ export function App() {
             if (!roomId) continue;
             if (event.type === "agentThreadBound") {
               next = { ...next, agentsByRoom: { ...next.agentsByRoom, [roomId]: (next.agentsByRoom?.[roomId] || []).map((agent) => agent.id === event.agentId ? { ...agent, boundThreadId: event.threadId, threadBinding: event.bindingMode || agent.threadBinding || "auto" } : agent) } };
+              next = recordAgentThreadBinding(next, roomId, event.agentId, event.threadId);
             }
-            if (event.type === "agentMessage" && event.text) {
+            if (["taskStarted", "taskWaitingApproval", "taskCompleted", "taskFailed"].includes(event.type)) {
+              next = applyTaskStatusEvent(next, { roomId, taskId: event.taskId, status: event.status, error: event.error, type: event.type });
+            }
+            if (event.type === "taskAssignmentRejected" || event.type === "taskDelegationFailed") {
+              next = applyTaskStatusEvent(next, { roomId, taskId: event.taskId, status: "failed", error: event.reason || event.error || "委派失败", type: event.type });
+            }
+            if (event.type === "coordinatorActionBlocked") next = applyCoordinatorActionBlocked(next, { roomId, taskId: event.taskId, sequence: event.sequence });
+            if (event.type === "agentMessage" && event.public !== false && event.text) {
               const messageId = `runtime-message-${event.sequence}`;
               const existingMessages = next.messagesByRoom[roomId] || [];
               if (!existingMessages.some((message) => message.id === messageId)) {
@@ -1046,18 +1124,10 @@ export function App() {
               }
             }
             if (event.type === "approvalRequested") {
-              const commandId = `runtime-command-${event.requestId}`;
-              const existing = next.commandsByRoom[roomId] || [];
-              if (!existing.some((command) => command.id === commandId)) {
-                const command = { id: commandId, source: "runtime", runtimeRequestId: event.requestId, agentId: event.agentId, title: "Codex 请求受控执行", command: event.command, summary: "来自真实 App Server 线程，等待一次性审批。", target: event.cwd, impact: "可能写入项目", risk: "中", status: "pending", time: nowLabel() };
-                next = { ...next, commandsByRoom: { ...next.commandsByRoom, [roomId]: [...existing, command] } };
-              }
+              next = applyApprovalLifecycleEvent(next, { roomId, source: "runtime", event });
             }
-            if (event.type === "approvalResolved") {
-              next = { ...next, commandsByRoom: { ...next.commandsByRoom, [roomId]: (next.commandsByRoom[roomId] || []).map((command) => command.runtimeRequestId === event.requestId ? { ...command, status: event.decision === "accept" ? "approved" : "denied" } : command) } };
-            }
-            if (event.type === "writeItemCompleted") {
-              next = { ...next, writeLocksByRoom: { ...next.writeLocksByRoom, [roomId]: null }, commandsByRoom: { ...next.commandsByRoom, [roomId]: (next.commandsByRoom[roomId] || []).map((command) => command.source === "runtime" && command.agentId === event.agentId && command.status === "approved" ? { ...command, status: "completed" } : command) } };
+            if (["approvalResolved", "approvalFailed", "writeItemCompleted", "turnCompleted", "runtimeDisconnected"].includes(event.type)) {
+              next = applyApprovalLifecycleEvent(next, { roomId, source: "runtime", event });
             }
           }
           return next;
@@ -1088,8 +1158,31 @@ export function App() {
             if (!roomId) continue;
             if (event.event_type === "agentThreadBound") {
               next = { ...next, agentsByRoom: { ...next.agentsByRoom, [roomId]: (next.agentsByRoom?.[roomId] || []).map((agent) => agent.id === payload.agentId ? { ...agent, boundThreadId: payload.threadId, threadBinding: payload.bindingMode || agent.threadBinding || "auto" } : agent) } };
+              next = recordAgentThreadBinding(next, roomId, payload.agentId, payload.threadId);
             }
-            if (event.event_type === "agentMessage" && payload.text) {
+            if (event.event_type === "turnStarted") {
+              const acknowledged = acknowledgeContextDelivery({
+                cursors: next.contextCursorsByRoom?.[roomId] || {},
+                pending: next.pendingContextCursorsByRoom?.[roomId] || [],
+                taskId: event.task_id || payload.taskId || null,
+                messageId: payload.messageId || null,
+                agentId: payload.agentId,
+                threadId: payload.threadId,
+              });
+              next = {
+                ...next,
+                contextCursorsByRoom: { ...next.contextCursorsByRoom, [roomId]: acknowledged.cursors },
+                pendingContextCursorsByRoom: { ...next.pendingContextCursorsByRoom, [roomId]: acknowledged.pending },
+              };
+            }
+            if (["taskStarted", "taskWaitingApproval", "taskCompleted", "taskFailed"].includes(event.event_type)) {
+              next = applyTaskStatusEvent(next, { roomId, taskId: payload.taskId || event.task_id, status: payload.status, error: payload.error, type: event.event_type });
+            }
+            if (event.event_type === "taskAssignmentRejected" || event.event_type === "taskDelegationFailed") {
+              next = applyTaskStatusEvent(next, { roomId, taskId: payload.taskId || event.task_id, status: "failed", error: payload.reason || payload.error || "委派失败", type: event.event_type });
+            }
+            if (event.event_type === "coordinatorActionBlocked") next = applyCoordinatorActionBlocked(next, { roomId, taskId: payload.taskId || event.task_id, sequence: event.sequence });
+            if (event.event_type === "agentMessage" && payload.public !== false && payload.text) {
               const messageId = `remote-message-${event.sequence}`;
               const existingMessages = next.messagesByRoom[roomId] || [];
               if (!existingMessages.some((message) => message.id === messageId)) {
@@ -1097,18 +1190,10 @@ export function App() {
               }
             }
             if (event.event_type === "approvalRequested") {
-              const commandId = `remote-command-${payload.requestId}`;
-              const existing = next.commandsByRoom[roomId] || [];
-              if (!existing.some((command) => command.id === commandId)) {
-                const command = { id: commandId, source: "remote", runtimeRequestId: payload.requestId, agentId: payload.agentId, title: "Codex 请求受控执行", command: payload.command, summary: "来自已配对电脑的真实 Codex，等待一次性审批。", target: payload.target || "已配对项目", impact: "可能写入项目", risk: "中", status: "pending", time: nowLabel() };
-                next = { ...next, commandsByRoom: { ...next.commandsByRoom, [roomId]: [...existing, command] } };
-              }
+              next = applyApprovalLifecycleEvent(next, { roomId, source: "remote", event: { ...payload, type: "approvalRequested" } });
             }
-            if (event.event_type === "approvalResolved") {
-              next = { ...next, commandsByRoom: { ...next.commandsByRoom, [roomId]: (next.commandsByRoom[roomId] || []).map((command) => String(command.runtimeRequestId) === String(payload.requestId) ? { ...command, status: payload.decision === "accept" ? "approved" : "denied" } : command) } };
-            }
-            if (event.event_type === "writeItemCompleted") {
-              next = { ...next, writeLocksByRoom: { ...next.writeLocksByRoom, [roomId]: null }, commandsByRoom: { ...next.commandsByRoom, [roomId]: (next.commandsByRoom[roomId] || []).map((command) => command.source === "remote" && command.agentId === payload.agentId && command.status === "approved" ? { ...command, status: "completed" } : command) } };
+            if (["approvalResolved", "approvalFailed", "writeItemCompleted", "turnCompleted", "runtimeDisconnected"].includes(event.event_type)) {
+              next = applyApprovalLifecycleEvent(next, { roomId, source: "remote", event: { ...payload, type: event.event_type } });
             }
           }
           return next;
@@ -1274,6 +1359,9 @@ export function App() {
       commandsByRoom: { ...current.commandsByRoom, [roomId]: [] },
       knowledgeByRoom: { ...current.knowledgeByRoom, [roomId]: [] },
       threadCache: { ...current.threadCache, [roomId]: [{ id: "global", title: "团队调度台", time: "现在", kind: "room" }] },
+      contextCursorsByRoom: { ...current.contextCursorsByRoom, [roomId]: {} },
+      contextDeliverySequenceByRoom: { ...current.contextDeliverySequenceByRoom, [roomId]: 0 },
+      pendingContextCursorsByRoom: { ...current.pendingContextCursorsByRoom, [roomId]: [] },
       agentsByRoom: { ...current.agentsByRoom, [roomId]: createRoomAgents() },
       writeLocksByRoom: { ...current.writeLocksByRoom, [roomId]: null },
     }));
@@ -1296,15 +1384,21 @@ export function App() {
       const threadCache = { ...current.threadCache };
       const historyCacheByThread = Object.fromEntries(Object.entries(current.historyCacheByThread || {})
         .filter(([, cached]) => cached.roomId !== room.id));
+      const contextCursorsByRoom = { ...current.contextCursorsByRoom };
+      const contextDeliverySequenceByRoom = { ...current.contextDeliverySequenceByRoom };
+      const pendingContextCursorsByRoom = { ...current.pendingContextCursorsByRoom };
       const agentsByRoom = { ...current.agentsByRoom };
       const writeLocksByRoom = { ...current.writeLocksByRoom };
       delete messagesByRoom[room.id];
       delete commandsByRoom[room.id];
       delete knowledgeByRoom[room.id];
       delete threadCache[room.id];
+      delete contextCursorsByRoom[room.id];
+      delete contextDeliverySequenceByRoom[room.id];
+      delete pendingContextCursorsByRoom[room.id];
       delete agentsByRoom[room.id];
       delete writeLocksByRoom[room.id];
-      return { ...current, rooms: remainingRooms, activeRoomId: nextRoomId, messagesByRoom, commandsByRoom, knowledgeByRoom, threadCache, historyCacheByThread, agentsByRoom, writeLocksByRoom };
+      return { ...current, rooms: remainingRooms, activeRoomId: nextRoomId, messagesByRoom, commandsByRoom, knowledgeByRoom, threadCache, historyCacheByThread, contextCursorsByRoom, contextDeliverySequenceByRoom, pendingContextCursorsByRoom, agentsByRoom, writeLocksByRoom };
     });
     setActiveView("chat");
     setActiveThreadId("global");
@@ -1339,7 +1433,11 @@ export function App() {
     try {
       const status = await postJson("/api/runtime/disconnect", {});
       setRuntime(status);
-      setState((current) => ({ ...current, writeLocksByRoom: { ...current.writeLocksByRoom, [activeRoom.id]: null } }));
+      setState((current) => reconcileApprovalState(applyApprovalLifecycleEvent(current, {
+        roomId: activeRoom.id,
+        source: "runtime",
+        event: { type: "runtimeDisconnected", roomId: activeRoom.id, error: "runtime_disconnected" },
+      }), { privateCloud: false, runtimeConnected: false }));
       setToast("已断开真实运行时；发送功能已关闭");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "断开失败");
@@ -1410,27 +1508,61 @@ export function App() {
       const dispatchAgents = executionMode ? agents : agents.map((agent) => agent.permission === "request-write" ? { ...agent, permission: "read-only" } : agent);
       const messageId = `user-${Date.now()}`;
       const contextId = globalThis.crypto?.randomUUID ? `context-${globalThis.crypto.randomUUID()}` : `context-${Date.now()}`;
-      const sharedContext = buildRoomSharedContext({ room: activeRoom, messages, knowledge, agents, contextId });
+      const deliverySequence = (stateRef.current.contextDeliverySequenceByRoom?.[activeRoom.id] || 0) + 1;
+      const sharedContext = buildRoomSharedContext({
+        room: activeRoom,
+        messages,
+        knowledge,
+        agents,
+        contextId,
+        memberCursors: stateRef.current.contextCursorsByRoom?.[activeRoom.id] || {},
+        activeAgentIds: decisions.filter((item) => item.decision === "speak").map((item) => item.agentId),
+        deliverySequence,
+        text,
+      });
       const silentNames = decisions.filter((item) => item.decision === "silent").map((item) => agents.find((agent) => agent.id === item.agentId)?.name).filter(Boolean);
       let dispatchLabel;
+      let remoteTask = null;
+      let localTurns = [];
+      let taskId = messageId;
+      let taskStatus = "running";
 
       if (privateCloud) {
-        await postJson("/api/remote/tasks", { text, decisions, agents: dispatchAgents, attachments: uploaded, sharedContext, roomId: activeRoom.id, messageId, cwd: activeRoom.path });
-        dispatchLabel = pairing.online ? "已发送到配对电脑的真实 Codex" : "真实任务已排队，电脑上线后执行";
+        remoteTask = await postJson("/api/remote/tasks", { text, decisions, agents: dispatchAgents, attachments: uploaded, sharedContext, roomId: activeRoom.id, messageId, cwd: activeRoom.path });
+        taskId = remoteTask?.task?.id || messageId;
+        taskStatus = remoteTask?.task?.status === "succeeded" || remoteTask?.task?.status === "failed" ? remoteTask.task.status : "pending";
+        dispatchLabel = taskStatusText(taskStatus);
       } else {
-        const result = await postJson("/api/runtime/dispatch", { text, decisions, attachments: uploaded, sharedContext, executionMode, messageId, roomId: activeRoom.id });
-        dispatchLabel = `已分派到 ${result.turns.length} 个真实 Codex 成员对话 · 上下文 ${contextId.slice(-8)}`;
+        const result = await postJson("/api/runtime/dispatch", { text, decisions, attachments: uploaded, sharedContext, executionMode, messageId, taskId: messageId, roomId: activeRoom.id });
+        localTurns = Array.isArray(result.turns) ? result.turns : [];
+        dispatchLabel = taskStatusText("running");
       }
 
       const userMessage = { id: messageId, kind: "user", time: nowLabel(), text: visibleText, attachments: uploaded.map(({ id, name, type, size }) => ({ id, name, type, size })) };
+      const localThreadIdsByAgentId = Object.fromEntries(localTurns.map((turn) => [turn.agentId, turn.threadId]));
       setState((current) => ({
         ...current,
-        agentsByRoom: { ...current.agentsByRoom, [activeRoom.id]: (current.agentsByRoom?.[activeRoom.id] || []).map((agent) => ({ ...agent, status: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "thinking" : "silent", statusLabel: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "真实处理中" : "本轮静默" })) },
+        contextDeliverySequenceByRoom: { ...current.contextDeliverySequenceByRoom, [activeRoom.id]: deliverySequence },
+        contextCursorsByRoom: privateCloud
+          ? current.contextCursorsByRoom
+          : { ...current.contextCursorsByRoom, [activeRoom.id]: applyContextCursorUpdates(current.contextCursorsByRoom?.[activeRoom.id] || {}, sharedContext.cursorUpdates, Object.fromEntries(localTurns.map((turn) => [turn.agentId, turn.threadId]))) },
+        pendingContextCursorsByRoom: privateCloud
+          ? { ...current.pendingContextCursorsByRoom, [activeRoom.id]: [
+            ...(current.pendingContextCursorsByRoom?.[activeRoom.id] || []),
+            { taskId: remoteTask?.task?.id || null, messageId, sequence: deliverySequence, updates: sharedContext.cursorUpdates, createdAt: new Date().toISOString() },
+          ].slice(-100) }
+          : current.pendingContextCursorsByRoom,
+        agentsByRoom: { ...current.agentsByRoom, [activeRoom.id]: (current.agentsByRoom?.[activeRoom.id] || []).map((agent) => ({
+          ...agent,
+          ...(localThreadIdsByAgentId[agent.id] ? { boundThreadId: localThreadIdsByAgentId[agent.id], threadBinding: agent.threadBinding || "auto" } : {}),
+          status: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "thinking" : "silent",
+          statusLabel: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "真实处理中" : "本轮静默",
+        })) },
         messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [
           ...(current.messagesByRoom[activeRoom.id] || []),
           userMessage,
           ...(silentNames.length ? [{ id: `silent-${Date.now()}`, kind: "system", time: nowLabel(), text: `${silentNames.join("、")}按当前项目发言策略保持静默` }] : []),
-          { id: `dispatch-${Date.now()}`, kind: "system", time: nowLabel(), text: dispatchLabel },
+          { id: `task-status-${taskId}`, kind: "system", taskId, taskStatus, time: nowLabel(), text: dispatchLabel },
         ] },
       }));
       setDraft("");
@@ -1454,38 +1586,72 @@ export function App() {
   };
 
   const approveCommand = async (command) => {
-    if (writeLock && writeLock.agentId !== command.agentId) {
+    if (command.status !== "pending") return;
+    if (command.canAccept === false) {
+      setToast("当前成员权限不允许批准此操作");
+      return;
+    }
+    const lockMatches = writeLock && (writeLock.approvalKey
+      ? writeLock.approvalKey === command.approvalKey
+      : writeLock.commandId === command.id || writeLock.agentId === command.agentId);
+    if (command.requiresWriteLock && writeLock && !lockMatches) {
       setToast("已有成员持有写入锁，请先完成当前操作");
       return;
     }
-    if (command.source === "runtime" || command.source === "remote") {
-      try {
-        await postJson(command.source === "remote" ? "/api/remote/approvals" : "/api/runtime/approval", { requestId: command.runtimeRequestId, decision: "accept" });
-      } catch (error) {
-        setToast(error instanceof Error ? error.message : "审批失败");
-        return;
-      }
+    const route = approvalRoute({ privateCloud });
+    try {
+      await postJson(route === "remote" ? "/api/remote/approvals" : "/api/runtime/approval", {
+        requestId: command.runtimeRequestId,
+        approvalKey: command.approvalKey,
+        decision: "accept",
+      });
+    } catch (error) {
+      setState((current) => applyApprovalLifecycleEvent(current, {
+        roomId: activeRoom.id,
+        source: route,
+        event: { type: "approvalFailed", requestId: command.runtimeRequestId, approvalKey: command.approvalKey, agentId: command.agentId, error: error instanceof Error ? error.message : String(error) },
+      }));
+      setToast(error instanceof Error ? error.message : "审批失败");
+      return;
     }
     setState((current) => ({
       ...current,
-      writeLocksByRoom: { ...current.writeLocksByRoom, [activeRoom.id]: { agentId: command.agentId, commandId: command.id, acquiredAt: new Date().toISOString() } },
-      commandsByRoom: { ...current.commandsByRoom, [activeRoom.id]: (current.commandsByRoom[activeRoom.id] || []).map((item) => item.id === command.id ? { ...item, status: "approved" } : item) },
-      messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `approved-${Date.now()}`, kind: "system", time: nowLabel(), text: "已授予开发一次性写入权限，并锁定项目写入权" }] },
+      commandsByRoom: {
+        ...current.commandsByRoom,
+        [activeRoom.id]: mergeApprovalCommands(current.commandsByRoom[activeRoom.id] || [], [{ ...command, status: "submitted", submittedDecision: "accept", submittedAt: new Date().toISOString(), legacyLifecycle: false }], { roomId: activeRoom.id }),
+      },
+      messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `approval-submitted-${Date.now()}`, kind: "system", time: nowLabel(), text: `${agents.find((agent) => agent.id === command.agentId)?.name || "成员"}已提交一次性${command.operationType || "操作"}审批，等待电脑确认` }] },
     }));
-    setToast("已批准一次并加锁");
+    setToast("审批已发送，等待电脑确认");
   };
 
   const denyCommand = async (command) => {
-    if (command.source === "runtime" || command.source === "remote") {
-      try {
-        await postJson(command.source === "remote" ? "/api/remote/approvals" : "/api/runtime/approval", { requestId: command.runtimeRequestId, decision: "decline" });
-      } catch (error) {
-        setToast(error instanceof Error ? error.message : "拒绝失败");
-        return;
-      }
+    if (command.status !== "pending") return;
+    const route = approvalRoute({ privateCloud });
+    try {
+      await postJson(route === "remote" ? "/api/remote/approvals" : "/api/runtime/approval", {
+        requestId: command.runtimeRequestId,
+        approvalKey: command.approvalKey,
+        decision: "decline",
+      });
+    } catch (error) {
+      setState((current) => applyApprovalLifecycleEvent(current, {
+        roomId: activeRoom.id,
+        source: route,
+        event: { type: "approvalFailed", requestId: command.runtimeRequestId, approvalKey: command.approvalKey, agentId: command.agentId, error: error instanceof Error ? error.message : String(error) },
+      }));
+      setToast(error instanceof Error ? error.message : "拒绝失败");
+      return;
     }
-    updateCommand(command.id, "denied");
-    setToast("执行请求已拒绝");
+    setState((current) => ({
+      ...current,
+      commandsByRoom: {
+        ...current.commandsByRoom,
+        [activeRoom.id]: mergeApprovalCommands(current.commandsByRoom[activeRoom.id] || [], [{ ...command, status: "submitted", submittedDecision: "decline", submittedAt: new Date().toISOString(), legacyLifecycle: false }], { roomId: activeRoom.id }),
+      },
+      messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `approval-submitted-${Date.now()}`, kind: "system", time: nowLabel(), text: `${agents.find((agent) => agent.id === command.agentId)?.name || "成员"}已提交拒绝审批，等待电脑确认` }] },
+    }));
+    setToast("拒绝已发送，等待电脑确认");
   };
 
   const saveAgent = (nextAgent) => {

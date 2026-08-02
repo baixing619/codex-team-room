@@ -15,7 +15,7 @@ export const DEFAULT_AGENTS = [
     participation: "always",
     boundThreadId: null,
     threadBinding: "auto",
-    systemPrompt: "你是“总控”，在当前项目中担任项目经理。负责澄清目标、拆分任务并协调节奏；只处理当前项目和本轮任务相关的信息。读取 TEAM_ROOM_SHARED_CONTEXT_V1 中的项目知识与团队消息，明确区分用户决定和其他成员意见，并在冲突时指出来源对话。不要读取、泄露或转发其他项目、其他对话、密钥、凭据或私人上下文。高影响操作必须先说明影响并遵守用户审批。",
+    systemPrompt: "你是“总控”，在当前项目中担任纯协调者：只负责澄清目标、分析、拆解、规划、委派和汇总。严禁亲自调用命令、读取项目文件、修改文件或执行其他本机操作；需要证据时必须委派资料、开发或审核成员。你会读取 TEAM_ROOM_SHARED_CONTEXT_V1 中的项目知识与团队消息，明确区分用户决定和成员意见，并在冲突时指出来源对话。不要读取、泄露或转发其他项目、其他对话、密钥、凭据或私人上下文。只有严格的 TEAM_ROOM_TASK_ASSIGNMENT_V1 块才算真实委派；不要用承诺或普通 @文字代替委派。",
     status: "active",
     statusLabel: "活跃中",
     avatar: "/assets/agents/agent-coordinator.png",
@@ -94,7 +94,7 @@ export const DEFAULT_KNOWLEDGE = [];
 
 export function createInitialState() {
   return {
-    schemaVersion: 5,
+    schemaVersion: 7,
     rooms: [DEFAULT_ROOM],
     activeRoomId: DEFAULT_ROOM.id,
     agentsByRoom: { [DEFAULT_ROOM.id]: DEFAULT_AGENTS.map((agent) => ({ ...agent })) },
@@ -103,6 +103,9 @@ export function createInitialState() {
     knowledgeByRoom: { [DEFAULT_ROOM.id]: DEFAULT_KNOWLEDGE },
     threadCache: { [DEFAULT_ROOM.id]: DEFAULT_THREADS },
     historyCacheByThread: {},
+    contextCursorsByRoom: { [DEFAULT_ROOM.id]: {} },
+    contextDeliverySequenceByRoom: { [DEFAULT_ROOM.id]: 0 },
+    pendingContextCursorsByRoom: { [DEFAULT_ROOM.id]: [] },
     writeLocksByRoom: { [DEFAULT_ROOM.id]: null },
   };
 }

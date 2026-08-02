@@ -54,6 +54,50 @@ function createIndexRequestDb() {
   };
 }
 
+function createApprovalDb() {
+  const rows = new Map();
+  const statements = [];
+  return {
+    rows,
+    statements,
+    batch: async () => [],
+    prepare(sql) {
+      let values = [];
+      return {
+        bind(...next) { values = next; return this; },
+        async run() {
+          statements.push({ sql, values });
+          if (sql.startsWith("INSERT INTO remote_approvals")) {
+            const [id, user_id, request_id, decision, approval_key] = values;
+            rows.set(id, { id, user_id, request_id, decision, approval_key: approval_key || null, status: "pending", error: null, created_at: "2026-08-02 00:00:00", claimed_at: null, completed_at: null });
+          } else if (sql.startsWith("UPDATE remote_approvals SET status = 'claimed'")) {
+            const row = rows.get(values[0]);
+            if (!row || row.status !== "pending") return { meta: { changes: 0 } };
+            row.status = "claimed";
+            row.claimed_at = "2026-08-02 00:00:01";
+            return { meta: { changes: 1 } };
+          } else if (sql.startsWith("UPDATE remote_approvals SET status = 'failed'")) {
+            for (const row of rows.values()) {
+              if (row.status === "pending" && row.created_at.startsWith("2020-")) Object.assign(row, { status: "failed", error: "approval_expired" });
+            }
+          }
+          return { meta: { changes: 1 } };
+        },
+        async first() {
+          if (sql.includes("status IN ('pending', 'claimed', 'completed')")) {
+            const [userId, keyOrRequestId] = values;
+            return Array.from(rows.values()).find((row) => row.user_id === userId
+              && (row.approval_key === keyOrRequestId || (!row.approval_key && row.request_id === keyOrRequestId))
+              && ["pending", "claimed", "completed"].includes(row.status)) || null;
+          }
+          if (sql.includes("FROM remote_approvals WHERE status = 'pending'")) return Array.from(rows.values()).find((row) => row.status === "pending") || null;
+          return null;
+        },
+      };
+    },
+  };
+}
+
 function createAttachmentTaskEnv() {
   const objects = new Map();
   const tasks = new Map();
@@ -115,6 +159,9 @@ function createAttachmentTaskEnv() {
           if (sql.startsWith("SELECT attachments_json FROM remote_tasks WHERE id = ?")) {
             const task = tasks.get(values[0]);
             return task ? { attachments_json: task.attachments_json } : null;
+          }
+          if (sql.includes("FROM remote_tasks WHERE user_id = ? AND message_id = ?")) {
+            return Array.from(tasks.values()).find((task) => task.user_id === values[0] && task.message_id === values[1]) || null;
           }
           return null;
         },
@@ -368,6 +415,41 @@ test("reclaims expired task and approval claims before returning them to the dev
   }
 });
 
+test("remote approvals are idempotent by approval key and stale pending rows expire", async () => {
+  const db = createApprovalDb();
+  const env = { DB: db, TEAM_ROOM_DEVICE_SECRET: "device-secret" };
+  const ownerHeaders = { origin: "https://example.test", "content-type": "application/json" };
+  const create = () => worker.fetch(new Request("https://example.test/api/remote/approvals", {
+    method: "POST",
+    headers: ownerHeaders,
+    body: JSON.stringify({ requestId: "41", approvalKey: "approval:stable", decision: "accept" }),
+  }), env);
+
+  const first = await create();
+  const firstBody = await first.json();
+  const duplicate = await create();
+  const duplicateBody = await duplicate.json();
+  assert.equal(first.status, 201);
+  assert.equal(duplicate.status, 200);
+  assert.equal(duplicateBody.reused, true);
+  assert.equal(duplicateBody.approval.id, firstBody.approval.id);
+
+  const claimed = await worker.fetch(new Request("https://example.test/api/device/approvals", {
+    headers: { "x-team-room-device-secret": "device-secret" },
+  }), env);
+  const claimedBody = await claimed.json();
+  assert.equal(claimedBody.approval.id, firstBody.approval.id);
+  assert.equal(db.rows.get(firstBody.approval.id).status, "claimed");
+
+  db.rows.set("stale-approval", { id: "stale-approval", user_id: "site-owner", request_id: "99", decision: "accept", approval_key: "stale-key", status: "pending", created_at: "2020-01-01 00:00:00", claimed_at: null, completed_at: null, error: null });
+  const expired = await worker.fetch(new Request("https://example.test/api/device/approvals", {
+    headers: { "x-team-room-device-secret": "device-secret" },
+  }), env);
+  assert.deepEqual(await expired.json(), { approval: null });
+  assert.equal(db.rows.get("stale-approval").status, "failed");
+  assert.ok(db.statements.some(({ sql }) => sql.includes("approval_expired")));
+});
+
 test("owner and paired device share cloud state with revision CAS conflict protection", async () => {
   const env = createOwnerStateEnv();
   const ownerHeaders = { origin: "https://example.test", "content-type": "application/json" };
@@ -447,6 +529,24 @@ test("stores uploaded R2 attachments and shared context with a task, serves them
   }), env);
   assert.equal(created.status, 201);
   const taskId = (await created.json()).task.id;
+  const duplicate = await worker.fetch(new Request("https://example.test/api/remote/tasks", {
+    method: "POST",
+    headers: { origin: "https://example.test", "content-type": "application/json" },
+    body: JSON.stringify({
+      roomId: "room-attachment",
+      messageId: "message-attachment",
+      cwd: "G:\\attachment-project",
+      text: "请处理附件",
+      decisions: [{ agentId: "coordinator", decision: "speak" }],
+      agents: [{ id: "coordinator" }],
+      attachments: [{ id: attachment.id, name: "不可信名称.txt" }],
+      sharedContext,
+    }),
+  }), env);
+  assert.equal(duplicate.status, 200);
+  const duplicateBody = await duplicate.json();
+  assert.equal(duplicateBody.reused, true);
+  assert.equal(duplicateBody.task.id, taskId);
   const storedTask = tasks.get(taskId);
   assert.deepEqual(JSON.parse(storedTask.attachments_json), [{ id: attachment.id, name: "计划.txt", type: "text/plain", size: 12 }]);
   assert.deepEqual(JSON.parse(storedTask.shared_context_json), sharedContext);
@@ -472,7 +572,7 @@ test("stores uploaded R2 attachments and shared context with a task, serves them
   assert.equal(completed.status, 200);
   assert.equal(objects.has(`site-owner/${attachment.id}`), false);
   assert.deepEqual(deletedObjects, [`site-owner/${attachment.id}`]);
-  assert.equal(tasks.get(taskId).status, "completed");
+  assert.equal(tasks.get(taskId).status, "succeeded");
 });
 
 test("keeps every source input required by Sites packaging", async () => {
