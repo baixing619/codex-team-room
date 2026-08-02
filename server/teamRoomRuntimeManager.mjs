@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { getCodexRuntimeStatus, spawnCodexAppServer } from "./codexAppServerRuntime.mjs";
+import { decideParticipation, isAgentMentioned, isBroadcastRequest } from "../src/lib/participation.js";
 
 const MAX_EVENTS = 500;
 
@@ -163,7 +164,23 @@ export class TeamRoomRuntimeManager {
       throw new Error("Dispatch room does not match the connected project room");
     }
     this.taskId = optionalId(taskId) || this.taskId;
-    const speakers = decisions.filter((decision) => decision.decision === "speak");
+    // Re-apply explicit mentions at the runtime boundary. This protects remote
+    // tasks and older clients from a stale participation decision: a named
+    // member must be dispatched on its own bound thread even when its normal
+    // strategy would be silent. Unmentioned members retain the supplied
+    // participation decisions.
+    const broadcast = isBroadcastRequest(text);
+    const explicitDecisions = decideParticipation(text, [...this.agentById.values()])
+      .filter((decision) => decision.decision === "speak" && (broadcast || isAgentMentioned(text, this.agentById.get(decision.agentId))));
+    const explicitByAgentId = new Map(explicitDecisions.map((decision) => [decision.agentId, decision]));
+    const suppliedDecisions = Array.isArray(decisions) ? decisions : [];
+    const effectiveDecisions = suppliedDecisions.map((decision) => explicitByAgentId.has(decision.agentId)
+      ? { ...decision, ...explicitByAgentId.get(decision.agentId), decision: "speak" }
+      : decision);
+    for (const decision of explicitDecisions) {
+      if (!effectiveDecisions.some((item) => item.agentId === decision.agentId)) effectiveDecisions.push(decision);
+    }
+    const speakers = effectiveDecisions.filter((decision) => decision.decision === "speak");
     const turns = await Promise.all(speakers.map(async (decision) => {
       const agent = this.agentById.get(decision.agentId);
       if (!agent) throw new Error(`Unknown agent: ${decision.agentId}`);

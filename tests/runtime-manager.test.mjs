@@ -63,6 +63,32 @@ test("dispatch creates one persistent thread per speaking member", async () => {
   assert.equal(manager.status().agentThreads.developer, "thread-developer");
 });
 
+test("runtime dispatch upgrades explicitly mentioned silent members and preserves their bound threads", async () => {
+  const { manager, protocol, agents } = createManager();
+  agents[0] = { ...agents[0], name: "总控", participation: "always" };
+  agents[1] = { ...agents[1], name: "开发", participation: "relevant", boundThreadId: "thread-developer-bound", threadBinding: "existing" };
+  agents[2] = { ...agents[2], name: "审核", participation: "review", boundThreadId: "thread-reviewer-bound", threadBinding: "existing" };
+  agents.push({ id: "researcher", name: "资料", model: "gpt-5.6-terra", reasoning: "medium", permission: "read-only", participation: "knowledge" });
+  await manager.connect({ cwd: "G:\\project", roomId: "room-mentions", agents, confirmed: true });
+
+  const result = await manager.dispatch({
+    text: "@开发 @审核 请分别回复",
+    decisions: [
+      { agentId: "coordinator", decision: "speak" },
+      { agentId: "developer", decision: "silent" },
+      { agentId: "reviewer", decision: "silent" },
+      { agentId: "researcher", decision: "silent" },
+    ],
+    messageId: "message-mentions",
+    roomId: "room-mentions",
+  });
+
+  assert.deepEqual(result.turns.map((turn) => turn.threadId).sort(), ["thread-coordinator", "thread-developer-bound", "thread-reviewer-bound"]);
+  assert.equal(protocol.startedThreads.length, 1);
+  assert.deepEqual(protocol.resumedThreads.map((item) => item.threadId).sort(), ["thread-developer-bound", "thread-reviewer-bound"]);
+  assert.ok(!result.turns.some((turn) => turn.agentId === "researcher"));
+});
+
 test("independent member conversations receive the same context id and execution-off is enforced server-side", async () => {
   const { manager, protocol, agents } = createManager();
   await manager.connect({ cwd: "G:\\project", roomId: "room-proof", agents, confirmed: true });
