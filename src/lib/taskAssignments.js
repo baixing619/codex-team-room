@@ -136,10 +136,16 @@ export function parseTaskResult(value) {
 }
 
 export function sanitizeTaskText(value, max = 8000) {
-  return text(value, max)
+  return String(value ?? "").trim()
+    .replace(/-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----[\s\S]*?-----END(?: [A-Z0-9]+)* PRIVATE KEY-----/gi, "[私钥已隐藏]")
+    .replace(/-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----[\s\S]*/gi, "[私钥已隐藏]")
+    .replace(/\b(?:jdbc:)?(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|mssql|sqlserver):\/\/[^\s\"'<>]+/gi, "[数据库地址已隐藏]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [凭据已隐藏]")
+    .replace(/\b(?:[A-Z][A-Z0-9]*_)*(?:PASSWORD|PASSWD|API[_-]?KEY|ACCESS[_-]?TOKEN|AUTH[_-]?TOKEN|REFRESH[_-]?TOKEN|TOKEN|SECRET|CLIENT[_-]?SECRET)\s*[:=]\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)/gi, "[凭据已隐藏]")
     .replace(/[A-Za-z]:[\\/][^\s\]\)\}>,;]+/g, "[本机路径已隐藏]")
-    .replace(/(?:sk|ghp|github_pat|xox[baprs])-[-A-Za-z0-9_]+/gi, "[凭据已隐藏]")
-    .replace(/(?:^|\n)\s*(?:PS [^>]+>|\$\s+|>\s+)/g, "$1[命令输出已隐藏] ");
+    .replace(/(?:sk|ghp|github_pat|xox[baprs])[-_][-A-Za-z0-9_]+/gi, "[凭据已隐藏]")
+    .replace(/(?:^|\n)\s*(?:PS [^>]+>|\$\s+|>\s+)/g, "[命令输出已隐藏] ")
+    .slice(0, max);
 }
 
 export function stripTaskAssignmentBlocks(value) {

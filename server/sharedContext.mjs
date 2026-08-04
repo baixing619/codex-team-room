@@ -44,7 +44,21 @@ export function normalizeSharedContext(value) {
   };
 }
 
-export function selectSharedContextForAgent(value, agentId) {
+function appendRecoveryCurrentMessage(messages, recovery, enabled) {
+  const source = Array.isArray(messages) ? messages : [];
+  const currentMessage = enabled && recovery?.currentMessage && typeof recovery.currentMessage === "object"
+    ? recovery.currentMessage
+    : null;
+  if (!currentMessage) return source;
+  const currentId = limitedText(currentMessage.id, 160);
+  const currentText = limitedText(currentMessage.text);
+  const alreadyPresent = currentId
+    ? source.some((message) => limitedText(message?.id, 160) === currentId)
+    : source.some((message) => message?.role === "user" && currentText && limitedText(message?.text) === currentText);
+  return alreadyPresent ? source : [...source, currentMessage];
+}
+
+export function selectSharedContextForAgent(value, agentId, { includeDeferredCurrentMessage = false } = {}) {
   const input = value && typeof value === "object" ? value : {};
   const delivery = input.deliveriesByAgentId && typeof input.deliveriesByAgentId === "object"
     ? input.deliveriesByAgentId[agentId]
@@ -58,13 +72,28 @@ export function selectSharedContextForAgent(value, agentId) {
   if (delivery.mode === "delta") {
     return { ...common, mode: "delta", knowledge: delivery.knowledge || [], recentMessages: delivery.recentMessages || [], removedKnowledgeIds: delivery.removedKnowledgeIds || [] };
   }
+  if (delivery.recovery?.mode === "delta") {
+    return {
+      ...common,
+      mode: "delta",
+      knowledge: delivery.recovery.knowledge || [],
+      recentMessages: appendRecoveryCurrentMessage(delivery.recovery.recentMessages, delivery.recovery, includeDeferredCurrentMessage),
+      removedKnowledgeIds: delivery.recovery.removedKnowledgeIds || [],
+    };
+  }
   // A stale client can still mark a newly promoted member as deferred. If a
   // full snapshot is present, recover with it; otherwise fail before turn/start
   // instead of sending an empty context that could permanently lose history.
   const snapshot = input.snapshot && typeof input.snapshot === "object"
     ? input.snapshot
     : (Array.isArray(input.knowledge) || Array.isArray(input.recentMessages) ? input : null);
-  if (snapshot) return { ...common, mode: "full", knowledge: snapshot.knowledge || [], recentMessages: snapshot.recentMessages || [], removedKnowledgeIds: [] };
+  if (snapshot) return {
+    ...common,
+    mode: "full",
+    knowledge: snapshot.knowledge || [],
+    recentMessages: appendRecoveryCurrentMessage(snapshot.recentMessages, delivery.recovery, includeDeferredCurrentMessage),
+    removedKnowledgeIds: [],
+  };
   throw new Error("shared_context_recovery_snapshot_required");
 }
 

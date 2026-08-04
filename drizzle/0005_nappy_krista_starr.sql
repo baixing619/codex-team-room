@@ -1,0 +1,1 @@
+ALTER TABLE `remote_approvals` ADD `route_json` text;

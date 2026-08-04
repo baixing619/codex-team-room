@@ -49,6 +49,7 @@ export const remoteApprovals = sqliteTable("remote_approvals", {
   userId: text("user_id").notNull(),
   requestId: text("request_id").notNull(),
   approvalKey: text("approval_key"),
+  routeJson: text("route_json"),
   decision: text("decision").notNull(),
   status: text("status").notNull().default("pending"),
   error: text("error"),

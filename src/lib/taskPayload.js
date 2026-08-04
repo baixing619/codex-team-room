@@ -87,7 +87,7 @@ function changedItems(items, fingerprints = {}) {
   return items.filter((item) => item.id && fingerprints[item.id] !== stableContextFingerprint(item));
 }
 
-export function buildRoomSharedContext({ room, messages, knowledge, agents, contextId, memberCursors = {}, activeAgentIds = null, deliverySequence = 0, text = "" }) {
+export function buildRoomSharedContext({ room, messages, knowledge, agents, contextId, memberCursors = {}, activeAgentIds = null, deliverySequence = 0, text = "", currentMessage = null }) {
   const agentById = new Map((agents || []).map((agent) => [agent.id, agent]));
   const fullKnowledge = (knowledge || []).slice(0, MAX_CONTEXT_ITEMS).map(normalizeKnowledgeEntry).filter((entry) => entry.id || entry.title || entry.body);
   const fullMessages = (messages || [])
@@ -96,7 +96,9 @@ export function buildRoomSharedContext({ room, messages, knowledge, agents, cont
     .map((message) => normalizeTeamMessage(message, agentById))
     .filter((message) => message.id || message.text);
   const knowledgeFingerprints = fingerprintMap(fullKnowledge);
+  const currentCursorMessage = currentMessage ? normalizeTeamMessage(currentMessage, agentById) : null;
   const messageFingerprints = fingerprintMap(fullMessages);
+  if (currentCursorMessage?.id) messageFingerprints[currentCursorMessage.id] = stableContextFingerprint(currentCursorMessage);
   const activeIds = activeAgentIds == null
     ? new Set((agents || []).map((agent) => agent.id))
     : new Set(activeAgentIds);
@@ -107,23 +109,34 @@ export function buildRoomSharedContext({ room, messages, knowledge, agents, cont
   for (const agent of agents || []) {
     const { key: cursorKey, cursor } = findContextCursor(memberCursors, agent);
     const threadId = typeof agent.boundThreadId === "string" && agent.boundThreadId.trim() ? agent.boundThreadId.trim() : null;
-    if (!activeIds.has(agent.id)) {
-      deliveriesByAgentId[agent.id] = { mode: "deferred", cursorKey, threadId };
-      if (isBroadcastRequest(text) || isAgentMentioned(text, agent)) needsFullSnapshot = true;
-      continue;
-    }
     const full = !cursor?.initialized;
-    if (full) needsFullSnapshot = true;
-    deliveriesByAgentId[agent.id] = full
-      ? { mode: "full", cursorKey, threadId, snapshotRef: "room-snapshot" }
-      : {
-        mode: "delta",
+    const delta = full ? null : {
+      mode: "delta",
+      knowledge: changedItems(fullKnowledge, cursor.knowledgeFingerprints),
+      recentMessages: changedItems(fullMessages, cursor.messageFingerprints),
+      removedKnowledgeIds: Object.keys(cursor.knowledgeFingerprints || {}).filter((id) => !knowledgeFingerprints[id]),
+    };
+    if (!activeIds.has(agent.id)) {
+      const recovery = full ? { mode: "full", snapshotRef: "room-snapshot" } : { ...delta };
+      // The current request is intentionally excluded from the ordinary
+      // snapshot/delta because an immediately-started member already receives
+      // it as descriptor.text.  A deferred member may only start later through
+      // a coordinator assignment, whose descriptor.text is the assignment
+      // rather than the user's request, so keep one structured recovery copy.
+      if (currentCursorMessage?.id || currentCursorMessage?.text) recovery.currentMessage = currentCursorMessage;
+      deliveriesByAgentId[agent.id] = {
+        mode: "deferred",
         cursorKey,
         threadId,
-        knowledge: changedItems(fullKnowledge, cursor.knowledgeFingerprints),
-        recentMessages: changedItems(fullMessages, cursor.messageFingerprints),
-        removedKnowledgeIds: Object.keys(cursor.knowledgeFingerprints || {}).filter((id) => !knowledgeFingerprints[id]),
+        recovery,
       };
+      if (full || isBroadcastRequest(text) || isAgentMentioned(text, agent)) needsFullSnapshot = true;
+    } else {
+      if (full) needsFullSnapshot = true;
+      deliveriesByAgentId[agent.id] = full
+        ? { mode: "full", cursorKey, threadId, snapshotRef: "room-snapshot" }
+        : { ...delta, cursorKey, threadId };
+    }
     cursorUpdates[cursorKey] = {
       version: 1,
       initialized: true,

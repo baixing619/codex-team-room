@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { buildTurnInput, selectSharedContextForAgent } from "../server/sharedContext.mjs";
 import { applyContextCursorUpdates } from "../src/lib/contextCursors.js";
 import { buildRoomSharedContext, isSupportedAttachment, MAX_ATTACHMENTS, validateSelectedFiles } from "../src/lib/taskPayload.js";
 
@@ -41,6 +42,10 @@ function contextFixture(overrides = {}) {
   };
 }
 
+function countText(source, expected) {
+  return String(source).split(expected).length - 1;
+}
+
 test("the same member receives a full snapshot once, then only new messages", () => {
   const first = buildRoomSharedContext(contextFixture({ agents: [{ id: "developer", name: "开发" }] }));
   const committed = applyContextCursorUpdates({}, first.cursorUpdates, { developer: "thread-developer" });
@@ -60,7 +65,7 @@ test("the same member receives a full snapshot once, then only new messages", ()
 
 test("a late member gets the complete snapshot while an existing thread gets a delta", () => {
   const first = buildRoomSharedContext(contextFixture({ activeAgentIds: ["developer"] }));
-  const committed = applyContextCursorUpdates({}, first.cursorUpdates, { developer: "thread-developer" });
+  const committed = applyContextCursorUpdates({}, Object.fromEntries(Object.entries(first.cursorUpdates).filter(([, cursor]) => cursor.agentId === "developer")), { developer: "thread-developer" });
   const next = buildRoomSharedContext(contextFixture({
     memberCursors: committed,
     agents: [
@@ -105,7 +110,129 @@ test("an explicitly mentioned deferred member gets a recovery snapshot in the pa
 
   assert.ok(context.snapshot);
   assert.equal(context.deliveriesByAgentId.reviewer.mode, "deferred");
+  assert.equal(context.deliveriesByAgentId.reviewer.recovery.mode, "full");
   assert.equal(context.snapshot.recentMessages.length, 2);
+});
+
+test("the current request advances ACK fingerprints without being duplicated in its own snapshot or the next delta", () => {
+  const currentMessage = { id: "m-current", kind: "user", text: "本轮新请求" };
+  const first = buildRoomSharedContext(contextFixture({
+    agents: [{ id: "developer", name: "开发", boundThreadId: "thread-developer" }],
+    activeAgentIds: ["developer"],
+    currentMessage,
+  }));
+  assert.equal(first.snapshot.recentMessages.some((message) => message.id === "m-current"), false);
+  assert.ok(first.cursorUpdates["thread:thread-developer"].messageFingerprints["m-current"]);
+
+  const committed = applyContextCursorUpdates({}, first.cursorUpdates, { developer: "thread-developer" });
+  const next = buildRoomSharedContext(contextFixture({
+    agents: [{ id: "developer", name: "开发", boundThreadId: "thread-developer" }],
+    activeAgentIds: ["developer"],
+    memberCursors: committed,
+    messages: [...contextFixture().messages, currentMessage],
+  }));
+  assert.equal(next.deliveriesByAgentId.developer.mode, "delta");
+  assert.deepEqual(next.deliveriesByAgentId.developer.recentMessages, []);
+});
+
+test("a deferred member keeps a pending cursor update and can recover an existing-thread delta when later delegated", () => {
+  const first = buildRoomSharedContext(contextFixture());
+  const committed = applyContextCursorUpdates({}, first.cursorUpdates, { developer: "thread-developer", reviewer: "thread-reviewer" });
+  const next = buildRoomSharedContext(contextFixture({
+    memberCursors: committed,
+    activeAgentIds: ["developer"],
+    messages: [...contextFixture().messages, { id: "m-delegated", kind: "user", text: "只在委派时补发" }],
+  }));
+  assert.equal(next.deliveriesByAgentId.reviewer.mode, "deferred");
+  assert.equal(next.deliveriesByAgentId.reviewer.recovery.mode, "delta");
+  assert.deepEqual(next.deliveriesByAgentId.reviewer.recovery.recentMessages.map((message) => message.id), ["m-delegated"]);
+  assert.equal(next.cursorUpdates["thread:thread-reviewer"].agentId, "reviewer");
+});
+
+test("deferred full and delta recovery deliver the current request once when delegated and never resend it after ACK", () => {
+  const developer = { id: "developer", name: "开发", boundThreadId: "thread-developer" };
+  const currentMessage = { id: "m-current-delegated", kind: "user", text: "CURRENT_DEFERRED_REQUEST_EXACTLY_ONCE" };
+
+  for (const developerMode of ["full", "delta"]) {
+    let memberCursors = {};
+    if (developerMode === "delta") {
+      const seed = buildRoomSharedContext(contextFixture({ agents: [developer], activeAgentIds: ["developer"] }));
+      memberCursors = applyContextCursorUpdates({}, seed.cursorUpdates, { developer: "thread-developer" });
+    }
+    const context = buildRoomSharedContext(contextFixture({
+      contextId: `context-current-${developerMode}`,
+      agents: [developer],
+      activeAgentIds: [],
+      memberCursors,
+      text: "请总控安排开发处理",
+      currentMessage,
+    }));
+    const recovery = context.deliveriesByAgentId.developer.recovery;
+    assert.equal(recovery.mode, developerMode);
+    assert.equal(recovery.currentMessage.text, currentMessage.text);
+
+    const delegatedContext = selectSharedContextForAgent(context, "developer", { includeDeferredCurrentMessage: true });
+    const delegatedMessages = buildTurnInput({
+      text: "你收到当前项目总控的真实委派。",
+      sharedContext: delegatedContext,
+    }).map((item) => item.text || "").join("\n");
+    assert.equal(countText(delegatedMessages, currentMessage.text), 1, `${developerMode} delegated recovery`);
+
+    const promotedContext = selectSharedContextForAgent(context, "developer", { includeDeferredCurrentMessage: false });
+    const promotedMessages = buildTurnInput({
+      text: currentMessage.text,
+      sharedContext: promotedContext,
+    }).map((item) => item.text || "").join("\n");
+    assert.equal(countText(promotedMessages, currentMessage.text), 1, `${developerMode} initial promotion`);
+
+    const acknowledged = applyContextCursorUpdates(memberCursors, context.cursorUpdates, { developer: "thread-developer" });
+    const nextMessage = { id: `m-next-${developerMode}`, kind: "user", text: `NEXT_REQUEST_${developerMode.toUpperCase()}` };
+    const next = buildRoomSharedContext(contextFixture({
+      contextId: `context-after-ack-${developerMode}`,
+      agents: [developer],
+      activeAgentIds: ["developer"],
+      memberCursors: acknowledged,
+      messages: [...contextFixture().messages, currentMessage],
+      text: nextMessage.text,
+      currentMessage: nextMessage,
+    }));
+    const nextContext = selectSharedContextForAgent(next, "developer");
+    const nextMessages = buildTurnInput({ text: nextMessage.text, sharedContext: nextContext })
+      .map((item) => item.text || "").join("\n");
+    assert.equal(next.deliveriesByAgentId.developer.mode, "delta");
+    assert.equal(countText(nextMessages, currentMessage.text), 0, `${developerMode} after ACK`);
+    assert.equal(countText(nextMessages, nextMessage.text), 1, `${developerMode} next request`);
+  }
+});
+
+test("deferred recovery keeps repeated user text when the message ids differ", () => {
+  const developer = { id: "developer", name: "开发", boundThreadId: "thread-developer" };
+  const messages = [
+    { id: "m-old", kind: "user", text: "继续" },
+    { id: "m-after-old", kind: "agent", agentId: "developer", text: "上一轮已处理" },
+  ];
+  const currentMessage = { id: "m-new", kind: "user", text: "继续" };
+
+  for (const developerMode of ["full", "delta"]) {
+    let memberCursors = {};
+    if (developerMode === "delta") {
+      const seed = buildRoomSharedContext(contextFixture({ agents: [developer], activeAgentIds: ["developer"], messages }));
+      memberCursors = applyContextCursorUpdates({}, seed.cursorUpdates, { developer: "thread-developer" });
+    }
+    const context = buildRoomSharedContext(contextFixture({
+      contextId: `context-repeat-${developerMode}`,
+      agents: [developer],
+      activeAgentIds: [],
+      memberCursors,
+      messages,
+      text: "请总控安排开发继续处理",
+      currentMessage,
+    }));
+    const delivered = selectSharedContextForAgent(context, "developer", { includeDeferredCurrentMessage: true });
+    const deliveredIds = delivered.recentMessages.map((message) => message.id);
+    assert.equal(deliveredIds.filter((id) => id === "m-new").length, 1, `${developerMode} keeps the new id`);
+    if (developerMode === "full") assert.ok(deliveredIds.includes("m-old"));
+  }
 });
 
 test("each member keeps an independent cursor and a failed send does not advance either one", () => {

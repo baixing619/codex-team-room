@@ -166,7 +166,7 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
     ...(event.eventId ? { eventId: event.eventId } : {}),
   };
   if (["taskStarted", "taskWaitingApproval", "taskCompleted", "taskFailed"].includes(event.type)) {
-    return { ...common, status: event.status, error: event.error || null };
+    return { ...common, status: event.status, error: event.error ? safeRemoteTaskError(event.error) : null };
   }
   if (event.type === "agentMessage") return {
     ...common,
@@ -178,10 +178,25 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
     ...(event.assignmentId ? { assignmentId: event.assignmentId } : {}),
   };
   if (event.type === "approvalRequested") {
-    return { ...common, requestId: event.requestId, approvalKey: event.approvalKey, method: event.method, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, command: event.command, target: projectLabel, operationType: event.operationType, requiresWriteLock: event.requiresWriteLock, canAccept: event.canAccept };
+    return {
+      ...common,
+      requestId: event.requestId,
+      approvalKey: event.approvalKey,
+      method: event.method,
+      threadId: event.threadId,
+      turnId: event.turnId,
+      itemId: event.itemId,
+      command: sanitizeTaskText(event.command || event.reason || "", 2000),
+      ...(event.reason ? { reason: sanitizeTaskText(event.reason, 2000) } : {}),
+      ...(event.error ? { error: safeRemoteTaskError(event.error) } : {}),
+      target: projectLabel,
+      operationType: event.operationType,
+      requiresWriteLock: event.requiresWriteLock,
+      canAccept: event.canAccept,
+    };
   }
   if (event.type === "approvalResolved") return { ...common, requestId: event.requestId, approvalKey: event.approvalKey, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, decision: event.decision, requiresWriteLock: event.requiresWriteLock };
-  if (event.type === "approvalFailed") return { ...common, requestId: event.requestId, approvalKey: event.approvalKey, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, error: event.error || "approval_failed" };
+  if (event.type === "approvalFailed") return { ...common, requestId: event.requestId, approvalKey: event.approvalKey, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, error: safeRemoteTaskError(event.error || "approval_failed") };
   if (event.type === "agentThreadBound") return { ...common, threadId: event.threadId, model: event.model, bindingMode: event.bindingMode };
   if (event.type === "turnStarted") return { ...common, threadId: event.threadId, turnId: event.turnId, messageId: event.messageId };
   if (event.type === "turnCompleted") return { ...common, threadId: event.threadId, turnId: event.turnId, status: event.turn?.status || event.status || "completed" };
@@ -254,6 +269,7 @@ export class RemotePairingBridge {
         "content-type": "application/json",
         "OAI-Sites-Authorization": `Bearer ${this.config.siwcBypassToken}`,
         "x-team-room-device-secret": this.config.deviceSecret,
+        ...(this.config?.deviceId ? { "x-team-room-device-id": this.config.deviceId } : {}),
         ...(options.headers || {}),
       },
     };
@@ -430,18 +446,31 @@ export class RemotePairingBridge {
   }
 
   async processApproval(approval) {
-    const requestId = safeApprovalRequestId(approval.request_id);
+    const requestId = safeApprovalRequestId(approval.request_id ?? approval.requestId);
+    const approvalKey = approval.approval_key ?? approval.approvalKey ?? null;
+    let route = approval.routeJson ?? approval.route_json ?? null;
+    if (typeof route === "string") {
+      try { route = JSON.parse(route); } catch { route = null; }
+    }
+    route = route && typeof route === "object" ? route : {};
+    const agentId = approval.agent_id ?? approval.agentId ?? route.agentId ?? null;
     try {
       this.runtime.resolveApproval({ requestId, decision: approval.decision });
-      await this.request(`/api/device/approvals/${encodeURIComponent(approval.id)}/result`, { method: "POST", body: JSON.stringify({ ok: true }) });
     } catch (error) {
-      const alreadyEmitted = this.runtime.listEvents(0).some((event) => event.type === "approvalFailed" && String(event.requestId) === String(requestId));
+      const safeError = safeRemoteTaskError(error);
+      const alreadyEmitted = this.runtime.listEvents(0).some((event) => event.type === "approvalFailed"
+        && String(event.requestId) === String(requestId)
+        && (!approvalKey || event.approvalKey === approvalKey));
       if (!alreadyEmitted) {
         this.runtime.emitRoomEvent("approvalFailed", {
           requestId,
-          approvalKey: approval.approval_key || null,
-          agentId: approval.agent_id || null,
-          error: error instanceof Error ? error.message : String(error),
+          approvalKey,
+          agentId,
+          roomId: route.roomId || null,
+          taskId: route.taskId || null,
+          threadId: route.threadId || null,
+          turnId: route.turnId || null,
+          error: safeError,
         });
       }
       // Emit first so the following tick can still upload the failure if the
@@ -449,12 +478,24 @@ export class RemotePairingBridge {
       try {
         await this.request(`/api/device/approvals/${encodeURIComponent(approval.id)}/result`, {
           method: "POST",
-          body: JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+          body: JSON.stringify({ ok: false, error: safeError, deviceId: this.config?.deviceId || null }),
         });
       } catch {
         // The event queue remains the durable retry path.
       }
-      throw error;
+      throw new Error(safeError);
+    }
+    // The local decision is already authoritative. A network failure while
+    // acknowledging it must never be rewritten as approvalFailed because the
+    // accepted command may already be executing. The emitted
+    // approvalResolved event reconciles the claimed cloud row durably.
+    try {
+      await this.request(`/api/device/approvals/${encodeURIComponent(approval.id)}/result`, {
+        method: "POST",
+        body: JSON.stringify({ ok: true, deviceId: this.config?.deviceId || null }),
+      });
+    } catch (error) {
+      throw new Error(safeRemoteTaskError(error));
     }
   }
 
@@ -487,7 +528,7 @@ export class RemotePairingBridge {
       } catch (error) {
         await this.request(`/api/device/index-requests/${encodeURIComponent(current.id)}/result`, {
           method: "POST",
-          body: JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+          body: JSON.stringify({ ok: false, error: safeRemoteTaskError(error) }),
         });
       }
       processed += 1;

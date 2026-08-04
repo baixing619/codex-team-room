@@ -46,6 +46,10 @@ export function isApprovalTerminal(status) {
   return TERMINAL_STATUSES.has(status);
 }
 
+export function visibleApprovalCommands(commands) {
+  return (Array.isArray(commands) ? commands : []).filter((command) => isApprovalActive(command?.status));
+}
+
 export function normalizeApprovalRequestId(value) {
   const result = text(value, 160);
   return result || null;
@@ -230,6 +234,8 @@ export function createApprovalCommand({ source, roomId, event, agent } = {}) {
     id: `approval-${identity.key.slice("approval:".length)}`,
     source: source === "remote" ? "remote" : "runtime",
     runtimeRequestId: payload.requestId,
+    roomId: payload.roomId || roomId || null,
+    taskId: payload.taskId || null,
     agentId: payload.agentId,
     approvalMethod: payload.method,
     threadId: payload.threadId,

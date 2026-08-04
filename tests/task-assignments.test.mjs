@@ -6,6 +6,7 @@ import {
   parseTaskAssignment,
   parseTaskAssignments,
   parseTaskResult,
+  sanitizeTaskText,
   stripTaskAssignmentBlocks,
   validateTaskAssignment,
 } from "../src/lib/taskAssignments.js";
@@ -67,8 +68,73 @@ test("assignment validation binds source turn, target member, depth, cycle, and 
   assert.equal(validateTaskAssignment({ ...args, assignment: base({ targetAgentId: "developer" }), parentTask: { ...parentTask, agentPath: ["coordinator", "developer"] } }).reason, "assignment_cycle");
 });
 
+test("assignment idempotency is scoped to the parent task lifecycle", () => {
+  const parent = {
+    id: "task-one",
+    roomId: "room-1",
+    depth: 0,
+    coordinatorTurnId: "turn-one",
+    coordinatorThreadId: "thread-coordinator",
+    coordinatorAgentId: "coordinator",
+    agentPath: ["coordinator"],
+    delegationCount: 0,
+  };
+  const common = {
+    assignment: base({ parentTaskId: "task-one" }),
+    coordinatorAgentId: "coordinator",
+    sourceRoomId: "room-1",
+    sourceTurnId: "turn-one",
+    sourceThreadId: "thread-coordinator",
+    parentTask: parent,
+    agents: [{ id: "coordinator" }, { id: "developer" }],
+    assignmentsById: new Map([["assignment-1", base({ parentTaskId: "task-one" })]]),
+  };
+  assert.equal(validateTaskAssignment(common).reason, "assignment_duplicate");
+  const nextParent = { ...parent, id: "task-two", coordinatorTurnId: "turn-two" };
+  const next = validateTaskAssignment({
+    ...common,
+    assignment: base({ parentTaskId: "task-two" }),
+    sourceTurnId: "turn-two",
+    parentTask: nextParent,
+    assignmentsById: new Map(),
+  });
+  assert.equal(next.ok, true);
+});
+
 test("task results retain a strict internal status and sanitize local paths", () => {
   const result = parseTaskResult(formatTaskResult({ assignmentId: "a", parentTaskId: "t", targetAgentId: "developer", sourceTurnId: "turn-1", status: "failed", summary: "G:\\private\\secret.txt" }));
   assert.equal(result.status, "failed");
   assert.match(result.summary, /本机路径已隐藏/);
+});
+
+test("task result sanitization removes bearer tokens, prefixed environment secrets, database URLs, and private keys", () => {
+  const openAiKeyName = ["OPENAI", "API", "KEY"].join("_");
+  const openSshHeader = ["-----BEGIN ", "OPENSSH", " PRIVATE KEY-----"].join("");
+  const encryptedHeader = ["-----BEGIN ", "ENCRYPTED", " PRIVATE KEY-----"].join("");
+  const source = [
+    "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.secret.signature",
+    `${openAiKeyName}=sk-live-openai-secret`,
+    "DB_PASSWORD='database-password'",
+    "X_CLIENT_SECRET=x-client-secret",
+    "postgresql://admin:password@db.example.test:5432/app",
+    "mongodb+srv://user:pass@cluster.example.test/app",
+    `${openSshHeader}\nOPENSSH_PRIVATE_MATERIAL\n-----END OPENSSH PRIVATE KEY-----`,
+    `${encryptedHeader}\nENCRYPTED_PRIVATE_MATERIAL\n-----END ENCRYPTED PRIVATE KEY-----`,
+  ].join("\n");
+  const sanitized = sanitizeTaskText(source);
+  for (const secret of [
+    "eyJhbGciOiJIUzI1NiJ9.secret.signature",
+    "sk-live-openai-secret",
+    "database-password",
+    "x-client-secret",
+    "admin:password",
+    "user:pass",
+    "OPENSSH_PRIVATE_MATERIAL",
+    "ENCRYPTED_PRIVATE_MATERIAL",
+    "BEGIN OPENSSH PRIVATE KEY",
+    "BEGIN ENCRYPTED PRIVATE KEY",
+  ]) assert.doesNotMatch(sanitized, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(sanitized, /凭据已隐藏/);
+  assert.match(sanitized, /数据库地址已隐藏/);
+  assert.match(sanitized, /私钥已隐藏/);
 });

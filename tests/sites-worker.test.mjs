@@ -56,11 +56,15 @@ function createIndexRequestDb() {
 
 function createApprovalDb() {
   const rows = new Map();
+  const tasks = new Map();
   const statements = [];
+  const events = [];
   return {
     rows,
+    tasks,
     statements,
-    batch: async () => [],
+    events,
+    batch: async (items) => Promise.all((items || []).map((item) => item.run())),
     prepare(sql) {
       let values = [];
       return {
@@ -68,18 +72,55 @@ function createApprovalDb() {
         async run() {
           statements.push({ sql, values });
           if (sql.startsWith("INSERT INTO remote_approvals")) {
-            const [id, user_id, request_id, decision, approval_key] = values;
-            rows.set(id, { id, user_id, request_id, decision, approval_key: approval_key || null, status: "pending", error: null, created_at: "2026-08-02 00:00:00", claimed_at: null, completed_at: null });
+            const [id, user_id, request_id, decision, approval_key, route_json] = values;
+            rows.set(id, { id, user_id, request_id, decision, approval_key: approval_key || null, route_json: route_json || null, status: "pending", error: null, created_at: "2026-08-02 00:00:00", claimed_at: null, completed_at: null });
+            return { meta: { changes: 1 } };
+          } else if (sql.startsWith("INSERT OR IGNORE INTO remote_events")) {
+            const [user_id, device_id, task_id, event_id, event_type, payload_json] = values;
+            if (!events.some((event) => event.user_id === user_id && event.device_id === device_id && event.event_id === event_id)) events.push({ sequence: events.length + 1, user_id, device_id, task_id, event_id, event_type, payload_json, created_at: "2026-08-02 00:00:03" });
+            return { meta: { changes: 1 } };
           } else if (sql.startsWith("UPDATE remote_approvals SET status = 'claimed'")) {
             const row = rows.get(values[0]);
             if (!row || row.status !== "pending") return { meta: { changes: 0 } };
             row.status = "claimed";
             row.claimed_at = "2026-08-02 00:00:01";
             return { meta: { changes: 1 } };
-          } else if (sql.startsWith("UPDATE remote_approvals SET status = 'failed'")) {
-            for (const row of rows.values()) {
-              if (row.status === "pending" && row.created_at.startsWith("2020-")) Object.assign(row, { status: "failed", error: "approval_expired" });
+          } else if (sql.startsWith("UPDATE remote_approvals SET status = ?, error = ?")) {
+            const [status, error] = values;
+            let row;
+            if (sql.includes("WHERE user_id = ? AND approval_key = ?")) {
+              const [, , userId, approvalKey] = values;
+              row = Array.from(rows.values()).find((item) => item.user_id === userId && item.approval_key === approvalKey && ["pending", "claimed"].includes(item.status));
+            } else if (sql.includes("WHERE user_id = ? AND request_id = ?")) {
+              const [, , userId, requestId] = values;
+              row = Array.from(rows.values()).find((item) => item.user_id === userId && item.request_id === requestId && ["pending", "claimed"].includes(item.status));
+            } else {
+              row = rows.get(values[2]);
+              if (row?.status !== "claimed") row = null;
             }
+            if (!row) return { meta: { changes: 0 } };
+            Object.assign(row, { status, error, completed_at: "2026-08-02 00:00:02" });
+            return { meta: { changes: 1 } };
+          } else if (sql.startsWith("UPDATE remote_approvals SET status = 'failed'")) {
+            const claimed = sql.includes("status = 'claimed'");
+            if (sql.includes("WHERE id = ?")) {
+              const row = rows.get(values[0]);
+              const expectedStatus = claimed ? "claimed" : "pending";
+              if (!row || row.user_id !== values[1] || row.status !== expectedStatus) return { meta: { changes: 0 } };
+              Object.assign(row, { status: "failed", error: claimed ? "approval_claim_expired" : "approval_expired", completed_at: "2026-08-02 00:00:02" });
+              return { meta: { changes: 1 } };
+            }
+            let changes = 0;
+            for (const row of rows.values()) {
+              const expired = claimed
+                ? row.status === "claimed" && row.claimed_at?.startsWith("2020-")
+                : row.status === "pending" && row.created_at.startsWith("2020-");
+              if (expired) {
+                Object.assign(row, { status: "failed", error: claimed ? "approval_claim_expired" : "approval_expired", completed_at: "2026-08-02 00:00:02" });
+                changes += 1;
+              }
+            }
+            return { meta: { changes } };
           }
           return { meta: { changes: 1 } };
         },
@@ -91,7 +132,15 @@ function createApprovalDb() {
               && ["pending", "claimed", "completed"].includes(row.status)) || null;
           }
           if (sql.includes("FROM remote_approvals WHERE status = 'pending'")) return Array.from(rows.values()).find((row) => row.status === "pending") || null;
+          if (sql.includes("FROM remote_approvals WHERE id = ?")) return rows.get(values[0]) || null;
+          if (sql.includes("SELECT user_id FROM remote_tasks WHERE id = ?")) return tasks.get(values[0]) || null;
           return null;
+        },
+        async all() {
+          if (sql.includes("FROM remote_events WHERE user_id = ?")) return { results: events.filter((event) => event.user_id === values[0] && event.sequence > Number(values[1] || 0)) };
+          if (sql.includes("status = 'claimed'")) return { results: Array.from(rows.values()).filter((row) => row.status === "claimed" && row.claimed_at?.startsWith("2020-") && (!sql.includes("user_id = ?") || row.user_id === values[0])) };
+          if (sql.includes("status = 'pending'")) return { results: Array.from(rows.values()).filter((row) => row.status === "pending" && row.created_at.startsWith("2020-") && (!sql.includes("user_id = ?") || row.user_id === values[0])) };
+          return { results: [] };
         },
       };
     },
@@ -377,10 +426,9 @@ test("reclaims an expired device index claim so a retry is not stuck forever", a
   assert.ok(statements.some(({ sql }) => sql.includes("device_request_lease_expired")));
 });
 
-test("reclaims expired task and approval claims before returning them to the device", async () => {
+test("reclaims expired task claims before returning them to the device", async () => {
   for (const scenario of [
     { table: "remote_tasks", pathname: "/api/device/tasks", property: "task", row: { id: "expired-task-1", room_id: "room-1", message_id: "message-1", cwd: "G:\\project", text: "继续", decisions_json: "[]", agents_json: "[]", created_at: "2026-08-01 00:00:00" } },
-    { table: "remote_approvals", pathname: "/api/device/approvals", property: "approval", row: { id: "expired-approval-1", request_id: "42", decision: "accept", created_at: "2026-08-01 00:00:00" } },
   ]) {
     const statements = [];
     const env = {
@@ -422,7 +470,7 @@ test("remote approvals are idempotent by approval key and stale pending rows exp
   const create = () => worker.fetch(new Request("https://example.test/api/remote/approvals", {
     method: "POST",
     headers: ownerHeaders,
-    body: JSON.stringify({ requestId: "41", approvalKey: "approval:stable", decision: "accept" }),
+    body: JSON.stringify({ requestId: "41", approvalKey: "approval:stable", decision: "accept", roomId: "room-approval", taskId: "task-approval", agentId: "developer", threadId: "thread-developer", turnId: "turn-41" }),
   }), env);
 
   const first = await create();
@@ -440,14 +488,90 @@ test("remote approvals are idempotent by approval key and stale pending rows exp
   const claimedBody = await claimed.json();
   assert.equal(claimedBody.approval.id, firstBody.approval.id);
   assert.equal(db.rows.get(firstBody.approval.id).status, "claimed");
+  assert.deepEqual(JSON.parse(db.rows.get(firstBody.approval.id).route_json), {
+    roomId: "room-approval",
+    taskId: "task-approval",
+    agentId: "developer",
+    threadId: "thread-developer",
+    turnId: "turn-41",
+  });
 
-  db.rows.set("stale-approval", { id: "stale-approval", user_id: "site-owner", request_id: "99", decision: "accept", approval_key: "stale-key", status: "pending", created_at: "2020-01-01 00:00:00", claimed_at: null, completed_at: null, error: null });
+  const privateKeyHeader = ["-----BEGIN ", "OPENSSH", " PRIVATE KEY-----"].join("");
+  const failed = await worker.fetch(new Request(`https://example.test/api/device/approvals/${firstBody.approval.id}/result`, {
+    method: "POST",
+    headers: { "x-team-room-device-secret": "device-secret", "content-type": "application/json" },
+    body: JSON.stringify({ ok: false, error: `G:\\private\\secret.txt Authorization: Bearer bearer-secret OPENAI_API_KEY=openai-secret postgresql://user:pass@db.example/app\n${privateKeyHeader}\nPRIVATE_MATERIAL\n-----END OPENSSH PRIVATE KEY-----`, deviceId: "device-1" }),
+  }), env);
+  assert.equal(failed.status, 200);
+  assert.equal(db.rows.get(firstBody.approval.id).status, "failed");
+  const terminal = db.events.find((event) => event.event_type === "approvalFailed");
+  assert.ok(terminal);
+  const terminalPayload = JSON.parse(terminal.payload_json);
+  assert.equal(terminalPayload.roomId, "room-approval");
+  assert.equal(terminalPayload.threadId, "thread-developer");
+  assert.match(terminalPayload.error, /本机路径已隐藏/);
+  assert.doesNotMatch(terminalPayload.error, /bearer-secret|openai-secret|user:pass|PRIVATE_MATERIAL|BEGIN OPENSSH|G:\\private/);
+
+  const second = await worker.fetch(new Request("https://example.test/api/remote/approvals", {
+    method: "POST",
+    headers: ownerHeaders,
+    body: JSON.stringify({ requestId: "42", approvalKey: "approval:success", decision: "accept", roomId: "room-approval", taskId: "task-approval", agentId: "developer", threadId: "thread-developer", turnId: "turn-42" }),
+  }), env);
+  const secondBody = await second.json();
+  const secondId = secondBody.approval.id;
+  await worker.fetch(new Request("https://example.test/api/device/approvals", { headers: { "x-team-room-device-secret": "device-secret" } }), env);
+  db.tasks.set("task-approval", { user_id: "site-owner" });
+  const reconciled = await worker.fetch(new Request("https://example.test/api/device/events", {
+    method: "POST",
+    headers: { "x-team-room-device-secret": "device-secret", "content-type": "application/json" },
+    body: JSON.stringify({ deviceId: "device-1", events: [{ taskId: "task-approval", eventId: "approval:success:approvalResolved", type: "approvalResolved", payload: { taskId: "task-approval", roomId: "room-approval", requestId: "42", approvalKey: "approval:success", agentId: "developer", threadId: "thread-developer", turnId: "turn-42", decision: "accept" } }] }),
+  }), env);
+  assert.equal(reconciled.status, 200);
+  assert.equal(db.rows.get(secondId).status, "completed");
+  assert.ok(db.events.some((event) => event.event_type === "approvalResolved"));
+
+  db.rows.set("stale-approval", { id: "stale-approval", user_id: "site-owner", request_id: "99", decision: "accept", approval_key: "stale-key", route_json: JSON.stringify({ roomId: "room-approval", taskId: "task-approval", agentId: "developer", threadId: "thread-developer", turnId: "turn-99" }), status: "pending", created_at: "2020-01-01 00:00:00", claimed_at: null, completed_at: null, error: null });
   const expired = await worker.fetch(new Request("https://example.test/api/device/approvals", {
     headers: { "x-team-room-device-secret": "device-secret" },
   }), env);
   assert.deepEqual(await expired.json(), { approval: null });
   assert.equal(db.rows.get("stale-approval").status, "failed");
   assert.ok(db.statements.some(({ sql }) => sql.includes("approval_expired")));
+  assert.ok(db.events.some((event) => event.event_type === "approvalFailed" && JSON.parse(event.payload_json).requestId === "99" && JSON.parse(event.payload_json).error === "approval_expired"));
+
+  db.rows.set("stale-claimed", { id: "stale-claimed", user_id: "site-owner", request_id: "100", decision: "accept", approval_key: "stale-claimed-key", route_json: JSON.stringify({ roomId: "room-approval", taskId: "task-approval", agentId: "developer", threadId: "thread-developer", turnId: "turn-100" }), status: "claimed", created_at: "2026-08-02 00:00:00", claimed_at: "2020-01-01 00:00:00", completed_at: null, error: null });
+  db.rows.set("next-approval", { id: "next-approval", user_id: "site-owner", request_id: "101", decision: "decline", approval_key: "next-key", route_json: JSON.stringify({ roomId: "room-approval", taskId: "task-approval", agentId: "reviewer", threadId: "thread-reviewer", turnId: "turn-101" }), status: "pending", created_at: "2026-08-02 00:00:01", claimed_at: null, completed_at: null, error: null });
+  const next = await worker.fetch(new Request("https://example.test/api/device/approvals", {
+    headers: { "x-team-room-device-secret": "device-secret", "x-team-room-device-id": "device-1" },
+  }), env);
+  assert.equal((await next.json()).approval.id, "next-approval");
+  assert.equal(db.rows.get("stale-claimed").status, "failed");
+  assert.equal(db.rows.get("stale-claimed").error, "approval_claim_expired");
+  assert.ok(db.events.some((event) => event.event_type === "approvalFailed" && JSON.parse(event.payload_json).requestId === "100" && JSON.parse(event.payload_json).error === "approval_claim_expired"));
+});
+
+test("owner event polling expires only that owner's stale approvals, emits terminal events, and performs no idle writes", async () => {
+  const ownerHeaders = { origin: "https://example.test" };
+  const idleDb = createApprovalDb();
+  const idle = await worker.fetch(new Request("https://example.test/api/remote/events?after=0", { headers: ownerHeaders }), { DB: idleDb, TEAM_ROOM_DEVICE_SECRET: "device-secret" });
+  assert.equal(idle.status, 200);
+  assert.deepEqual((await idle.json()).events, []);
+  assert.equal(idleDb.statements.some(({ sql }) => sql.startsWith("UPDATE remote_approvals SET status = 'failed'")), false);
+
+  const db = createApprovalDb();
+  db.rows.set("owner-stale", { id: "owner-stale", user_id: "site-owner", request_id: "owner-99", decision: "accept", approval_key: "owner-key", route_json: JSON.stringify({ roomId: "room-owner", taskId: "task-owner", agentId: "developer", threadId: "thread-owner", turnId: "turn-owner" }), status: "pending", created_at: "2020-01-01 00:00:00", claimed_at: null, completed_at: null, error: null });
+  db.rows.set("other-stale", { id: "other-stale", user_id: "other-owner", request_id: "other-99", decision: "accept", approval_key: "other-key", route_json: JSON.stringify({ roomId: "room-other", taskId: "task-other" }), status: "pending", created_at: "2020-01-01 00:00:00", claimed_at: null, completed_at: null, error: null });
+  const response = await worker.fetch(new Request("https://example.test/api/remote/events?after=0", { headers: ownerHeaders }), { DB: db, TEAM_ROOM_DEVICE_SECRET: "device-secret" });
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(db.rows.get("owner-stale").status, "failed");
+  assert.equal(db.rows.get("other-stale").status, "pending");
+  assert.equal(body.events.length, 1);
+  assert.equal(body.events[0].event_type, "approvalFailed");
+  assert.equal(body.events[0].payload.requestId, "owner-99");
+  assert.equal(body.events[0].payload.roomId, "room-owner");
+  assert.equal(body.events[0].payload.error, "approval_expired");
+  assert.equal(db.statements.filter(({ sql }) => sql.startsWith("UPDATE remote_approvals SET status = 'failed'")).length, 1);
 });
 
 test("owner and paired device share cloud state with revision CAS conflict protection", async () => {

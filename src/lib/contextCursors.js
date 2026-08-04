@@ -140,3 +140,9 @@ export function acknowledgeContextDelivery({ cursors = {}, pending = [], taskId 
   else nextPending.splice(index, 1);
   return { cursors: nextCursors, pending: nextPending };
 }
+
+export function discardPendingContextDelivery(pending = [], { taskId = null, messageId = null } = {}) {
+  if (!Array.isArray(pending)) return [];
+  if (!taskId && !messageId) return pending;
+  return pending.filter((item) => !((taskId && item.taskId === taskId) || (messageId && item.messageId === messageId)));
+}

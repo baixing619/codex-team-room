@@ -112,6 +112,32 @@ test("sanitized agent thread bindings retain their binding mode", () => {
   assert.equal(sanitized.cwd, undefined);
 });
 
+test("approval events sent to the private site sanitize command, reason, and failure details", () => {
+  const requested = sanitizeRuntimeEvent({
+    type: "approvalRequested",
+    requestId: 7,
+    approvalKey: "approval-7",
+    method: "item/commandExecution/requestApproval",
+    command: "Get-Content G:\\private\\secret.txt sk-live-secret",
+    reason: "PS G:\\private\\project> output with token ghp_example-secret",
+    error: "G:\\private\\error.log",
+    threadId: "thread-7",
+    turnId: "turn-7",
+  });
+  assert.match(requested.command, /本机路径已隐藏/);
+  assert.doesNotMatch(requested.command, /sk-live-secret/);
+  assert.match(requested.reason, /命令输出已隐藏/);
+  assert.doesNotMatch(requested.reason, /ghp_example-secret/);
+  assert.match(requested.error, /本机路径已隐藏/);
+  assert.equal(requested.cwd, undefined);
+  const failed = sanitizeRuntimeEvent({ type: "approvalFailed", requestId: 7, error: "G:\\private\\failure.txt sk-live-secret" });
+  assert.match(failed.error, /本机路径已隐藏/);
+  assert.doesNotMatch(failed.error, /sk-live-secret/);
+  const taskFailed = sanitizeRuntimeEvent({ type: "taskFailed", error: "G:\\private\\task.txt sk_live_secret" });
+  assert.match(taskFailed.error, /本机路径已隐藏/);
+  assert.doesNotMatch(taskFailed.error, /sk_live_secret/);
+});
+
 test("outbound bridge dispatches queued work and applies one-time approvals", async () => {
   const calls = [];
   const runtime = {
@@ -396,7 +422,7 @@ test("remote approval failures are emitted and uploaded on the same tick", async
   const calls = [];
   const events = [];
   const runtime = {
-    resolveApproval() { throw new Error("runtime_disconnected"); },
+    resolveApproval() { throw new Error("G:\\private\\approval.txt sk-live-secret"); },
     listEvents(after = 0) { return events.filter((event) => event.sequence > after); },
     emitRoomEvent(type, payload) {
       const event = { sequence: events.length + 1, type, createdAt: "2026-08-02T00:00:00.000Z", ...payload };
@@ -423,7 +449,54 @@ test("remote approval failures are emitted and uploaded on the same tick", async
   const upload = calls.find((call) => call.pathname === "/api/device/events");
   assert.ok(upload);
   const uploadedEvents = JSON.parse(upload.options.body).events;
-  assert.equal(uploadedEvents.some((item) => item.type === "approvalFailed" && item.payload.requestId === 41 && item.payload.error === "runtime_disconnected"), true);
-  assert.equal(bridge.lastError, "runtime_disconnected");
+  const uploadedFailure = uploadedEvents.find((item) => item.type === "approvalFailed" && item.payload.requestId === 41);
+  assert.ok(uploadedFailure);
+  assert.match(uploadedFailure.payload.error, /本机路径已隐藏/);
+  assert.doesNotMatch(uploadedFailure.payload.error, /sk-live-secret|G:\\private/);
+  assert.match(bridge.lastError, /本机路径已隐藏/);
   assert.equal(bridge.busy, false);
+});
+
+test("a failed result acknowledgement after local approval never emits a false approval failure", async () => {
+  const calls = [];
+  const events = [];
+  const runtime = {
+    resolveApproval({ requestId, decision }) {
+      this.emitRoomEvent("approvalResolved", { requestId, approvalKey: "approval:accepted", decision, roomId: "room-1", taskId: "task-1", agentId: "developer", threadId: "thread-1", turnId: "turn-1" });
+    },
+    listEvents(after = 0) { return events.filter((event) => event.sequence > after); },
+    emitRoomEvent(type, payload) {
+      const event = { sequence: events.length + 1, type, createdAt: "2026-08-02T00:00:00.000Z", ...payload };
+      events.push(event);
+      return event;
+    },
+  };
+  const bridge = new RemotePairingBridge({
+    runtime,
+    fetchImpl: async (url, options = {}) => {
+      const pathname = new URL(url).pathname;
+      calls.push({ pathname, options });
+      if (pathname === "/api/device/tasks") return Response.json({ task: null });
+      if (pathname === "/api/device/approvals") return Response.json({ approval: { id: "approval-accepted", request_id: "51", approval_key: "approval:accepted", routeJson: { roomId: "room-1", taskId: "task-1", agentId: "developer", threadId: "thread-1", turnId: "turn-1" }, decision: "accept" } });
+      if (pathname === "/api/device/index-requests") return Response.json({ error: "not_found" }, { status: 404 });
+      if (pathname === "/api/device/approvals/approval-accepted/result") return Response.json({ error: "temporary_result_outage" }, { status: 503 });
+      return Response.json({ ok: true });
+    },
+  });
+  bridge.config = { siteUrl: "https://private.example", deviceSecret: "device-secret", siwcBypassToken: "bypass-token", cwd: "G:\\project", deviceId: "device-1", deviceLabel: "工作电脑" };
+  bridge.lastHeartbeatAt = Date.now();
+
+  await bridge.tick();
+
+  assert.equal(events.some((event) => event.type === "approvalFailed"), false);
+  assert.equal(events.some((event) => event.type === "approvalResolved" && event.requestId === 51), true);
+  const uploaded = calls.find((call) => call.pathname === "/api/device/events");
+  assert.ok(uploaded);
+  const uploadedEvents = JSON.parse(uploaded.options.body).events;
+  assert.equal(uploadedEvents.some((event) => event.type === "approvalResolved"), true);
+  assert.equal(uploadedEvents.some((event) => event.type === "approvalFailed"), false);
+  const resultBodies = calls
+    .filter((call) => call.pathname === "/api/device/approvals/approval-accepted/result")
+    .map((call) => JSON.parse(call.options.body));
+  assert.equal(resultBodies.every((body) => body.ok === true), true);
 });

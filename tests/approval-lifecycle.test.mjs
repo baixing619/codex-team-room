@@ -7,6 +7,7 @@ import {
   createApprovalCommand,
   mergeApprovalCommands,
   reconcileApprovalState,
+  visibleApprovalCommands,
 } from "../src/lib/approvalLifecycle.js";
 
 const roomId = "room-approval-tests";
@@ -37,6 +38,21 @@ test("runtime and remote events for one request merge into one stable approval",
   assert.equal(commands.length, 1);
   assert.deepEqual(commands[0].originSources.sort(), ["remote", "runtime"]);
   assert.equal(commands[0].approvalKey, commands[0].approvalKey);
+});
+
+test("approval cards preserve room and task routing for accept and decline posts", () => {
+  const agent = { id: "developer", permission: "request-write", name: "开发" };
+  const command = createApprovalCommand({
+    roomId,
+    source: "remote",
+    agent,
+    event: { ...request({ agentId: agent.id, method: "item/fileChange/requestApproval", requestId: 17 }), roomId, taskId: "task-route-17" },
+  });
+  assert.equal(command.roomId, roomId);
+  assert.equal(command.taskId, "task-route-17");
+  assert.equal(command.agentId, "developer");
+  assert.equal(command.threadId, "thread-developer");
+  assert.equal(command.turnId, "turn-developer");
 });
 
 test("private cloud routes remote approvals and local runtime stays local", () => {
@@ -110,4 +126,17 @@ test("legacy active cards and orphan locks are removed during generic reconcilia
   const migrated = reconcileApprovalState(state([agent], [runtime, remote], { commandId: "remote-command-0", agentId: agent.id }), { privateCloud: true, runtimeConnected: false });
   assert.equal(migrated.commandsByRoom[roomId].length, 0);
   assert.equal(migrated.writeLocksByRoom[roomId], null);
+});
+
+test("only active approvals remain visible in the conversation", () => {
+  const commands = [
+    { id: "pending", status: "pending" },
+    { id: "submitted", status: "submitted" },
+    { id: "approved", status: "approved" },
+    { id: "completed", status: "completed" },
+    { id: "denied", status: "denied" },
+    { id: "failed", status: "failed" },
+    { id: "expired", status: "expired" },
+  ];
+  assert.deepEqual(visibleApprovalCommands(commands).map((command) => command.id), ["pending", "submitted", "approved"]);
 });

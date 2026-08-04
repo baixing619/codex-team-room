@@ -3,9 +3,19 @@ import { getCodexRuntimeStatus, spawnCodexAppServer } from "./codexAppServerRunt
 import { decideParticipation, isAgentMentioned, isBroadcastRequest } from "../src/lib/participation.js";
 import { selectSharedContextForAgent } from "./sharedContext.mjs";
 import { approvalIdentity, classifyApprovalRequest } from "../src/lib/approvalLifecycle.js";
-import { formatTaskResult, isCoordinatorOnlyRequest, parseTaskAssignments, stripTaskAssignmentBlocks, TASK_ASSIGNMENT_START, validateTaskAssignment } from "../src/lib/taskAssignments.js";
+import { formatTaskResult, isCoordinatorOnlyRequest, parseTaskAssignments, sanitizeTaskText, stripTaskAssignmentBlocks, TASK_ASSIGNMENT_START, validateTaskAssignment } from "../src/lib/taskAssignments.js";
 
 const MAX_EVENTS = 500;
+const COORDINATOR_PASSIVE_ITEM_TYPES = new Set([
+  "userMessage",
+  "hookPrompt",
+  "agentMessage",
+  "plan",
+  "reasoning",
+  "enteredReviewMode",
+  "exitedReviewMode",
+  "contextCompaction",
+]);
 function coordinatorInitialProtocol(record, agents) {
   const targets = (agents || [])
     .filter((agent) => agent?.id && agent.id !== record?.coordinatorAgentId)
@@ -38,14 +48,26 @@ function isTurnSuccessful(turn) {
 }
 
 function safeTaskError(error) {
-  return String(error instanceof Error ? error.message : error || "task_failed")
-    .replace(/[A-Za-z]:[\\/][^\s\]\)\}>,;]+/g, "[本机路径已隐藏]")
-    .replace(/(?:sk|ghp|github_pat|xox[baprs])-[-A-Za-z0-9_]+/gi, "[凭据已隐藏]")
-    .slice(0, 600);
+  return sanitizeTaskText(error instanceof Error ? error.message : error || "task_failed", 600) || "task_failed";
+}
+
+function followupSharedContext(record) {
+  const source = record?.sharedContext;
+  if (!source || typeof source !== "object") return source || null;
+  return {
+    version: source.version,
+    id: source.id,
+    roomId: source.roomId || record.roomId,
+    roomName: source.roomName,
+    mode: "delta",
+    knowledge: [],
+    recentMessages: [],
+    removedKnowledgeIds: [],
+  };
 }
 
 export class TeamRoomRuntimeManager {
-  constructor({ statusProvider = getCodexRuntimeStatus, runtimeFactory = spawnCodexAppServer, approvalTimeoutMs = 120_000 } = {}) {
+  constructor({ statusProvider = getCodexRuntimeStatus, runtimeFactory = spawnCodexAppServer, approvalTimeoutMs = 120_000, interruptReleaseTimeoutMs = 5_000 } = {}) {
     this.statusProvider = statusProvider;
     this.runtimeFactory = runtimeFactory;
     this.connection = null;
@@ -57,14 +79,15 @@ export class TeamRoomRuntimeManager {
     this.turnMessagesById = new Map();
     this.activeTurnByThreadId = new Map();
     this.turnQueuesByThreadId = new Map();
+    this.cancelledTurnReleaseTimers = new Map();
+    this.quarantinedThreadIds = new Set();
     this.threadStartPromises = new Map();
     this.taskRecords = new Map();
-    this.assignmentById = new Map();
-    this.assignmentSourceTargets = new Set();
     this.taskWaiters = new Map();
     this.pendingApprovals = new Map();
     this.approvalTimers = new Map();
     this.approvalTimeoutMs = Math.max(1_000, Number(approvalTimeoutMs) || 120_000);
+    this.interruptReleaseTimeoutMs = Math.max(10, Number(interruptReleaseTimeoutMs) || 5_000);
     this.writeLock = null;
     this.events = [];
     this.sequence = 0;
@@ -85,6 +108,7 @@ export class TeamRoomRuntimeManager {
       agentThreads: Object.fromEntries(this.threadByAgentId),
       pendingApprovals: this.pendingApprovals.size,
       writeLock: this.writeLock,
+      requiresReconnect: this.quarantinedThreadIds.size > 0,
     };
   }
 
@@ -111,6 +135,7 @@ export class TeamRoomRuntimeManager {
         this.threadByAgentId.delete(agentId);
         this.agentByThreadId.delete(threadId);
         this.roomByThreadId.delete(threadId);
+        this.quarantinedThreadIds.delete(threadId);
       }
     }
     this.agentById = nextAgents;
@@ -144,10 +169,13 @@ export class TeamRoomRuntimeManager {
       pendingAssignments: new Set(),
       assignmentResults: new Map(),
       failedAssignments: new Set(),
+      assignmentById: new Map(),
+      assignmentSourceTargets: new Set(),
       finalSummaryStarted: false,
       finalSummaryCompleted: false,
       delegationCount: 0,
       terminalError: null,
+      sharedContext: null,
       createdAt: new Date().toISOString(),
     };
     this.taskRecords.set(id, record);
@@ -183,10 +211,35 @@ export class TeamRoomRuntimeManager {
   }
 
   failTask(record, error) {
-    if (!record) return;
+    if (!record || ["succeeded", "failed"].includes(record.state) || record.cancelling) return;
+    record.cancelling = true;
+    const protocol = this.connection?.protocol;
+    for (const [threadId, queue] of this.turnQueuesByThreadId) {
+      const retained = [];
+      for (const entry of queue) {
+        if (entry.descriptor?.taskRecord?.id !== record.id) {
+          retained.push(entry);
+          continue;
+        }
+        try { entry.reject(new Error("task_cancelled")); } catch {}
+      }
+      if (retained.length) this.turnQueuesByThreadId.set(threadId, retained);
+      else this.turnQueuesByThreadId.delete(threadId);
+    }
+    for (const turnId of record.pendingTurnIds) {
+      const context = this.turnContextById.get(turnId);
+      if (!context || context.taskId !== record.id) continue;
+      context.cancelled = true;
+      context.public = false;
+      context.internal = true;
+      this.interruptAndReleaseCancelledTurn(context.threadId, turnId, protocol);
+    }
     record.pendingAssignments.clear();
-    record.pendingTurnIds.clear();
-    this.finishTask(record, "failed", error);
+    const finished = this.finishTask(record, "failed", error);
+    if (finished) {
+      record.assignmentById.clear();
+      record.assignmentSourceTargets.clear();
+    }
   }
 
   waitForTask(taskId) {
@@ -231,19 +284,86 @@ export class TeamRoomRuntimeManager {
   }
 
   clearThreadActivity(threadId, turnId) {
-    if (this.activeTurnByThreadId.get(threadId) === turnId) this.activeTurnByThreadId.delete(threadId);
+    const activeTurnId = this.activeTurnByThreadId.get(threadId);
+    // A late completion from an interrupted turn must never unlock a newer
+    // turn that is already using the same member thread.
+    if (activeTurnId && activeTurnId !== turnId) return false;
+    if (activeTurnId === turnId) this.activeTurnByThreadId.delete(threadId);
     const queue = this.turnQueuesByThreadId.get(threadId);
     if (queue?.length) {
       const next = queue.shift();
       if (!queue.length) this.turnQueuesByThreadId.delete(threadId);
       this.startQueuedTurn(threadId, next);
     }
+    return true;
+  }
+
+  clearCancelledTurnReleaseTimer(turnId) {
+    const timer = this.cancelledTurnReleaseTimers.get(turnId);
+    if (timer) clearTimeout(timer);
+    this.cancelledTurnReleaseTimers.delete(turnId);
+  }
+
+  releaseCancelledTurn(turnId, { retainContext = true } = {}) {
+    const context = this.turnContextById.get(turnId);
+    if (!context?.cancelled) return false;
+    this.clearCancelledTurnReleaseTimer(turnId);
+    context.completed = true;
+    context.released = true;
+    const record = context.taskId ? this.taskRecords.get(context.taskId) : null;
+    record?.pendingTurnIds.delete(turnId);
+    this.turnMessagesById.delete(turnId);
+    if (!retainContext) this.turnContextById.delete(turnId);
+    this.clearThreadActivity(context.threadId, turnId);
+    return true;
+  }
+
+  interruptAndReleaseCancelledTurn(threadId, turnId, protocol = this.connection?.protocol) {
+    const quarantine = () => {
+      const context = this.turnContextById.get(turnId);
+      this.cancelledTurnReleaseTimers.delete(turnId);
+      if (!context?.cancelled) return;
+      this.quarantinedThreadIds.add(threadId);
+      const queued = this.turnQueuesByThreadId.get(threadId) || [];
+      this.turnQueuesByThreadId.delete(threadId);
+      for (const entry of queued) {
+        const record = entry.descriptor?.taskRecord;
+        if (record && !["succeeded", "failed"].includes(record.state)) this.failTask(record, "thread_reconnect_required");
+        try { entry.reject(new Error("thread_reconnect_required")); } catch {}
+      }
+      this.emitRoomEvent("runtimeReconnectRequired", {
+        threadId,
+        turnId,
+        taskId: context.taskId,
+        roomId: context.roomId,
+        error: "turn_terminal_notification_lost",
+        public: true,
+      });
+    };
+    const timer = setTimeout(quarantine, this.interruptReleaseTimeoutMs);
+    timer.unref?.();
+    this.cancelledTurnReleaseTimers.set(turnId, timer);
+    if (typeof protocol?.interruptAgentTurn !== "function") return;
+    try {
+      // The RPC response only acknowledges the interrupt request.  The thread
+      // remains occupied until turn/completed arrives; the timer is solely a
+      // bounded fallback for a lost terminal notification.
+      Promise.resolve(protocol.interruptAgentTurn(threadId, turnId)).catch(() => {});
+    } catch {
+      // The bounded fallback still releases the tombstoned turn if the App
+      // Server connection disappears before it can report completion.
+    }
   }
 
   startQueuedTurn(threadId, queued) {
     this.startTurnNow(threadId, queued.descriptor)
       .then(queued.resolve)
-      .catch(queued.reject);
+      .catch((error) => {
+        const record = queued.descriptor?.taskRecord;
+        if (record && !["succeeded", "failed"].includes(record.state)) this.failTask(record, `turn_start_failed:${safeTaskError(error)}`);
+        queued.reject(error);
+        this.clearThreadActivity(threadId, null);
+      });
   }
 
   async startTurnNow(threadId, descriptor) {
@@ -254,7 +374,7 @@ export class TeamRoomRuntimeManager {
       const resumedThread = await this.connection.protocol.resumeAgentThread(threadId, agent, this.cwd);
       if (!resumedThread?.id || resumedThread.id !== threadId) throw new Error(`Codex resumed an unexpected thread for member ${agent.id}`);
     }
-    const turnAgent = descriptor.forceReadOnly || (descriptor.executionMode === false && agent.permission === "request-write")
+    const turnAgent = (descriptor.forceReadOnly && agent.permission !== "coordinate") || (descriptor.executionMode === false && agent.permission === "request-write")
       ? { ...agent, permission: "read-only" }
       : agent;
     let turnText = descriptor.text;
@@ -266,10 +386,33 @@ export class TeamRoomRuntimeManager {
       cwd: this.cwd,
       text: turnText,
       clientUserMessageId: descriptor.messageId,
-      sharedContext: selectSharedContextForAgent(descriptor.sharedContext, agent.id),
+      sharedContext: selectSharedContextForAgent(descriptor.sharedContext, agent.id, {
+        // An initial promotion receives the user's request through turnText.
+        // Only a later coordinator delegation needs the recovery copy.
+        includeDeferredCurrentMessage: descriptor.kind === "delegatedTarget",
+      }),
       attachments: descriptor.attachments || [],
     });
     if (!turn?.id) throw new Error(`Codex did not return a turn for member ${agent.id}`);
+    if (descriptor.taskRecord && ["succeeded", "failed"].includes(descriptor.taskRecord.state)) {
+      // The task may fail while turn/start is in flight.  Keep the returned
+      // turn active and tracked as cancelled until its terminal notification;
+      // otherwise startTurnForAgent's error cleanup could launch another task
+      // on the same thread before the interrupt has taken effect.
+      this.activeTurnByThreadId.set(threadId, turn.id);
+      this.registerTurn(descriptor.taskRecord, turn, {
+        agentId: agent.id,
+        threadId,
+        kind: descriptor.kind || "initial",
+        public: false,
+        internal: true,
+        cancelled: true,
+        toolsForbidden: agent.permission === "coordinate",
+        assignment: descriptor.assignment || null,
+      });
+      this.interruptAndReleaseCancelledTurn(threadId, turn.id, this.connection?.protocol);
+      throw new Error("task_cancelled");
+    }
     this.activeTurnByThreadId.set(threadId, turn.id);
     this.registerTurn(descriptor.taskRecord, turn, {
       agentId: agent.id,
@@ -277,6 +420,7 @@ export class TeamRoomRuntimeManager {
       kind: descriptor.kind || "initial",
       public: descriptor.public !== false,
       internal: descriptor.internal === true,
+        toolsForbidden: agent.permission === "coordinate",
         assignment: descriptor.assignment || null,
         resultStatus: descriptor.resultStatus || null,
         resultSummary: descriptor.resultSummary || null,
@@ -304,6 +448,10 @@ export class TeamRoomRuntimeManager {
   async startTurnForAgent(descriptor, { queue = false } = {}) {
     descriptor = { ...descriptor, threadWasAlreadyBound: this.threadByAgentId.has(descriptor.agentId) };
     const threadId = await this.ensureAgentThread(descriptor.agentId);
+    if (this.quarantinedThreadIds.has(threadId)) {
+      if (descriptor.taskRecord && !["succeeded", "failed"].includes(descriptor.taskRecord.state)) this.failTask(descriptor.taskRecord, "thread_reconnect_required");
+      throw new Error("thread_reconnect_required");
+    }
     const active = this.activeTurnByThreadId.get(threadId);
     if (active) {
       if (!queue) throw new Error(`agent_thread_busy:${descriptor.agentId}`);
@@ -340,7 +488,7 @@ export class TeamRoomRuntimeManager {
         agentId: coordinator.id,
         text: `以下是内部委派结果，只用于更新当前项目判断，不要再次创建委派：\n${resultText}`,
         messageId: `result-${assignment.assignmentId}`,
-        sharedContext: null,
+        sharedContext: followupSharedContext(record),
         executionMode: record.executionMode,
         forceReadOnly: record.executionMode === false,
         kind: "resultReturn",
@@ -373,7 +521,7 @@ export class TeamRoomRuntimeManager {
         agentId: record.coordinatorAgentId,
         text: `以下是本轮真实委派的全部结果。只做最终汇总，不得执行命令、读写文件或创建新的 TEAM_ROOM_TASK_ASSIGNMENT_V1：\n${resultText}`,
         messageId: `summary-${record.id}`,
-        sharedContext: null,
+        sharedContext: followupSharedContext(record),
         executionMode: record.executionMode,
         forceReadOnly: true,
         kind: "finalSummary",
@@ -396,8 +544,8 @@ export class TeamRoomRuntimeManager {
       sourceThreadId,
       parentTask: record,
       agents: [...this.agentById.values()],
-      assignmentsById: this.assignmentById,
-      sourceTargets: this.assignmentSourceTargets,
+      assignmentsById: record.assignmentById,
+      sourceTargets: record.assignmentSourceTargets,
     });
     if (!validation.ok) {
       this.emitRoomEvent("taskAssignmentRejected", { taskId: record.id, reason: validation.reason, assignmentId: assignment?.assignmentId || null, public: true });
@@ -410,8 +558,8 @@ export class TeamRoomRuntimeManager {
       this.recordAssignmentFailure(record, assignment, "assignment_thread_mismatch", sourceTurnId);
       return false;
     }
-    this.assignmentById.set(assignment.assignmentId, { ...assignment, sourceTurnId, sourceThreadId, roomId: record.roomId });
-    this.assignmentSourceTargets.add(`${sourceTurnId}:${assignment.targetAgentId}`);
+    record.assignmentById.set(assignment.assignmentId, { ...assignment, sourceTurnId, sourceThreadId, roomId: record.roomId });
+    record.assignmentSourceTargets.add(`${sourceTurnId}:${assignment.targetAgentId}`);
     record.delegationCount += 1;
     record.pendingAssignments.add(assignment.assignmentId);
     const child = {
@@ -433,7 +581,7 @@ export class TeamRoomRuntimeManager {
         agentId: target.id,
         text: `你收到当前项目总控的真实委派。\n目标：${assignment.objective}\n验收标准：\n${criteriaText}\n完成后直接报告结果；不要创建新的委派块。`,
         messageId: `assignment-${assignment.assignmentId}`,
-        sharedContext: null,
+        sharedContext: record.sharedContext,
         executionMode: record.executionMode,
         forceReadOnly: record.executionMode === false,
         kind: "delegatedTarget",
@@ -492,7 +640,9 @@ export class TeamRoomRuntimeManager {
     for (const approval of this.pendingApprovals.values()) {
       this.emitRoomEvent("approvalFailed", { ...approval, error: "runtime_disconnected", roomId, taskId });
     }
-    if (this.connection?.child && !this.connection.child.killed) this.connection.child.kill();
+    const connection = this.connection;
+    if (connection?.child && !connection.child.killed) connection.child.kill();
+    try { connection?.protocol?.dispose?.(); } catch {}
     this.connection = null;
     this.agentByThreadId.clear();
     this.threadByAgentId.clear();
@@ -501,6 +651,9 @@ export class TeamRoomRuntimeManager {
     this.turnMessagesById.clear();
     this.activeTurnByThreadId.clear();
     this.turnQueuesByThreadId.clear();
+    for (const timer of this.cancelledTurnReleaseTimers.values()) clearTimeout(timer);
+    this.cancelledTurnReleaseTimers.clear();
+    this.quarantinedThreadIds.clear();
     this.threadStartPromises.clear();
     this.pendingApprovals.clear();
     for (const timer of this.approvalTimers.values()) clearTimeout(timer);
@@ -555,6 +708,7 @@ export class TeamRoomRuntimeManager {
     }
     this.taskId = optionalId(taskId) || this.taskId;
     const taskRecord = this.ensureTaskRecord({ taskId: this.taskId || messageId, roomId: this.roomId, text, executionMode });
+    if (taskRecord.sharedContext == null && sharedContext != null) taskRecord.sharedContext = sharedContext;
     // Re-apply explicit mentions at the runtime boundary. This protects remote
     // tasks and older clients from a stale participation decision: a named
     // member must be dispatched on its own bound thread even when its normal
@@ -600,7 +754,24 @@ export class TeamRoomRuntimeManager {
 
   async processCompletedTurn(turnId, turn, context, finalText) {
     const record = context?.taskId ? this.taskRecords.get(context.taskId) : null;
-    if (!record || context.completed) return;
+    if (!record) return;
+    if (context.completed) {
+      if (context.cancelled) {
+        this.clearCancelledTurnReleaseTimer(turnId);
+        this.turnMessagesById.delete(turnId);
+        this.turnContextById.delete(turnId);
+      }
+      return;
+    }
+    if (context.cancelled || ["succeeded", "failed"].includes(record.state)) {
+      // A failed task keeps its active marker until the real terminal
+      // notification. A bounded tombstone timer handles a lost notification.
+      context.cancelled = true;
+      context.public = false;
+      context.internal = true;
+      this.releaseCancelledTurn(turnId, { retainContext: false });
+      return;
+    }
     context.completed = true;
     record.pendingTurnIds.delete(turnId);
     this.turnMessagesById.delete(turnId);
@@ -649,6 +820,36 @@ export class TeamRoomRuntimeManager {
     this.maybeFinishTask(record);
   }
 
+  blockCoordinatorAction({ agentId, threadId, turnId, turnContext = null, roomId = null, taskId = null, itemType = "tool", requestId = null } = {}) {
+    const agent = this.agentById.get(agentId);
+    if (agent?.permission !== "coordinate" && turnContext?.toolsForbidden !== true) return false;
+    if (turnContext?.coordinatorActionBlocked) return true;
+    if (turnContext) {
+      turnContext.coordinatorActionBlocked = true;
+      turnContext.cancelled = true;
+      turnContext.public = false;
+      turnContext.internal = true;
+    }
+    this.emitRoomEvent("coordinatorActionBlocked", {
+      requestId,
+      agentId,
+      threadId,
+      turnId,
+      taskId,
+      roomId,
+      operationType: String(itemType || "tool").slice(0, 120),
+      reason: "coordinator_must_delegate",
+      public: true,
+    });
+    const record = taskId ? this.taskRecords.get(taskId) : null;
+    if (record && !["succeeded", "failed"].includes(record.state)) {
+      this.failTask(record, `coordinator_tool_forbidden:${String(itemType || "tool").slice(0, 120)}`);
+    } else if (turnId && threadId) {
+      this.interruptAndReleaseCancelledTurn(threadId, turnId, this.connection?.protocol);
+    }
+    return true;
+  }
+
   handleNotification(event) {
     const params = event.params || {};
     const agentId = this.agentByThreadId.get(params.threadId) || null;
@@ -656,6 +857,14 @@ export class TeamRoomRuntimeManager {
     const turnContext = turnId ? this.turnContextById.get(turnId) : null;
     const roomId = turnContext?.roomId ?? this.roomByThreadId.get(params.threadId) ?? this.roomId;
     const taskId = turnContext?.taskId ?? this.taskId;
+    const itemType = params.item?.type || null;
+    if (["item/started", "item/completed"].includes(event.method) && itemType
+      && (turnContext?.toolsForbidden === true || this.agentById.get(agentId)?.permission === "coordinate")
+      && !COORDINATOR_PASSIVE_ITEM_TYPES.has(itemType)) {
+      this.blockCoordinatorAction({ agentId, threadId: params.threadId, turnId, turnContext, roomId, taskId, itemType });
+      return;
+    }
+    if (turnContext?.coordinatorActionBlocked && event.method === "item/completed" && itemType === "agentMessage") return;
     if (event.method === "item/completed" && params.item?.type === "agentMessage") {
       const messageText = params.item.text || "";
       const messages = this.turnMessagesById.get(turnId) || [];
@@ -718,22 +927,24 @@ export class TeamRoomRuntimeManager {
     };
     const agent = this.agentById.get(agentId);
     const classification = classifyApprovalRequest({ method: approval.method, agentPermission: agent?.permission });
-    if (agent?.permission === "coordinate" && ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"].includes(approval.method)) {
+    // Coordinator threads are data-isolated and tool-free.  Treat every
+    // App Server JSON-RPC request from them as execution-capable by default;
+    // an unknown future request must never become an unresolvable approval.
+    if (agent?.permission === "coordinate") {
       try {
         this.connection?.protocol?.resolveApproval(request.id, "cancel");
       } catch {
         // The runtime may already have closed the request; this event remains authoritative.
       }
-      this.emitRoomEvent("coordinatorActionBlocked", {
+      this.blockCoordinatorAction({
         requestId: request.id,
         agentId,
         threadId: params.threadId,
         turnId,
+        turnContext,
         taskId: approval.taskId,
         roomId: approval.roomId,
-        operationType: classification.operationType,
-        reason: "coordinator_must_delegate",
-        public: true,
+        itemType: classification.operationType || approval.method,
       });
       return { blocked: true, approval, classification };
     }
@@ -790,7 +1001,7 @@ export class TeamRoomRuntimeManager {
     if (decision !== "accept" && this.writeLock?.approvalKey === approval.approvalKey) this.writeLock = null;
     this.emitRoomEvent("approvalResolved", { ...approval, decision, requiresWriteLock: classification.requiresWriteLock });
     const taskRecord = approval.taskId ? this.taskRecords.get(approval.taskId) : null;
-    if (taskRecord && !["succeeded", "failed"].includes(taskRecord.state)) this.taskStatusEvent(taskRecord, "taskStarted");
+    if (decision === "accept" && taskRecord && !["succeeded", "failed"].includes(taskRecord.state)) this.taskStatusEvent(taskRecord, "taskStarted");
     return { approval, writeLock: this.writeLock };
   }
 

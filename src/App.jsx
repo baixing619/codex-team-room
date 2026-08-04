@@ -36,9 +36,9 @@ import { decideParticipation } from "./lib/participation.js";
 import { addRoomMember, createProjectMember, createRoomAgents, createSafeMemberPrompt, removeRoomMember, replaceRoomMember } from "./lib/roomAgents.js";
 import { loadState, resetState, saveState } from "./lib/storage.js";
 import { buildRoomSharedContext, formatAttachmentSize, validateSelectedFiles } from "./lib/taskPayload.js";
-import { acknowledgeContextDelivery, applyContextCursorUpdates, bindContextCursorToThread } from "./lib/contextCursors.js";
+import { acknowledgeContextDelivery, bindContextCursorToThread, discardPendingContextDelivery } from "./lib/contextCursors.js";
 import { applyCloudSnapshot, createCloudSnapshot } from "./lib/cloudState.js";
-import { applyApprovalLifecycleEvent, approvalRoute, classifyApprovalRequest, isApprovalActive, isApprovalTerminal, mergeApprovalCommands, normalizeApprovalCommand, reconcileApprovalState } from "./lib/approvalLifecycle.js";
+import { applyApprovalLifecycleEvent, approvalRoute, classifyApprovalRequest, isApprovalTerminal, mergeApprovalCommands, normalizeApprovalCommand, reconcileApprovalState, visibleApprovalCommands } from "./lib/approvalLifecycle.js";
 
 const VIEW_ITEMS = [
   { id: "knowledge", label: "知识库", icon: BookOpenText },
@@ -560,15 +560,16 @@ function ChatView({
   connectionLabel,
 }) {
   const endRef = useRef(null);
+  const visibleCommands = visibleApprovalCommands(commands);
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, [messages.length, commands.length]);
+  }, [messages.length, visibleCommands.length]);
 
   return (
     <div className="chat-layout">
       <div className="message-scroll">
         {messages.map((message) => <MessageItem key={message.id} message={message} agents={agents} />)}
-        {commands.map((command) => {
+        {visibleCommands.map((command) => {
           const agent = agents.find((item) => item.id === command.agentId) || { id: command.agentId, name: "已移除成员", avatar: "/assets/agents/agent-researcher.png" };
           return (
             <CommandCard
@@ -1109,8 +1110,32 @@ export function App() {
               next = { ...next, agentsByRoom: { ...next.agentsByRoom, [roomId]: (next.agentsByRoom?.[roomId] || []).map((agent) => agent.id === event.agentId ? { ...agent, boundThreadId: event.threadId, threadBinding: event.bindingMode || agent.threadBinding || "auto" } : agent) } };
               next = recordAgentThreadBinding(next, roomId, event.agentId, event.threadId);
             }
+            if (event.type === "turnStarted") {
+              const acknowledged = acknowledgeContextDelivery({
+                cursors: next.contextCursorsByRoom?.[roomId] || {},
+                pending: next.pendingContextCursorsByRoom?.[roomId] || [],
+                taskId: event.taskId || null,
+                messageId: event.messageId || null,
+                agentId: event.agentId,
+                threadId: event.threadId,
+              });
+              next = {
+                ...next,
+                contextCursorsByRoom: { ...next.contextCursorsByRoom, [roomId]: acknowledged.cursors },
+                pendingContextCursorsByRoom: { ...next.pendingContextCursorsByRoom, [roomId]: acknowledged.pending },
+              };
+            }
             if (["taskStarted", "taskWaitingApproval", "taskCompleted", "taskFailed"].includes(event.type)) {
               next = applyTaskStatusEvent(next, { roomId, taskId: event.taskId, status: event.status, error: event.error, type: event.type });
+              if (["taskCompleted", "taskFailed"].includes(event.type)) {
+                next = {
+                  ...next,
+                  pendingContextCursorsByRoom: {
+                    ...next.pendingContextCursorsByRoom,
+                    [roomId]: discardPendingContextDelivery(next.pendingContextCursorsByRoom?.[roomId] || [], { taskId: event.taskId }),
+                  },
+                };
+              }
             }
             if (event.type === "taskAssignmentRejected" || event.type === "taskDelegationFailed") {
               next = applyTaskStatusEvent(next, { roomId, taskId: event.taskId, status: "failed", error: event.reason || event.error || "委派失败", type: event.type });
@@ -1177,6 +1202,15 @@ export function App() {
             }
             if (["taskStarted", "taskWaitingApproval", "taskCompleted", "taskFailed"].includes(event.event_type)) {
               next = applyTaskStatusEvent(next, { roomId, taskId: payload.taskId || event.task_id, status: payload.status, error: payload.error, type: event.event_type });
+              if (["taskCompleted", "taskFailed"].includes(event.event_type)) {
+                next = {
+                  ...next,
+                  pendingContextCursorsByRoom: {
+                    ...next.pendingContextCursorsByRoom,
+                    [roomId]: discardPendingContextDelivery(next.pendingContextCursorsByRoom?.[roomId] || [], { taskId: payload.taskId || event.task_id }),
+                  },
+                };
+              }
             }
             if (event.event_type === "taskAssignmentRejected" || event.event_type === "taskDelegationFailed") {
               next = applyTaskStatusEvent(next, { roomId, taskId: payload.taskId || event.task_id, status: "failed", error: payload.reason || payload.error || "委派失败", type: event.event_type });
@@ -1507,6 +1541,7 @@ export function App() {
       const decisions = decideParticipation(text, agents);
       const dispatchAgents = executionMode ? agents : agents.map((agent) => agent.permission === "request-write" ? { ...agent, permission: "read-only" } : agent);
       const messageId = `user-${Date.now()}`;
+      const userMessage = { id: messageId, kind: "user", time: nowLabel(), text: visibleText, attachments: uploaded.map(({ id, name, type, size }) => ({ id, name, type, size })) };
       const contextId = globalThis.crypto?.randomUUID ? `context-${globalThis.crypto.randomUUID()}` : `context-${Date.now()}`;
       const deliverySequence = (stateRef.current.contextDeliverySequenceByRoom?.[activeRoom.id] || 0) + 1;
       const sharedContext = buildRoomSharedContext({
@@ -1519,6 +1554,7 @@ export function App() {
         activeAgentIds: decisions.filter((item) => item.decision === "speak").map((item) => item.agentId),
         deliverySequence,
         text,
+        currentMessage: userMessage,
       });
       const silentNames = decisions.filter((item) => item.decision === "silent").map((item) => agents.find((agent) => agent.id === item.agentId)?.name).filter(Boolean);
       let dispatchLabel;
@@ -1538,33 +1574,42 @@ export function App() {
         dispatchLabel = taskStatusText("running");
       }
 
-      const userMessage = { id: messageId, kind: "user", time: nowLabel(), text: visibleText, attachments: uploaded.map(({ id, name, type, size }) => ({ id, name, type, size })) };
       const localThreadIdsByAgentId = Object.fromEntries(localTurns.map((turn) => [turn.agentId, turn.threadId]));
-      setState((current) => ({
-        ...current,
-        contextDeliverySequenceByRoom: { ...current.contextDeliverySequenceByRoom, [activeRoom.id]: deliverySequence },
-        contextCursorsByRoom: privateCloud
-          ? current.contextCursorsByRoom
-          : { ...current.contextCursorsByRoom, [activeRoom.id]: applyContextCursorUpdates(current.contextCursorsByRoom?.[activeRoom.id] || {}, sharedContext.cursorUpdates, Object.fromEntries(localTurns.map((turn) => [turn.agentId, turn.threadId]))) },
-        pendingContextCursorsByRoom: privateCloud
-          ? { ...current.pendingContextCursorsByRoom, [activeRoom.id]: [
-            ...(current.pendingContextCursorsByRoom?.[activeRoom.id] || []),
-            { taskId: remoteTask?.task?.id || null, messageId, sequence: deliverySequence, updates: sharedContext.cursorUpdates, createdAt: new Date().toISOString() },
-          ].slice(-100) }
-          : current.pendingContextCursorsByRoom,
-        agentsByRoom: { ...current.agentsByRoom, [activeRoom.id]: (current.agentsByRoom?.[activeRoom.id] || []).map((agent) => ({
-          ...agent,
-          ...(localThreadIdsByAgentId[agent.id] ? { boundThreadId: localThreadIdsByAgentId[agent.id], threadBinding: agent.threadBinding || "auto" } : {}),
-          status: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "thinking" : "silent",
-          statusLabel: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "真实处理中" : "本轮静默",
-        })) },
-        messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [
-          ...(current.messagesByRoom[activeRoom.id] || []),
-          userMessage,
-          ...(silentNames.length ? [{ id: `silent-${Date.now()}`, kind: "system", time: nowLabel(), text: `${silentNames.join("、")}按当前项目发言策略保持静默` }] : []),
-          { id: `task-status-${taskId}`, kind: "system", taskId, taskStatus, time: nowLabel(), text: dispatchLabel },
-        ] },
-      }));
+      setState((current) => {
+        let roomCursors = current.contextCursorsByRoom?.[activeRoom.id] || {};
+        let roomPending = current.pendingContextCursorsByRoom?.[activeRoom.id] || [];
+        if (!["succeeded", "failed"].includes(taskStatus)) {
+          roomPending = [...roomPending, { taskId, messageId, sequence: deliverySequence, updates: sharedContext.cursorUpdates, createdAt: new Date().toISOString() }].slice(-100);
+          // Local dispatch already returns every turn that really started. ACK
+          // only those members now (avoiding a poll race); deferred members
+          // stay pending until a later delegated turnStarted event arrives.
+          if (!privateCloud) {
+            for (const turn of localTurns) {
+              const acknowledged = acknowledgeContextDelivery({ cursors: roomCursors, pending: roomPending, taskId, messageId, agentId: turn.agentId, threadId: turn.threadId });
+              roomCursors = acknowledged.cursors;
+              roomPending = acknowledged.pending;
+            }
+          }
+        }
+        return {
+          ...current,
+          contextDeliverySequenceByRoom: { ...current.contextDeliverySequenceByRoom, [activeRoom.id]: deliverySequence },
+          contextCursorsByRoom: { ...current.contextCursorsByRoom, [activeRoom.id]: roomCursors },
+          pendingContextCursorsByRoom: { ...current.pendingContextCursorsByRoom, [activeRoom.id]: roomPending },
+          agentsByRoom: { ...current.agentsByRoom, [activeRoom.id]: (current.agentsByRoom?.[activeRoom.id] || []).map((agent) => ({
+            ...agent,
+            ...(localThreadIdsByAgentId[agent.id] ? { boundThreadId: localThreadIdsByAgentId[agent.id], threadBinding: agent.threadBinding || "auto" } : {}),
+            status: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "thinking" : "silent",
+            statusLabel: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "真实处理中" : "本轮静默",
+          })) },
+          messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [
+            ...(current.messagesByRoom[activeRoom.id] || []),
+            userMessage,
+            ...(silentNames.length ? [{ id: `silent-${Date.now()}`, kind: "system", time: nowLabel(), text: `${silentNames.join("、")}按当前项目发言策略保持静默` }] : []),
+            { id: `task-status-${taskId}`, kind: "system", taskId, taskStatus, time: nowLabel(), text: dispatchLabel },
+          ] },
+        };
+      });
       setDraft("");
       clearSelectedAttachments();
     } catch (error) {
@@ -1604,6 +1649,11 @@ export function App() {
         requestId: command.runtimeRequestId,
         approvalKey: command.approvalKey,
         decision: "accept",
+        roomId: activeRoom.id,
+        taskId: command.taskId || null,
+        agentId: command.agentId || null,
+        threadId: command.threadId || null,
+        turnId: command.turnId || null,
       });
     } catch (error) {
       setState((current) => applyApprovalLifecycleEvent(current, {
@@ -1633,6 +1683,11 @@ export function App() {
         requestId: command.runtimeRequestId,
         approvalKey: command.approvalKey,
         decision: "decline",
+        roomId: activeRoom.id,
+        taskId: command.taskId || null,
+        agentId: command.agentId || null,
+        threadId: command.threadId || null,
+        turnId: command.turnId || null,
       });
     } catch (error) {
       setState((current) => applyApprovalLifecycleEvent(current, {

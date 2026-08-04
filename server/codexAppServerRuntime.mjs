@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
@@ -70,11 +71,21 @@ function developerInstructionsForAgent(agent) {
   return value || null;
 }
 
+function isCoordinatorAgent(agent) {
+  return agent?.permission === "coordinate";
+}
+
+function createCoordinatorIsolationDirectory() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "codex-team-room-coordinator-"));
+}
+
 export class CodexAppServerProtocol extends EventEmitter {
   constructor(rpc) {
     super();
     this.rpc = rpc;
     this.initialized = false;
+    this.coordinatorIsolationByThreadId = new Map();
+    this.coordinatorIsolationDirectories = new Set();
     rpc.on("approval", (request) => this.emit("approval", request));
     rpc.on("notification", (event) => this.emit("notification", event));
   }
@@ -92,25 +103,45 @@ export class CodexAppServerProtocol extends EventEmitter {
   async startAgentThread(agent, cwd) {
     await this.initialize();
     const developerInstructions = developerInstructionsForAgent(agent);
-    const result = await this.rpc.request("thread/start", {
-      cwd,
-      model: agent.model,
-      approvalPolicy: "untrusted",
-      sandbox: threadSandboxForAgent(agent),
-      ...(developerInstructions ? { developerInstructions } : {}),
-    });
+    const coordinatorIsolation = isCoordinatorAgent(agent) ? createCoordinatorIsolationDirectory() : null;
+    if (coordinatorIsolation) this.coordinatorIsolationDirectories.add(coordinatorIsolation);
+    let result;
+    try {
+      result = await this.rpc.request("thread/start", {
+        cwd: coordinatorIsolation || cwd,
+        model: agent.model,
+        approvalPolicy: "untrusted",
+        sandbox: threadSandboxForAgent(agent),
+        ...(coordinatorIsolation ? { runtimeWorkspaceRoots: [], environments: [], selectedCapabilityRoots: [] } : {}),
+        ...(developerInstructions ? { developerInstructions } : {}),
+      });
+    } catch (error) {
+      if (coordinatorIsolation) {
+        this.coordinatorIsolationDirectories.delete(coordinatorIsolation);
+        try { fs.rmSync(coordinatorIsolation, { recursive: true, force: true }); } catch {}
+      }
+      throw error;
+    }
+    if (coordinatorIsolation && result.thread?.id) this.coordinatorIsolationByThreadId.set(result.thread.id, coordinatorIsolation);
     return result.thread;
   }
 
   async resumeAgentThread(threadId, agent, cwd) {
     await this.initialize();
     const developerInstructions = developerInstructionsForAgent(agent);
+    let coordinatorIsolation = null;
+    if (isCoordinatorAgent(agent)) {
+      coordinatorIsolation = this.coordinatorIsolationByThreadId.get(threadId) || createCoordinatorIsolationDirectory();
+      this.coordinatorIsolationDirectories.add(coordinatorIsolation);
+      this.coordinatorIsolationByThreadId.set(threadId, coordinatorIsolation);
+    }
     const result = await this.rpc.request("thread/resume", {
       threadId,
-      cwd,
+      cwd: coordinatorIsolation || cwd,
       model: agent.model,
       approvalPolicy: "untrusted",
       sandbox: threadSandboxForAgent(agent),
+      ...(coordinatorIsolation ? { runtimeWorkspaceRoots: [] } : {}),
       ...(developerInstructions ? { developerInstructions } : {}),
     });
     return result.thread;
@@ -118,19 +149,39 @@ export class CodexAppServerProtocol extends EventEmitter {
 
   async startAgentTurn({ threadId, agent, cwd, text, clientUserMessageId, sharedContext, attachments }) {
     await this.initialize();
+    let coordinatorIsolation = null;
+    if (isCoordinatorAgent(agent)) {
+      coordinatorIsolation = this.coordinatorIsolationByThreadId.get(threadId) || createCoordinatorIsolationDirectory();
+      this.coordinatorIsolationDirectories.add(coordinatorIsolation);
+      this.coordinatorIsolationByThreadId.set(threadId, coordinatorIsolation);
+    }
     const result = await this.rpc.request("turn/start", {
       threadId,
       clientUserMessageId,
       input: buildTurnInput({ text, sharedContext, attachments }),
-      cwd,
+      cwd: coordinatorIsolation || cwd,
       model: agent.model,
       effort: agent.reasoning,
       approvalPolicy: "untrusted",
       sandboxPolicy: turnSandboxForAgent(agent) === "workspaceWrite"
         ? { type: "workspaceWrite", writableRoots: [cwd], networkAccess: false }
         : { type: "readOnly", networkAccess: false },
+      ...(coordinatorIsolation ? { runtimeWorkspaceRoots: [], environments: [] } : {}),
     });
     return result.turn;
+  }
+
+  async interruptAgentTurn(threadId, turnId) {
+    await this.initialize();
+    return this.rpc.request("turn/interrupt", { threadId, turnId });
+  }
+
+  dispose() {
+    this.coordinatorIsolationByThreadId.clear();
+    for (const directory of this.coordinatorIsolationDirectories) {
+      try { fs.rmSync(directory, { recursive: true, force: true }); } catch {}
+    }
+    this.coordinatorIsolationDirectories.clear();
   }
 
   resolveApproval(requestId, decision) {
