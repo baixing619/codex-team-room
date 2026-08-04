@@ -16,7 +16,7 @@ test("migrates legacy global members into independent per-room copies", () => {
   assert.notEqual(migrated.agentsByRoom["room-a"], migrated.agentsByRoom["room-b"]);
   assert.equal(migrated.agentsByRoom["room-a"][0].runtimeThreadId, undefined);
   assert.equal(migrated.agentsByRoom["room-a"][0].threadBinding, "auto");
-  assert.equal(migrated.writeLocksByRoom["room-a"].commandId, "old-command");
+  assert.equal(migrated.writeLocksByRoom["room-a"], null);
   assert.equal(migrated.writeLocksByRoom["room-b"], null);
 
   migrated.agentsByRoom["room-a"][0].name = "只改 A";

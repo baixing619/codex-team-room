@@ -17,6 +17,33 @@ test("role hints and mentions wake only relevant members", () => {
   assert.equal(result.find((item) => item.agentId === "researcher").decision, "silent");
 });
 
+test("multiple Chinese member mentions override each member's normal silent strategy", () => {
+  const agents = [
+    ...DEFAULT_AGENTS,
+    { id: "pro-owner", name: "PRO项目专员", role: "项目专员", participation: "review", permission: "read-only" },
+  ];
+  const result = decideParticipation("@总控 @开发 @审核 @资料 @PRO项目专员", agents);
+
+  assert.equal(result.length, agents.length);
+  assert.ok(result.every((item) => item.decision === "speak"));
+  assert.ok(result.every((item) => item.reason === "收到直接提及或全体通知"));
+});
+
+test("full-width Chinese at-signs and compact multi-mentions are recognized", () => {
+  const result = decideParticipation("＠开发、＠审核＠资料", DEFAULT_AGENTS);
+
+  assert.equal(result.find((item) => item.agentId === "developer").decision, "speak");
+  assert.equal(result.find((item) => item.agentId === "reviewer").decision, "speak");
+  assert.equal(result.find((item) => item.agentId === "researcher").decision, "speak");
+});
+
+test("whole-team requests wake every member, including the recognition phrase", () => {
+  for (const text of ["都出来认识下", "都出来", "全员发言", "大家出来", "所有人请介绍一下"]) {
+    const result = decideParticipation(text, DEFAULT_AGENTS);
+    assert.ok(result.every((item) => item.decision === "speak"), text);
+  }
+});
+
 test("custom members participate through their configured strategy and role", () => {
   const agents = [
     { id: "always-member", name: "项目跟进", role: "进度协调", participation: "always", permission: "read-only" },

@@ -72,6 +72,88 @@ test("turn overrides keep model, effort, workspace root, and network denial toge
   assert.equal((await pending).id, "turn-1");
 });
 
+test("coordinator threads and turns use an empty isolated cwd with no workspace, environment, capability, or network access", async () => {
+  const harness = createHarness();
+  await finishInitialize(harness);
+  const agent = { id: "coordinator", model: "gpt-5.6-sol", reasoning: "high", permission: "coordinate" };
+  const threadPending = harness.protocol.startAgentThread(agent, "G:\\project-secret");
+  await Promise.resolve();
+  const threadRequest = harness.sent.at(-1);
+  assert.equal(threadRequest.method, "thread/start");
+  assert.notEqual(threadRequest.params.cwd, "G:\\project-secret");
+  assert.equal(path.dirname(threadRequest.params.cwd), os.tmpdir());
+  assert.deepEqual(threadRequest.params.runtimeWorkspaceRoots, []);
+  assert.deepEqual(threadRequest.params.environments, []);
+  assert.deepEqual(threadRequest.params.selectedCapabilityRoots, []);
+  assert.equal(threadRequest.params.sandbox, "read-only");
+  harness.rpc.receive({ id: threadRequest.id, result: { thread: { id: "thread-coordinator" } } });
+  await threadPending;
+
+  const turnPending = harness.protocol.startAgentTurn({
+    threadId: "thread-coordinator",
+    agent,
+    cwd: "G:\\project-secret",
+    text: "只协调",
+    clientUserMessageId: "message-coordinate",
+  });
+  await Promise.resolve();
+  const turnRequest = harness.sent.at(-1);
+  assert.equal(turnRequest.method, "turn/start");
+  assert.equal(turnRequest.params.cwd, threadRequest.params.cwd);
+  assert.deepEqual(turnRequest.params.runtimeWorkspaceRoots, []);
+  assert.deepEqual(turnRequest.params.environments, []);
+  assert.deepEqual(turnRequest.params.sandboxPolicy, { type: "readOnly", networkAccess: false });
+  harness.rpc.receive({ id: turnRequest.id, result: { turn: { id: "turn-coordinator", status: "inProgress" } } });
+  await turnPending;
+
+  const isolationPath = threadRequest.params.cwd;
+  assert.equal(fs.existsSync(isolationPath), true);
+  harness.protocol.dispose();
+  assert.equal(fs.existsSync(isolationPath), false);
+});
+
+test("resumed coordinator threads replace workspace roots and every following turn disables sticky environments", async () => {
+  const harness = createHarness();
+  await finishInitialize(harness);
+  const agent = { id: "coordinator", model: "gpt-5.6-sol", reasoning: "high", permission: "coordinate" };
+  const resumePending = harness.protocol.resumeAgentThread("thread-coordinator-existing", agent, "G:\\project-secret");
+  await Promise.resolve();
+  const resumeRequest = harness.sent.at(-1);
+  assert.equal(resumeRequest.method, "thread/resume");
+  assert.notEqual(resumeRequest.params.cwd, "G:\\project-secret");
+  assert.deepEqual(resumeRequest.params.runtimeWorkspaceRoots, []);
+  // Codex 0.146.0 ThreadResumeParams has no environments or
+  // selectedCapabilityRoots fields; turn/start below is the authoritative
+  // supported override for disabling inherited environments.
+  assert.equal("environments" in resumeRequest.params, false);
+  assert.equal("selectedCapabilityRoots" in resumeRequest.params, false);
+  harness.rpc.receive({ id: resumeRequest.id, result: { thread: { id: "thread-coordinator-existing" } } });
+  await resumePending;
+
+  const turnPending = harness.protocol.startAgentTurn({ threadId: "thread-coordinator-existing", agent, cwd: "G:\\project-secret", text: "继续协调", clientUserMessageId: "message-resume-coordinate" });
+  await Promise.resolve();
+  const turnRequest = harness.sent.at(-1);
+  assert.equal(turnRequest.params.cwd, resumeRequest.params.cwd);
+  assert.deepEqual(turnRequest.params.runtimeWorkspaceRoots, []);
+  assert.deepEqual(turnRequest.params.environments, []);
+  assert.equal(turnRequest.params.sandboxPolicy.networkAccess, false);
+  harness.rpc.receive({ id: turnRequest.id, result: { turn: { id: "turn-coordinate-existing" } } });
+  await turnPending;
+  harness.protocol.dispose();
+});
+
+test("interrupts an active turn through the App Server turn/interrupt RPC", async () => {
+  const harness = createHarness();
+  await finishInitialize(harness);
+  const pending = harness.protocol.interruptAgentTurn("thread-developer", "turn-42");
+  await Promise.resolve();
+  const request = harness.sent.at(-1);
+  assert.equal(request.method, "turn/interrupt");
+  assert.deepEqual(request.params, { threadId: "thread-developer", turnId: "turn-42" });
+  harness.rpc.receive({ id: request.id, result: { turn: { id: "turn-42", status: "interrupted" } } });
+  assert.deepEqual(await pending, { turn: { id: "turn-42", status: "interrupted" } });
+});
+
 test("a real turn carries traceable shared context and protocol-native attachments", async () => {
   const harness = createHarness();
   await finishInitialize(harness);

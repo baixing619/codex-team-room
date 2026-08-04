@@ -26,6 +26,46 @@ function participationFor(agent) {
   return agent.id === "coordinator" ? "always" : "relevant";
 }
 
+function normalizeMessage(value) {
+  return String(value ?? "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[\u200B\u200C\u200D\uFEFF]/gu, "")
+    .trim();
+}
+
+function mentionVariants(value) {
+  const normalized = normalizeMessage(value).replace(/^@+/u, "");
+  if (!normalized) return [];
+  return Array.from(new Set([normalized, normalized.replace(/\s+/gu, "")])).filter(Boolean);
+}
+
+function hasMention(normalizedText, value) {
+  return mentionVariants(value).some((variant) => {
+    const marker = `@${variant}`;
+    let offset = normalizedText.indexOf(marker);
+    while (offset >= 0) {
+      const after = normalizedText[offset + marker.length];
+      // Require a token boundary after the alias so @开发不会误命中 @开发者；
+      // punctuation also lets compact Chinese mentions such as @开发、@审核 work.
+      if (after == null || /[\s\p{P}\p{S}]/u.test(after)) return true;
+      offset = normalizedText.indexOf(marker, offset + 1);
+    }
+    return false;
+  });
+}
+
+export function isBroadcastRequest(text) {
+  const normalized = normalizeMessage(text);
+  return ["都出来", "全员", "全体", "大家", "所有人"].some((hint) => normalized.includes(hint));
+}
+
+export function isAgentMentioned(text, agent) {
+  const normalized = normalizeMessage(text);
+  if (!normalized || !agent) return false;
+  return hasMention(normalized, agent.name) || hasMention(normalized, agent.id);
+}
+
 function matchingHints(agent) {
   const participation = participationFor(agent);
   return [
@@ -36,20 +76,18 @@ function matchingHints(agent) {
 }
 
 export function decideParticipation(text, agents) {
-  const normalized = String(text || "").trim().toLowerCase();
-  const broadcast = normalized.includes("@全体") || normalized.includes("大家") || normalized.includes("所有人");
+  const normalized = normalizeMessage(text);
+  const broadcast = isBroadcastRequest(normalized);
 
   return (agents || []).map((agent) => {
-    const agentName = String(agent.name || "").trim().toLowerCase();
-    const agentId = String(agent.id || "").trim().toLowerCase();
-    const directlyMentioned = (agentName && normalized.includes(`@${agentName}`)) || (agentId && normalized.includes(`@${agentId}`));
+    const directlyMentioned = isAgentMentioned(normalized, agent);
     const participation = participationFor(agent);
     const relevant = matchingHints(agent).some((hint) => hint && normalized.includes(hint));
     const shouldSpeak = participation === "always" || broadcast || directlyMentioned || relevant;
-    const reason = participation === "always"
-      ? "此成员配置为每条消息都参与"
-      : broadcast || directlyMentioned
-        ? "收到直接提及或全体通知"
+    const reason = broadcast || directlyMentioned
+      ? "收到直接提及或全体通知"
+      : participation === "always"
+        ? "此成员配置为每条消息都参与"
         : relevant
           ? "职责、配置策略或成员角色与当前消息相关"
           : "与当前项目成员的职责和参与策略无直接关系";
