@@ -51,6 +51,28 @@ function safeTaskError(error) {
   return sanitizeTaskText(error instanceof Error ? error.message : error || "task_failed", 600) || "task_failed";
 }
 
+function textFingerprint(value) {
+  const text = String(value || "");
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${text.length}-${(hash >>> 0).toString(36)}`;
+}
+
+function agentMessageEventId({ taskId, agentId, kind, assignmentId, text }) {
+  if (!taskId || !agentId) return null;
+  return [
+    String(taskId).slice(0, 80),
+    "agentMessage",
+    String(agentId).slice(0, 40),
+    String(kind || "turn").slice(0, 24),
+    String(assignmentId || "none").slice(0, 48),
+    textFingerprint(text),
+  ].join(":");
+}
+
 function followupSharedContext(record) {
   const source = record?.sharedContext;
   if (!source || typeof source !== "object") return source || null;
@@ -89,6 +111,8 @@ export class TeamRoomRuntimeManager {
     this.approvalTimeoutMs = Math.max(1_000, Number(approvalTimeoutMs) || 120_000);
     this.interruptReleaseTimeoutMs = Math.max(10, Number(interruptReleaseTimeoutMs) || 5_000);
     this.writeLock = null;
+    this.agentMessageEventIds = new Set();
+    this.agentMessageEventIdOrder = [];
     this.events = [];
     this.sequence = 0;
     this.cwd = null;
@@ -874,7 +898,23 @@ export class TeamRoomRuntimeManager {
         ? stripTaskAssignmentBlocks(messageText)
         : messageText;
       if (!publicText && turnContext?.public !== false) return;
+      const eventId = agentMessageEventId({
+        taskId,
+        agentId,
+        kind: turnContext?.kind,
+        assignmentId: turnContext?.assignment?.assignmentId,
+        text: publicText,
+      });
+      if (eventId && this.agentMessageEventIds.has(eventId)) return;
+      if (eventId) {
+        this.agentMessageEventIds.add(eventId);
+        this.agentMessageEventIdOrder.push(eventId);
+        if (this.agentMessageEventIdOrder.length > MAX_EVENTS * 2) {
+          this.agentMessageEventIds.delete(this.agentMessageEventIdOrder.shift());
+        }
+      }
       this.emitRoomEvent("agentMessage", {
+        ...(eventId ? { eventId } : {}),
         agentId,
         threadId: params.threadId,
         turnId,

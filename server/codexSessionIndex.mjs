@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isInternalTeamRoomThreadTitle } from "../src/lib/internalThreads.js";
 
 const MAX_ROLLOUTS = 2500;
 const META_CHUNK_BYTES = 16 * 1024;
@@ -181,7 +182,7 @@ function fallbackTitleForRollout(filePath) {
         const event = JSON.parse(line);
         const payload = event.type === "response_item" ? event.payload : null;
         if (payload?.type !== "message" || payload.role !== "user") return true;
-        const text = extractVisibleText(payload.content, payload.role);
+        const text = extractVisibleText(payload.content, payload.role, { includeTeamRoomContext: true });
         title = titleFromText(text);
       } catch {
         // Ignore malformed or actively-written lines.
@@ -313,9 +314,14 @@ function parseMeta(filePath, names) {
     const source = item.payload.source || null;
     if (isGuardianSource(source)) return null;
     const cwd = recentTurnContextCwd(filePath) || item.payload.cwd || "";
+    const indexedTitle = known?.title || threadSpawnTitle(source);
+    if (isInternalTeamRoomThreadTitle(indexedTitle)) return null;
+    const fallbackTitle = indexedTitle ? null : fallbackTitleForRollout(filePath);
+    if (isInternalTeamRoomThreadTitle(fallbackTitle)) return null;
+    const title = indexedTitle || fallbackTitle || "历史对话";
     return {
       id: item.payload.id,
-      title: known?.title || threadSpawnTitle(source) || fallbackTitleForRollout(filePath) || "历史对话",
+      title,
       updatedAt: known?.updatedAt || item.payload.timestamp || null,
       timestamp: item.payload.timestamp || null,
       cwd,
@@ -392,20 +398,20 @@ export function listThreads(projectPath) {
     });
 }
 
-function extractVisibleText(content, role) {
+function extractVisibleText(content, role, options = {}) {
   if (!Array.isArray(content)) return "";
   return content
     .map((part) => ({
       part,
       text: part?.text || part?.input_text || part?.output_text || "",
     }))
-    .filter(({ part, text }) => text && (role !== "user" || isVisibleUserContent(part, text)))
+    .filter(({ part, text }) => text && (role !== "user" || isVisibleUserContent(part, text, options)))
     .map(({ text }) => text)
     .join("\n")
     .trim();
 }
 
-function isVisibleUserContent(part, text) {
+function isVisibleUserContent(part, text, { includeTeamRoomContext = false } = {}) {
   if (!text) return false;
   const contentType = typeof part?.type === "string" ? part.type.toLowerCase() : "";
   if (contentType.includes("annotation") || contentType.includes("context")) return false;
@@ -432,6 +438,7 @@ function isVisibleUserContent(part, text) {
     "# personality",
     "# working with the user",
     "# rules for getting work done",
+    ...(!includeTeamRoomContext ? ["[team_room_shared_context_v1]"] : []),
   ];
   const normalized = trimmed.toLowerCase();
   return !internalPrefixes.some((prefix) => normalized.startsWith(prefix.toLowerCase()));

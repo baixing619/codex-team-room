@@ -33,7 +33,7 @@ import {
 } from "@phosphor-icons/react";
 import { DEFAULT_THREADS, MODEL_OPTIONS } from "./data/defaults.js";
 import { decideParticipation } from "./lib/participation.js";
-import { addRoomMember, createProjectMember, createRoomAgents, createSafeMemberPrompt, removeRoomMember, replaceRoomMember } from "./lib/roomAgents.js";
+import { addRoomMember, createProjectMember, createRoomAgents, createSafeMemberPrompt, removeRoomMember, replaceRoomMember, sanitizeRoomMessages } from "./lib/roomAgents.js";
 import { loadState, resetState, saveState } from "./lib/storage.js";
 import { buildRoomSharedContext, formatAttachmentSize, validateSelectedFiles } from "./lib/taskPayload.js";
 import { acknowledgeContextDelivery, bindContextCursorToThread, discardPendingContextDelivery } from "./lib/contextCursors.js";
@@ -1142,10 +1142,12 @@ export function App() {
             }
             if (event.type === "coordinatorActionBlocked") next = applyCoordinatorActionBlocked(next, { roomId, taskId: event.taskId, sequence: event.sequence });
             if (event.type === "agentMessage" && event.public !== false && event.text) {
-              const messageId = `runtime-message-${event.sequence}`;
+              const stableEventId = event.eventId ? String(event.eventId).slice(0, 180) : null;
+              const messageId = stableEventId ? `agent-message-${stableEventId}` : `runtime-message-${event.sequence}`;
               const existingMessages = next.messagesByRoom[roomId] || [];
               if (!existingMessages.some((message) => message.id === messageId)) {
-                next = { ...next, messagesByRoom: { ...next.messagesByRoom, [roomId]: [...existingMessages, { id: messageId, kind: "agent", agentId: event.agentId, threadId: event.threadId || null, time: nowLabel(), text: event.text }] } };
+                const candidate = { id: messageId, kind: "agent", agentId: event.agentId, threadId: event.threadId || null, taskId: event.taskId || null, turnId: event.turnId || null, eventId: stableEventId, time: nowLabel(), text: event.text };
+                next = { ...next, messagesByRoom: { ...next.messagesByRoom, [roomId]: sanitizeRoomMessages([...existingMessages, candidate]) } };
               }
             }
             if (event.type === "approvalRequested") {
@@ -1217,10 +1219,12 @@ export function App() {
             }
             if (event.event_type === "coordinatorActionBlocked") next = applyCoordinatorActionBlocked(next, { roomId, taskId: payload.taskId || event.task_id, sequence: event.sequence });
             if (event.event_type === "agentMessage" && payload.public !== false && payload.text) {
-              const messageId = `remote-message-${event.sequence}`;
+              const stableEventId = String(event.event_id || event.eventId || payload.eventId || "").slice(0, 180) || null;
+              const messageId = stableEventId ? `agent-message-${stableEventId}` : `remote-message-${event.sequence}`;
               const existingMessages = next.messagesByRoom[roomId] || [];
               if (!existingMessages.some((message) => message.id === messageId)) {
-                next = { ...next, messagesByRoom: { ...next.messagesByRoom, [roomId]: [...existingMessages, { id: messageId, kind: "agent", agentId: payload.agentId, threadId: payload.threadId || null, time: nowLabel(), text: payload.text }] } };
+                const candidate = { id: messageId, kind: "agent", agentId: payload.agentId, threadId: payload.threadId || null, taskId: payload.taskId || event.task_id || null, turnId: payload.turnId || null, eventId: stableEventId, time: nowLabel(), text: payload.text };
+                next = { ...next, messagesByRoom: { ...next.messagesByRoom, [roomId]: sanitizeRoomMessages([...existingMessages, candidate]) } };
               }
             }
             if (event.event_type === "approvalRequested") {

@@ -378,6 +378,12 @@ test("async runtime messages keep the room and task that started their turn", as
   assert.equal(event.type, "agentMessage");
   assert.equal(event.roomId, "room-a");
   assert.equal(event.taskId, "task-a");
+  assert.match(event.eventId, /^task-a:agentMessage:developer:/);
+  protocol.emit("notification", {
+    method: "item/completed",
+    params: { threadId: "thread-developer", turnId: "turn-developer", item: { type: "agentMessage", text: "已完成" } },
+  });
+  assert.equal(manager.listEvents().filter((item) => item.type === "agentMessage" && item.taskId === "task-a").length, 1);
   assert.equal(protocol.resumedThreads.length, 0);
   protocol.emit("notification", { method: "turn/completed", params: { threadId: "thread-developer", turnId: "turn-developer", turn: { status: "completed" } } });
   await manager.dispatch({

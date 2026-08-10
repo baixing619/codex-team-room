@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { addRoomMember, createProjectMember, createSafeMemberPrompt, isCorruptedThreadTitle, migrateTeamRoomState, removeRoomMember, sanitizeHistoryCache, STATE_SCHEMA_VERSION } from "../src/lib/roomAgents.js";
+import { addRoomMember, createProjectMember, createSafeMemberPrompt, isCorruptedThreadTitle, migrateTeamRoomState, removeRoomMember, sanitizeHistoryCache, sanitizeRoomMessages, STATE_SCHEMA_VERSION } from "../src/lib/roomAgents.js";
 
 test("migrates legacy global members into independent per-room copies", () => {
   const migrated = migrateTeamRoomState({
@@ -54,6 +54,7 @@ test("migration removes only cached thread titles corrupted into question marks"
       "room-a": [
         { id: "global", title: "团队调度台", kind: "room" },
         { id: "broken", title: "??????", kind: "codex" },
+        { id: "internal", title: "[TEAM_ROOM_SHARED_CONTEXT_V1] 上下文标识：internal", kind: "codex" },
         { id: "valid", title: "是不是这样？", kind: "codex" },
       ],
     },
@@ -63,6 +64,17 @@ test("migration removes only cached thread titles corrupted into question marks"
   assert.equal(isCorruptedThreadTitle("?? ??"), true);
   assert.equal(isCorruptedThreadTitle("问题？"), false);
   assert.equal(isCorruptedThreadTitle("?"), false);
+});
+
+test("migration collapses the local and remote copies of one agent event", () => {
+  const messages = sanitizeRoomMessages([
+    { id: "runtime-message-31", kind: "agent", agentId: "coordinator", threadId: "thread-1", time: "03:49", text: "同一条真实成员回复" },
+    { id: "remote-message-31", kind: "agent", agentId: "coordinator", threadId: "thread-1", time: "00:39", text: "同一条真实成员回复" },
+  ]);
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].id, "remote-message-31");
+  assert.equal(messages[0].time, "03:49");
 });
 
 test("history cache survives refresh migration while bounding stored transcript text", () => {

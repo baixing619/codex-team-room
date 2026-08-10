@@ -4,6 +4,12 @@ import path from "node:path";
 import test from "node:test";
 
 const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+const indexHtml = fs.readFileSync(path.join(process.cwd(), "index.html"), "utf8");
+
+test("uses the product name in the browser tab", () => {
+  assert.match(indexHtml, /<title>Codex Team Room<\/title>/);
+  assert.doesNotMatch(indexHtml, /<title>Prototype<\/title>/);
+});
 
 function rule(selector) {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

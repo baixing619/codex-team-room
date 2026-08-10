@@ -94,7 +94,7 @@ export const DEFAULT_KNOWLEDGE = [];
 
 export function createInitialState() {
   return {
-    schemaVersion: 7,
+    schemaVersion: 8,
     rooms: [DEFAULT_ROOM],
     activeRoomId: DEFAULT_ROOM.id,
     agentsByRoom: { [DEFAULT_ROOM.id]: DEFAULT_AGENTS.map((agent) => ({ ...agent })) },
