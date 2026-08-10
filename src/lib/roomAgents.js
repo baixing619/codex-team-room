@@ -1,8 +1,9 @@
 import { DEFAULT_AGENTS, DEFAULT_ROOM } from "../data/defaults.js";
 import { sanitizeContextCursorsByRoom, sanitizeContextDeliverySequences, sanitizePendingContextCursorsByRoom } from "./contextCursors.js";
 import { mergeApprovalCommands, reconcileApprovalState } from "./approvalLifecycle.js";
+import { isInternalTeamRoomThreadTitle } from "./internalThreads.js";
 
-export const STATE_SCHEMA_VERSION = 7;
+export const STATE_SCHEMA_VERSION = 8;
 
 const LEGACY_DEMO_MESSAGE_IDS = new Set(["m1", "m2", "m3", "m4", "m5", "m6", "day"]);
 const LEGACY_DEMO_KNOWLEDGE_IDS = new Set(["knowledge-1", "knowledge-2", "knowledge-3"]);
@@ -17,9 +18,53 @@ export function sanitizeThreadCache(value) {
   return Object.fromEntries(Object.entries(value).map(([roomId, threads]) => [
     roomId,
     Array.isArray(threads)
-      ? threads.filter((thread) => thread?.kind !== "demo" && !isCorruptedThreadTitle(thread?.title))
+      ? threads.filter((thread) => thread?.kind !== "demo" && !isCorruptedThreadTitle(thread?.title) && !isInternalTeamRoomThreadTitle(thread?.title))
       : [],
   ]));
+}
+
+function legacyTransportMessage(value) {
+  const match = String(value || "").match(/^(runtime|remote)-message-(\d+)$/);
+  return match ? { source: match[1], sequence: match[2] } : null;
+}
+
+export function sanitizeRoomMessages(value) {
+  const result = [];
+  const ids = new Set();
+  const legacyByFingerprint = new Map();
+
+  for (const message of Array.isArray(value) ? value : []) {
+    if (!message || typeof message !== "object") continue;
+    const id = String(message.id || "").slice(0, 200);
+    if (id && ids.has(id)) continue;
+
+    const transport = message.kind === "agent" ? legacyTransportMessage(id) : null;
+    if (transport) {
+      const fingerprint = [
+        transport.sequence,
+        String(message.agentId || ""),
+        String(message.threadId || ""),
+        String(message.text || ""),
+      ].join("\u0000");
+      const previous = legacyByFingerprint.get(fingerprint);
+      if (previous && previous.source !== transport.source) {
+        if (transport.source === "remote") {
+          const kept = result[previous.index];
+          ids.delete(String(kept?.id || ""));
+          result[previous.index] = { ...message, time: kept?.time || message.time };
+          if (id) ids.add(id);
+          legacyByFingerprint.set(fingerprint, { source: transport.source, index: previous.index });
+        }
+        continue;
+      }
+      legacyByFingerprint.set(fingerprint, { source: transport.source, index: result.length });
+    }
+
+    result.push(message);
+    if (id) ids.add(id);
+  }
+
+  return result;
 }
 
 export function sanitizeHistoryCache(value) {
@@ -148,7 +193,7 @@ export function migrateTeamRoomState(value) {
     contextCursorsByRoom: sanitizeContextCursorsByRoom(input.contextCursorsByRoom),
     contextDeliverySequenceByRoom: sanitizeContextDeliverySequences(input.contextDeliverySequenceByRoom),
     pendingContextCursorsByRoom: sanitizePendingContextCursorsByRoom(input.pendingContextCursorsByRoom),
-    messagesByRoom: Object.fromEntries(Object.entries(input.messagesByRoom || {}).map(([roomId, messages]) => [roomId, (Array.isArray(messages) ? messages : []).filter((message) => !LEGACY_DEMO_MESSAGE_IDS.has(message?.id))])),
+    messagesByRoom: Object.fromEntries(Object.entries(input.messagesByRoom || {}).map(([roomId, messages]) => [roomId, sanitizeRoomMessages((Array.isArray(messages) ? messages : []).filter((message) => !LEGACY_DEMO_MESSAGE_IDS.has(message?.id)))])),
     commandsByRoom: Object.fromEntries(rooms.map((room) => [room.id, mergeApprovalCommands(
       (Array.isArray(input.commandsByRoom?.[room.id]) ? input.commandsByRoom[room.id] : []).filter((command) => command?.id !== "command-1"),
       [],

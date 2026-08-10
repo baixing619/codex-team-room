@@ -37,7 +37,7 @@ export function createCloudSnapshot(state) {
       .map((command) => ({ ...command, command: text(command.command, 4_000), summary: text(command.summary, 2_000) })),
   ]));
   return {
-    schemaVersion: Number(state?.schemaVersion) || 7,
+    schemaVersion: Number(state?.schemaVersion) || 8,
     rooms,
     agentsByRoom: Object.fromEntries(rooms.map((room) => [room.id, (state.agentsByRoom?.[room.id] || []).slice(0, 24).map((agent) => ({
       ...agent,

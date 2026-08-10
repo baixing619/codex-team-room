@@ -164,6 +164,29 @@ test("hides guardian sessions and gives unindexed spawned agents an identifiable
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+test("hides Team Room managed member sessions from normal project history", async () => {
+  const previousHome = process.env.CODEX_HOME;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-team-room-internal-thread-test-"));
+  const sessions = path.join(home, "sessions", "2026", "08", "01");
+  const projectPath = "G:\\internal-team-room-project";
+  fs.mkdirSync(sessions, { recursive: true });
+  const rollout = [
+    { type: "session_meta", payload: { id: "internal-thread", cwd: projectPath, timestamp: "2026-08-01T09:00:00Z" } },
+    { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "[TEAM_ROOM_SHARED_CONTEXT_V1]\n内部共享上下文\n[/TEAM_ROOM_SHARED_CONTEXT_V1]\n\n用户当前请求：检查项目" }] } },
+  ];
+  fs.writeFileSync(path.join(sessions, "rollout-internal.jsonl"), `${rollout.map((item) => JSON.stringify(item)).join("\n")}\n`);
+
+  process.env.CODEX_HOME = home;
+  const indexModule = await import(`../server/codexSessionIndex.mjs?internal-thread-test=${Date.now()}`);
+
+  assert.equal(indexModule.listThreads(projectPath).length, 0);
+  assert.equal(indexModule.listProjects().length, 0);
+
+  if (previousHome === undefined) delete process.env.CODEX_HOME;
+  else process.env.CODEX_HOME = previousHome;
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 test("includes visible spawned-agent ancestors in the child project without including guardians", async () => {
   const previousHome = process.env.CODEX_HOME;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-team-room-ancestor-project-test-"));
