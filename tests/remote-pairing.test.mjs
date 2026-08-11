@@ -241,6 +241,51 @@ test("outbound bridge dispatches queued work and applies one-time approvals", as
   assert.equal(bridge.lastError, null);
 });
 
+test("paired bridge never claims a second room while one real task is still active", async () => {
+  let resolveFirstTask;
+  let taskClaims = 0;
+  let approvalPolls = 0;
+  const firstTask = { id: "task-room-one", room_id: "room-one", cwd: "G:\\project", text: "任务一", message_id: "message-one", agents: [{ id: "coordinator" }] };
+  const secondTask = { id: "task-room-two", room_id: "room-two", cwd: "G:\\project", text: "任务二", message_id: "message-two", agents: [{ id: "coordinator" }] };
+  const runtime = {
+    async connect() {},
+    async dispatch() {},
+    waitForTask(taskId) {
+      if (taskId === firstTask.id) return new Promise((resolve) => { resolveFirstTask = resolve; });
+      return Promise.resolve({ status: "succeeded", error: null });
+    },
+    listEvents() { return []; },
+  };
+  const bridge = new RemotePairingBridge({
+    runtime,
+    indexProvider: { listProjects: () => [{ path: "G:\\project", exists: true }] },
+    fetchImpl: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/api/device/tasks") {
+        taskClaims += 1;
+        return Response.json({ task: taskClaims === 1 ? firstTask : secondTask });
+      }
+      if (pathname === "/api/device/approvals") { approvalPolls += 1; return Response.json({ approval: null }); }
+      if (pathname === "/api/device/index-requests") return Response.json({ error: "not_found" }, { status: 404 });
+      return Response.json({ ok: true });
+    },
+  });
+  bridge.config = { siteUrl: "https://private.example", deviceSecret: "device-secret-that-is-long-enough", siwcBypassToken: "bypass-token-that-is-long-enough", cwd: "G:\\project", deviceId: "device-1", deviceLabel: "工作电脑" };
+  bridge.lastHeartbeatAt = Date.now();
+
+  await bridge.tick();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bridge.status().activeTaskId, firstTask.id);
+  await bridge.tick();
+  assert.equal(taskClaims, 1);
+  assert.equal(approvalPolls, 2);
+
+  resolveFirstTask({ status: "succeeded", error: null });
+  await bridge.activeTasks.get(firstTask.id);
+  await bridge.tick();
+  assert.equal(taskClaims, 2);
+});
+
 test("paired bridge reads project metadata only when the private site requests it", async () => {
   let uploadedResult = null;
   let indexClaims = 0;

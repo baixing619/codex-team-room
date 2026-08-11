@@ -1,54 +1,58 @@
 # 把这个文件拖进 Codex
 
-这个文件用于让 Codex 帮你初始化自己的 Codex Team Room。你不需要先会配置命令行。
+这是 Codex Team Room 的个人安装入口。下载或解压项目后，把本文件拖进 Codex；你只需要提供一次项目目录，并确认必要的安装和私人站点授权。
 
-## 你要做什么
+## 安装后你会得到
 
-1. 下载或克隆 Codex Team Room 项目。
-2. 把本文件拖进 Codex 对话框。
-3. Codex 会问你“项目目录在哪里”。把下载后的项目文件夹地址发给它。
-4. Codex 检查目录正确后，会一次性说明将要进行的安装、验证和私有站点创建操作，并等待你确认。
-5. 完成后，Codex 会给你两个已经配对的入口：
-   - 电脑本地入口：连接你自己的 Codex CLI，可启用真实成员。
-   - 私有 Sites 入口：登录后可从手机访问，仅限站点所有者，默认不公开。
+- 电脑入口：`http://127.0.0.1:4174/`，只监听本机。
+- 手机入口：只允许你本人登录的私人 Sites，电脑关机时任务留在私人队列。
+- Windows 登录后自动恢复本机服务；不用每次重新安装。
 
-> 安全说明：私有 Sites 页面不会暴露你电脑上的端口、项目文件、历史对话或 Codex 登录凭据。电脑只会主动连接私人队列。手机发出的消息、成员配置、成员回复和待审批命令会保存在站点的私人数据库中。
+> 本机安装可以真正一键完成。创建个人私人站点和设备配对涉及账号权限与一枚本机专用令牌，因此仍会显示一次明确的安全确认；安装器不会读取密码、Cookie 或 Codex 认证文件。
 
 ---
 
 <codex_setup_instructions>
 
-你正在帮助用户安装 Codex Team Room。请按以下顺序执行，不要跳过目录确认、隐私检查或用户授权。
+你正在为用户安装 Codex Team Room。必须执行确定的安装器，不要临时拼凑 npm、复制依赖目录或读取认证文件。
 
-1. 如果用户尚未给出项目目录，只问一句：“Codex Team Room 下载到了哪个文件夹？请把完整目录地址发给我。”
-2. 收到目录后，先只读确认它包含 `package.json`、`.openai/hosting.json`、`src/`、`server/`，并确认 `package.json.name` 为 `codex-team-room`。不符合时停止并请用户重新选择，绝不在猜测目录中安装。
-3. 说明将进行以下操作，并请求一次明确确认：
-   - 在确认的项目目录安装项目依赖；
-   - 检查并按 OpenAI 官方方式安装或升级 `@openai/codex` CLI；
-   - 检查 Codex 登录状态，但不读取或输出认证文件；
-   - 运行测试、生产构建和发布安全检查；
-   - 启动仅监听 `127.0.0.1` 的本地 Team Room；
-   - 使用 Sites 创建仅站点所有者可访问的个人私有站点和 D1 私人队列；
-   - 为这台电脑生成独立的设备密钥与站点专用 SIWC 绕过令牌，并保存在 Git 忽略的 `.team-room/`；
-   - 启动本机主动外连代理，使手机可以发送消息、接收回复和处理一次性审批。
-4. 用户确认后，在项目目录执行 `npm install`、`npm test`、`npm run build`、`npm run release:check`。任何一步失败都先修复并重跑，不要把失败状态说成完成。
-5. 检查 `codex --version` 和 `codex login status`。如果没有官方 CLI，使用 `npm install -g @openai/codex`；如果需要登录，让用户在可见登录界面完成，不索要令牌或密码。
-6. 初次验证本地服务时只绑定 `127.0.0.1`。打开本地页面，确认 `/api/health` 正常且 `/api/runtime/status` 能识别独立 Codex CLI。
-7. 使用 Sites 插件发布个人站点：
-   - 先读取 `.openai/hosting.json`。
-   - 如果没有 `project_id`，创建一个新站点并立即写回该文件。
-   - 如果已有 `project_id`，先确认当前用户对该站点有权限；若该 ID 来自原作者且当前用户无权访问，说明原因，获得确认后移除旧 ID，再为当前用户创建新的个人站点。
-   - 构建成功后保存版本，优先使用私有部署；不得改成公开访问。
-   - 私有部署完成后核对访问策略只有当前所有者，没有用户组或外部访客。
-8. 创建安全设备配对：
-   - 从 Sites 当前访问策略确认只有唯一所有者、没有用户组和外部访客；若不是仅本人可访问，停止配对。
-   - 本文件代表用户请求启用跨设备配对；在生成 SIWC 绕过令牌前，仍需明确告诉用户“将创建一枚只供这台电脑访问私人站点的令牌”，并得到肯定答复。
-   - 用户肯定后，调用 Sites 的 SIWC 绕过令牌能力。令牌只存本机，不打印、不提交、不写入 Sites 环境变量。
-   - 将 `siteUrl`、令牌、确认的项目目录和设备名称以 JSON 从标准输入传给 `npm run pair:configure`。脚本会生成 `.team-room/pairing.json` 和临时的 `.team-room/sites-environment.json`，且不会打印密钥。
-   - 读取临时环境文件，把 `TEAM_ROOM_DEVICE_SECRET` 作为 secret 写入 Sites 生产环境；写入成功后删除这个临时文件。不得删除 `pairing.json`。浏览器访问由 Sites 的“仅唯一所有者”策略授权，Worker 不另行复制或猜测账号 ID。
-   - 重新构建、保存并私有部署站点；重启本地 Team Room，让本机代理开始主动轮询。
-9. 验收配对：确认本地 `/api/pair/local-status` 返回 `configured: true`、`running: true` 且无错误；确认站点设备心跳成功；让用户在已登录的手机站点看到“本机在线”。再用一条不执行命令的测试消息验证：私人队列收到任务、本机真实 Codex 回复、回复回到手机。不要为验收自动批准任何命令。
-10. 最终交付电脑本地地址和个人私有 Sites 地址，并说明：本地地址直接连接本机 Codex；私有 Sites 通过加密出站配对通道连接本机。电脑关机时，手机任务会留在私人队列等待。
-11. 不把 `.codex` 会话、认证文件、项目内容、令牌、Cookie、数据库、本机绝对路径或用户聊天记录提交到 Git 或部署包。不得复制原作者的 `project_id`、设备密钥或配对文件给新用户；每位用户都创建自己的私有站点和密钥。
+1. 如果用户尚未提供目录，只问：“Codex Team Room 下载到了哪个文件夹？请把完整目录地址发给我。”
+2. 只读确认该目录包含 `install-team-room.cmd`、`package.json`、`package-lock.json`、`src/`、`server/`，且 `package.json.name` 为 `codex-team-room`。不符合就停止，不猜目录、不移动项目。
+3. 一次性说明并请求确认：将在该最终目录重建依赖、必要时安装 Node.js LTS 和官方 Codex CLI、构建并做发布安全检查、启动仅监听 `127.0.0.1` 的本机服务、设置当前用户登录后的自动启动；随后创建仅当前所有者可访问的个人 Sites 和设备配对。明确说明不会读取或输出认证文件、令牌、聊天记录和项目内容。
+4. 用户确认后，在该目录运行以下唯一的本机安装入口：
+
+   ```powershell
+   .\install-team-room.cmd --no-open --no-pause
+   ```
+
+   安装器会使用 `npm ci` 按锁文件重建依赖，因此即使下载目录曾被复制或移动，也不会复用损坏的 `node_modules` 软链接。不要先在别处安装再复制成品目录。
+5. 如果 Codex 的受控命令环境拒绝启动安装器，不要检查 `auth.json`、Windows 凭据或浏览器登录状态，也不要把它误报为“未登录”。请用户在资源管理器中双击根目录的 `install-team-room.cmd`；看到“安装完成”后继续第 6 步。
+6. 安装器成功才继续。只核对：
+   - `GET http://127.0.0.1:4174/api/health` 返回 `ok: true`，且 `serviceRoot` 等于用户给出的安装目录；
+   - `GET http://127.0.0.1:4174/api/runtime/status` 返回 `available: true`。
+   不运行任何仅凭认证文件推断登录状态的命令，也不读取认证文件。CLI 登录是否真实有效由第 12 步的实际 Codex 回合验证。
+7. 在调用任何 Sites 站点读取、保存或部署前，运行：
+
+   ```powershell
+   npm run site:prepare-personal
+   ```
+
+   这会从当前下载副本移除原作者公开仓库携带的 `project_id`，但保留 D1/R2 绑定名称。绝不尝试访问、复用或更新原作者的站点。
+8. 使用 Sites 创建一个全新的个人站点，立即把返回的 `project_id` 写入当前副本的 `.openai/hosting.json`。执行生产构建并保存版本；仅使用私人部署，不得设为公开。
+9. 部署后核对访问策略：当前用户必须是唯一所有者，用户组为 0，外部访客为 0。不满足则停止，不能继续配对。
+10. 告诉用户：“将创建一枚只供这台电脑访问你私人站点的令牌；它只保存在本机，不会进 Git 或站点源码。”取得肯定答复后，创建站点专用 SIWC 绕过令牌。把 `siteUrl`、令牌、用户确认的默认项目目录和设备名称以 JSON 从标准输入传给 `npm run pair:configure`。不得把令牌写进命令行参数或输出。
+11. 读取 `.team-room/sites-environment.json`，把其中 `TEAM_ROOM_DEVICE_SECRET` 作为 Sites 生产 secret 写入；无论写入或部署是否成功，都在 `finally` 中删除该临时文件。保留 Git 忽略的 `.team-room/pairing.json`。重新构建、保存并私人部署，然后调用：
+
+   ```powershell
+   Invoke-RestMethod -Method Post http://127.0.0.1:4174/api/pair/reload
+   ```
+
+12. 只做一次必要的真实验收：
+   - `/api/pair/local-status` 必须是 `configured: true`、`running: true`、`lastError: null`；
+   - 私人站点显示本机在线；
+   - 发送一条“不执行命令、不写文件，只回复 TEAM_ROOM_READY”的测试消息，确认私人队列、独立 Codex 回合和手机回传全部成功。
+   不自动批准任何命令。失败时立即停止并报告具体失败阶段，不继续堆叠测试。
+13. 最终只交付本地地址、个人私人站点地址和 [详细图文教程](docs/USER_GUIDE.md)。提醒用户：项目移动到新目录后需要再次运行 `install-team-room.cmd`；不要复制已经生成的 `node_modules`、`.team-room` 或原作者 `.openai/hosting.json` 到另一台电脑。
+14. 永远不提交 `.team-room/`、`.codex`、认证文件、令牌、Cookie、数据库、本机绝对路径、用户聊天记录或项目内容。每位用户必须有自己的私人站点、设备密钥和配对文件。
 
 </codex_setup_instructions>

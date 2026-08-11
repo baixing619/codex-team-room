@@ -42,6 +42,7 @@ import { acknowledgeContextDelivery, applyContextCursorUpdates, bindContextCurso
 import { applyCloudSnapshot, createCloudSnapshot } from "./lib/cloudState.js";
 import { applyApprovalLifecycleEvent, approvalRoute, classifyApprovalRequest, isApprovalTerminal, mergeApprovalCommands, normalizeApprovalCommand, reconcileApprovalState, visibleApprovalCommands } from "./lib/approvalLifecycle.js";
 import { MessageRichText } from "./components/MessageRichText.jsx";
+import { runtimeMatchesRoom } from "./lib/runtimeScope.js";
 
 const VIEW_ITEMS = [
   { id: "knowledge", label: "知识库", icon: BookOpenText },
@@ -54,6 +55,8 @@ const PERMISSION_LABELS = {
   "request-write": "可申请写入",
   coordinate: "协调建议",
 };
+
+const BASIC_TUTORIAL_DISMISSED_KEY = "codex-team-room:basic-tutorial-dismissed:v1";
 
 function classNames(...values) {
   return values.filter(Boolean).join(" ");
@@ -900,7 +903,41 @@ function AgentSettingsView({ agents, onOpenAgent, onAddMember, onRemoveAgent }) 
   );
 }
 
-function SettingsView({ bridge, pairing, runtime, rooms, syncStatus, onConnectRuntime, onDisconnectRuntime, onExport, onReset }) {
+function BasicTutorialModal({ onClose, onNeverShow }) {
+  const steps = [
+    ["1", "接入项目", "点左侧“接入 Codex 项目”，选择要协作的项目；历史对话只在你打开时读取。"],
+    ["2", "配置成员", "在“成员配置”里设置总控和专家的职责、模型、推理强度与权限；每个项目独立保存。"],
+    ["3", "在房间发任务", "简单任务可直接 @成员；复杂任务由总控拆解、邀请成员讨论，再由总控拍板。文件和拍照可从发送框添加。"],
+    ["4", "确认执行", "成员需要写文件或执行命令时会出现真实审批；只批准你看懂且认可的本次操作。"],
+  ];
+  return (
+    <div className="modal-backdrop tutorial-backdrop" role="presentation">
+      <section className="modal tutorial-modal" role="dialog" aria-modal="true" aria-labelledby="tutorial-title">
+        <header className="modal-header">
+          <div><span className="eyebrow">首次使用</span><h2 id="tutorial-title">四步开始使用 Team Room</h2></div>
+          <button className="icon-button" type="button" aria-label="关闭基础教程" onClick={onClose}><X size={21} /></button>
+        </header>
+        <div className="tutorial-list">
+          {steps.map(([number, title, detail]) => (
+            <article className="tutorial-step" key={number}>
+              <span className="tutorial-step__number">{number}</span>
+              <div><h3>{title}</h3><p>{detail}</p></div>
+            </article>
+          ))}
+          <a className="tutorial-guide-link" href="https://github.com/baixing619/codex-team-room/blob/main/docs/USER_GUIDE.md" target="_blank" rel="noreferrer">
+            <BookOpenText size={19} /> 查看带真实截图的详细教程
+          </a>
+        </div>
+        <footer className="tutorial-actions">
+          <button className="secondary-button" type="button" onClick={onNeverShow}>不再显示</button>
+          <button className="primary-button" type="button" onClick={onClose}>开始使用</button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function SettingsView({ bridge, pairing, runtime, rooms, syncStatus, onConnectRuntime, onDisconnectRuntime, onShowTutorial, onExport, onReset }) {
   const privateCloud = isPrivateCloudHost();
   return (
     <div className="content-view">
@@ -938,6 +975,7 @@ function SettingsView({ bridge, pairing, runtime, rooms, syncStatus, onConnectRu
             {runtime.connected ? "断开真实运行时" : "启用真实成员"}
           </button>
         ) : null}
+        <button className="secondary-button" type="button" onClick={onShowTutorial}><BookOpenText size={17} />重新显示基础教程</button>
         <button className="secondary-button" type="button" onClick={onExport}>导出本地配置</button>
         <button className="danger-button" type="button" onClick={onReset}>重置本机 Team Room 数据</button>
       </div>
@@ -1055,6 +1093,9 @@ export function App() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
   const [toast, setToast] = useState("");
+  const [tutorialOpen, setTutorialOpen] = useState(() => {
+    try { return localStorage.getItem(BASIC_TUTORIAL_DISMISSED_KEY) !== "1"; } catch { return true; }
+  });
   // Cached thread lists make the sidebar fast, but every page load still needs
   // one real index refresh so conversations removed by an older client return.
   const autoLoadedRooms = useRef(new Set());
@@ -1080,13 +1121,13 @@ export function App() {
   const openAgent = newMember || agents.find((agent) => agent.id === openAgentId) || null;
   const inspectedCommand = commands.find((command) => command.id === inspectedCommandId) || null;
   const connectedPaths = useMemo(() => new Set(state.rooms.map((room) => room.path.toLowerCase())), [state.rooms]);
-  const realRuntimeActive = Boolean(runtime?.connected && runtime.cwd?.toLowerCase() === activeRoom.path.toLowerCase());
+  const realRuntimeActive = runtimeMatchesRoom(runtime, activeRoom);
   const privateCloud = isPrivateCloudHost();
   const syncEndpoint = privateCloud ? "/api/state" : pairing?.configured ? "/api/sync/state" : null;
   const canSendReal = privateCloud ? Boolean(pairing?.paired) : realRuntimeActive;
   const connectionLabel = privateCloud
     ? pairing?.online ? "真实 Codex 在线" : pairing?.paired ? "真实 Codex 离线排队" : "尚未配对真实 Codex"
-    : realRuntimeActive ? "真实 Codex 已连接" : "真实 Codex 未连接";
+    : realRuntimeActive ? "真实 Codex 已连接" : runtime?.connected ? "真实 Codex 将切换到当前房间" : "真实 Codex 未连接";
 
   useEffect(() => {
     stateRef.current = state;
@@ -1718,7 +1759,15 @@ export function App() {
       setToast("当前项目没有成员；请先在成员配置中新增成员");
       return;
     }
-    if (!canSendReal) {
+    if (!privateCloud && runtime?.connected && !realRuntimeActive) {
+      try {
+        const status = await postJson("/api/runtime/connect", { confirmed: true, cwd: activeRoom.path, roomId: activeRoom.id, agents });
+        setRuntime(status);
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : "无法切换到当前项目房间");
+        return;
+      }
+    } else if (!canSendReal) {
       setToast(privateCloud ? "请先完成私人电脑配对" : "请先在设置中启用真实 Codex 成员");
       return;
     }
@@ -2030,7 +2079,7 @@ export function App() {
   const renderCenter = () => {
     if (activeView === "knowledge") return <KnowledgeView entries={knowledge} onAdd={addKnowledge} />;
     if (activeView === "agents") return <AgentSettingsView agents={agents} onOpenAgent={openAgentEditor} onAddMember={addMember} onRemoveAgent={removeAgent} />;
-    if (activeView === "settings") return <SettingsView bridge={bridge} pairing={pairing} runtime={runtime} rooms={state.rooms} syncStatus={syncStatus} onConnectRuntime={connectRuntime} onDisconnectRuntime={disconnectRuntime} onExport={exportConfig} onReset={resetPrototype} />;
+    if (activeView === "settings") return <SettingsView bridge={bridge} pairing={pairing} runtime={runtime} rooms={state.rooms} syncStatus={syncStatus} onConnectRuntime={connectRuntime} onDisconnectRuntime={disconnectRuntime} onShowTutorial={() => { try { localStorage.removeItem(BASIC_TUTORIAL_DISMISSED_KEY); } catch {} setTutorialOpen(true); }} onExport={exportConfig} onReset={resetPrototype} />;
     if (activeThreadId !== "global") return <HistoryView history={history} loading={historyLoading} error={historyError} attached={Boolean(attachedHistoryEntry(knowledge, activeThread))} onAttach={attachHistory} onRefresh={() => selectThread(activeThread, { force: true })} />;
     return (
       <ChatView
@@ -2082,6 +2131,7 @@ export function App() {
       {importOpen ? <ImportProjectModal projects={projects} loading={projectsLoading} error={projectsError} connectedPaths={connectedPaths} onClose={() => setImportOpen(false)} onRefresh={loadProjects} onAttach={attachProject} /> : null}
       {openAgent ? <AgentDrawer agent={openAgent} bindingThreads={threads.filter((thread) => thread.kind === "codex")} isNew={Boolean(newMember)} onClose={() => { setOpenAgentId(null); setNewMember(null); }} onSave={saveAgent} /> : null}
       {inspectedCommand ? <CommandModal command={inspectedCommand} agent={agents.find((agent) => agent.id === inspectedCommand.agentId)} onClose={() => setInspectedCommandId(null)} /> : null}
+      {tutorialOpen ? <BasicTutorialModal onClose={() => setTutorialOpen(false)} onNeverShow={() => { try { localStorage.setItem(BASIC_TUTORIAL_DISMISSED_KEY, "1"); } catch {} setTutorialOpen(false); }} /> : null}
       <Toast message={toast} />
     </div>
   );

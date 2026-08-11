@@ -4,13 +4,17 @@
 
 ## 让 Codex 帮你安装
 
-下载项目后，把 [CODEX_SETUP.md](CODEX_SETUP.md) 拖进 Codex。Codex 会先询问项目目录，然后在你确认后完成本地初始化、CLI 检查、验证、个人私有 Sites 创建和安全设备配对。
+下载项目后，把 [CODEX_SETUP.md](CODEX_SETUP.md) 拖进 Codex。Codex 会先询问项目目录，然后调用仓库内固定的 Windows 安装器完成依赖重建、CLI 检查、本机服务和开机恢复，再创建当前用户自己的私人 Sites 与安全设备配对。不会让 Codex 临时拼装一串安装命令。
+
+也可以直接双击根目录的 `install-team-room.cmd` 完成本机安装。安装器会按 `package-lock.json` 执行 `npm ci`，自动修复复制或移动目录造成的依赖断链；缺少 Node.js LTS 或官方 Codex CLI 时会自动安装。完整手机私人站点仍需把 [CODEX_SETUP.md](CODEX_SETUP.md) 拖进 Codex，完成一次所有者授权。
 
 配对完成后，私有 Sites 可从手机发送消息、接收真实成员回复并处理一次性审批。本机代理只主动连接私人站点，不开放电脑端口；配对凭据保存在 `.team-room/`，受 Git 忽略且不会进入站点源码。
 
 私人 Sites 是跨浏览器同步源：手机、电脑浏览器和本机 `127.0.0.1` 页面会同步项目房间、每房间成员配置与提示词、知识库、近期群聊和成员对话绑定。同步使用递增修订号；两台设备同时修改时不会静默覆盖，而会载入最新状态并提示重试冲突操作。
 
 > 当前版本只在连接真实 Codex 运行时或已配对私人站点时允许发送。不会生成模拟成员回复、模拟命令或模拟完成状态。
+
+首次打开主界面会显示四步基础教程；选择“不再显示”后可随时到“设置 → 重新显示基础教程”再次打开。完整操作见 [带真实页面截图的图文教程](docs/USER_GUIDE.md)。
 
 ## 双路线协作
 
@@ -47,9 +51,10 @@ Team Room 不是把所有请求都塞进一条长流水线，而是在同一个�
 需要 Node.js 20 或更新版本。
 
 ```powershell
-npm install
-npm run dev
+.\install-team-room.cmd
 ```
+
+开发者手动运行时使用 `npm ci` 和 `npm run dev`。不要复制已经安装好的 `node_modules` 到另一个 Windows 目录。
 
 默认会启动 Vite 本地服务。开发模式下，本地桥接层读取用户自己的 `CODEX_HOME`（未设置时为用户目录下的 `.codex`）。静态构建不直接包含本机桥接能力；启用设备配对后，本机代理通过经过认证的私人队列与站点通信，并继续由本地 App Server 执行任务。
 
@@ -68,10 +73,9 @@ Team Room 不捆绑 Codex 可执行文件。需要真实成员线程时，请按
 ```powershell
 npm install -g @openai/codex
 codex login
-codex login status
 ```
 
-Windows 上通过 npm 安装的官方 x64/ARM64 平台二进制会被自动识别。确认设置页显示 CLI 可用后，仍需由用户点击“启用真实成员”才会启动 App Server；Team Room 不会因检测到 CLI 而自动执行任务。
+Windows 上通过 npm 安装的官方 x64/ARM64 平台二进制会被自动识别。Team Room 不读取认证文件，也不靠受控命令环境推断登录状态；首次真实成员回合才是登录有效的最终证明。确认设置页显示 CLI 可用后，仍需由用户点击“启用真实成员”才会启动 App Server；Team Room 不会因检测到 CLI 而自动执行任务。
 
 ## 隐私边界
 

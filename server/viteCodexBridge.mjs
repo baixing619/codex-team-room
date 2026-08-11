@@ -67,6 +67,10 @@ export function codexBridgePlugin() {
           if (request.method === "GET" && url.pathname === "/api/pair/local-status") {
             return sendJson(response, 200, remotePairing.status());
           }
+          if (request.method === "POST" && url.pathname === "/api/pair/reload") {
+            remotePairing.stop();
+            return sendJson(response, 200, remotePairing.start());
+          }
           if (request.method === "GET" && url.pathname === "/api/sync/state") {
             return remotePairing.request("/api/device/state", { requestTimeoutMs: 30_000 })
               .then((value) => sendJson(response, 200, value))
