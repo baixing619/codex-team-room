@@ -112,6 +112,38 @@ test("sanitized agent thread bindings retain their binding mode", () => {
   assert.equal(sanitized.cwd, undefined);
 });
 
+test("turn-start receipts retain only the context cursor needed for cross-browser delta delivery", () => {
+  const sanitized = sanitizeRuntimeEvent({
+    sequence: 12,
+    type: "turnStarted",
+    roomId: "room-animation",
+    taskId: "task-2",
+    agentId: "developer",
+    threadId: "thread-developer",
+    turnId: "turn-2",
+    contextCursorUpdate: {
+      agentId: "developer",
+      threadId: "thread-developer",
+      deliverySequence: 3,
+      messageFingerprints: { "message-1": "fnv1a:1234" },
+      knowledgeFingerprints: { "knowledge-1": "fnv1a:5678" },
+      lastContextId: "context-2",
+      privateText: "must-not-pass",
+    },
+  });
+
+  assert.deepEqual(sanitized.contextCursorUpdate, {
+    version: 1,
+    initialized: true,
+    agentId: "developer",
+    threadId: "thread-developer",
+    deliverySequence: 3,
+    messageFingerprints: { "message-1": "fnv1a:1234" },
+    knowledgeFingerprints: { "knowledge-1": "fnv1a:5678" },
+    lastContextId: "context-2",
+  });
+});
+
 test("approval events sent to the private site sanitize command, reason, and failure details", () => {
   const requested = sanitizeRuntimeEvent({
     type: "approvalRequested",

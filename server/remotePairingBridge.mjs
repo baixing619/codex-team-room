@@ -15,6 +15,31 @@ function safeRemoteTaskError(value) {
   return sanitizeTaskText(value instanceof Error ? value.message : value, 1000) || "remote_task_failed";
 }
 
+function sanitizeCursorFingerprints(value, limit) {
+  if (!value || typeof value !== "object") return {};
+  return Object.fromEntries(Object.entries(value).slice(-limit).flatMap(([id, fingerprint]) => {
+    const safeId = String(id || "").trim().slice(0, 240);
+    const safeFingerprint = String(fingerprint || "").trim().slice(0, 240);
+    return safeId && safeFingerprint ? [[safeId, safeFingerprint]] : [];
+  }));
+}
+
+function sanitizeContextCursorUpdate(value) {
+  if (!value || typeof value !== "object") return null;
+  const agentId = String(value.agentId || "").trim().slice(0, 160);
+  if (!agentId) return null;
+  return {
+    version: 1,
+    initialized: true,
+    agentId,
+    threadId: String(value.threadId || "").trim().slice(0, 200) || null,
+    deliverySequence: Math.max(0, Number(value.deliverySequence) || 0),
+    messageFingerprints: sanitizeCursorFingerprints(value.messageFingerprints, 240),
+    knowledgeFingerprints: sanitizeCursorFingerprints(value.knowledgeFingerprints, 100),
+    lastContextId: String(value.lastContextId || "").trim().slice(0, 200) || null,
+  };
+}
+
 const POWERSHELL_REQUEST_SCRIPT = `
 $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $headers = @{}
@@ -177,6 +202,31 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
     ...(event.internal !== undefined ? { internal: event.internal === true } : {}),
     ...(event.assignmentId ? { assignmentId: event.assignmentId } : {}),
   };
+  if (event.type === "agentMessageDelta") return {
+    ...common,
+    text: sanitizeTaskText(event.text || "", 12_000),
+    threadId: event.threadId,
+    turnId: event.turnId,
+    itemId: event.itemId || null,
+    public: event.public !== false,
+  };
+  if (event.type === "turnProgress") return {
+    ...common,
+    threadId: event.threadId,
+    turnId: event.turnId,
+    turnKind: event.turnKind || null,
+    assignmentId: event.assignmentId || null,
+    stage: event.stage,
+    itemType: event.itemType || null,
+    public: event.public !== false,
+  };
+  if (event.type === "taskDelegationMerged") return {
+    ...common,
+    assignmentId: event.assignmentId || null,
+    targetAgentId: event.targetAgentId || null,
+    stage: "already_running",
+    public: true,
+  };
   if (event.type === "approvalRequested") {
     return {
       ...common,
@@ -198,7 +248,7 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
   if (event.type === "approvalResolved") return { ...common, requestId: event.requestId, approvalKey: event.approvalKey, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, decision: event.decision, requiresWriteLock: event.requiresWriteLock };
   if (event.type === "approvalFailed") return { ...common, requestId: event.requestId, approvalKey: event.approvalKey, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, error: safeRemoteTaskError(event.error || "approval_failed") };
   if (event.type === "agentThreadBound") return { ...common, threadId: event.threadId, model: event.model, bindingMode: event.bindingMode };
-  if (event.type === "turnStarted") return { ...common, threadId: event.threadId, turnId: event.turnId, messageId: event.messageId };
+  if (event.type === "turnStarted") return { ...common, threadId: event.threadId, turnId: event.turnId, messageId: event.messageId, turnKind: event.turnKind || null, assignmentId: event.assignmentId || null, contextCursorUpdate: sanitizeContextCursorUpdate(event.contextCursorUpdate), public: event.public !== false };
   if (event.type === "turnCompleted") return { ...common, threadId: event.threadId, turnId: event.turnId, status: event.turn?.status || event.status || "completed" };
   if (event.type === "writeItemCompleted") return { ...common, threadId: event.threadId, item: { type: event.item?.type, status: event.item?.status } };
   return common;
@@ -214,6 +264,9 @@ export class RemotePairingBridge {
     this.timers = timers;
     this.config = null;
     this.interval = null;
+    this.eventUploadTimer = null;
+    this.eventUploadPromise = null;
+    this.unsubscribeRuntimeEvents = null;
     this.busy = false;
     this.eventCursor = 0;
     this.lastHeartbeatAt = 0;
@@ -242,14 +295,31 @@ export class RemotePairingBridge {
     this.config = readConfig(this.configPath);
     if (!this.config) return this.status();
     this.interval = this.timers.setInterval(() => this.tick(), POLL_INTERVAL_MS);
+    if (typeof this.runtime?.subscribe === "function") {
+      this.unsubscribeRuntimeEvents = this.runtime.subscribe(() => this.scheduleEventUpload());
+    }
     this.tick();
     return this.status();
   }
 
   stop() {
     if (this.interval) this.timers.clearInterval(this.interval);
+    if (this.eventUploadTimer) this.timers.clearTimeout(this.eventUploadTimer);
+    this.eventUploadTimer = null;
+    this.unsubscribeRuntimeEvents?.();
+    this.unsubscribeRuntimeEvents = null;
     this.interval = null;
     return this.status();
+  }
+
+  scheduleEventUpload() {
+    if (!this.config || this.eventUploadTimer) return;
+    this.eventUploadTimer = this.timers.setTimeout(() => {
+      this.eventUploadTimer = null;
+      this.uploadEvents().catch((error) => {
+        this.lastError = safeRemoteTaskError(error);
+      });
+    }, 80);
   }
 
   async updateTaskStatus(taskId, status, error = null) {
@@ -428,21 +498,32 @@ export class RemotePairingBridge {
   }
 
   async uploadEvents() {
-    const events = this.runtime.listEvents(this.eventCursor);
-    if (!events.length) return;
-    await this.request("/api/device/events", {
-      method: "POST",
-      body: JSON.stringify({
-        deviceId: this.config.deviceId,
-        events: events.map((event) => ({
-          taskId: event.taskId || this.lastTaskId,
-          type: event.type,
-          ...(event.eventId ? { eventId: event.eventId } : {}),
-          payload: sanitizeRuntimeEvent(event),
-        })),
-      }),
+    if (this.eventUploadPromise) return this.eventUploadPromise;
+    this.eventUploadPromise = (async () => {
+      while (true) {
+        const events = this.runtime.listEvents(this.eventCursor)
+          .filter((event) => Number(event?.sequence) > this.eventCursor);
+        if (!events.length) return;
+        await this.request("/api/device/events", {
+          method: "POST",
+          body: JSON.stringify({
+            deviceId: this.config.deviceId,
+            events: events.map((event) => ({
+              taskId: event.taskId || this.lastTaskId,
+              type: event.type,
+              ...(event.eventId ? { eventId: event.eventId } : {}),
+              payload: sanitizeRuntimeEvent(event),
+            })),
+          }),
+        });
+        const nextCursor = Math.max(...events.map((event) => Number(event.sequence)));
+        if (!Number.isFinite(nextCursor) || nextCursor <= this.eventCursor) return;
+        this.eventCursor = nextCursor;
+      }
+    })().finally(() => {
+      this.eventUploadPromise = null;
     });
-    this.eventCursor = events.at(-1).sequence;
+    return this.eventUploadPromise;
   }
 
   async processApproval(approval) {

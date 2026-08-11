@@ -587,6 +587,23 @@ select:focus-visible {
   gap: 9px;
 }
 
+.streaming-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #5f5bd6;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.streaming-label > span {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #6d68df;
+  box-shadow: 0 0 0 3px rgba(109, 104, 223, 0.12);
+}
+
 .message-meta strong {
   font-size: 15px;
 }

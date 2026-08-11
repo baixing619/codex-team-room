@@ -50,6 +50,26 @@ function normalizeAssignment(raw) {
   return assignment;
 }
 
+function parseAssignmentBody(body) {
+  try {
+    const parsed = JSON.parse(body);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {}
+
+  const raw = {};
+  for (const sourceLine of String(body || "").split(/\r?\n/)) {
+    const line = sourceLine.trim();
+    if (!line) continue;
+    const match = /^([A-Za-z][A-Za-z0-9]*)\s*=\s*(.*)$/.exec(line);
+    if (!match || !ASSIGNMENT_FIELDS.has(match[1]) || Object.hasOwn(raw, match[1])) return null;
+    const [, key, value] = match;
+    raw[key] = key === "acceptanceCriteria"
+      ? value.split(/\s*[;；]\s*/).map((item) => item.trim()).filter(Boolean)
+      : value.trim();
+  }
+  return Object.keys(raw).length ? raw : null;
+}
+
 function extractJsonBlock(value, start, end) {
   const source = String(value ?? "");
   const first = source.indexOf(start);
@@ -83,12 +103,8 @@ export function parseTaskAssignments(value) {
     const end = source.indexOf(TASK_ASSIGNMENT_END, start + TASK_ASSIGNMENT_START.length);
     if (end < 0 || (nextStart >= 0 && nextStart < end)) return [];
     const body = source.slice(start + TASK_ASSIGNMENT_START.length, end).trim();
-    let raw;
-    try {
-      raw = JSON.parse(body);
-    } catch {
-      return [];
-    }
+    const raw = parseAssignmentBody(body);
+    if (!raw) return [];
     const assignment = normalizeAssignment(raw);
     if (!assignment || assignments.some((item) => item.assignmentId === assignment.assignmentId)) return [];
     assignments.push(assignment);
