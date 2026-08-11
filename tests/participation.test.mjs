@@ -10,11 +10,13 @@ test("coordinator always receives a message while unrelated members stay silent"
   assert.equal(result.find((item) => item.agentId === "reviewer").decision, "silent");
 });
 
-test("role hints and mentions wake only relevant members", () => {
+test("an explicit specialist mention uses the fast route without waking keyword matches", () => {
   const result = decideParticipation("@审核 请检查代码风险", DEFAULT_AGENTS);
-  assert.equal(result.find((item) => item.agentId === "developer").decision, "speak");
+  assert.equal(result.find((item) => item.agentId === "coordinator").decision, "silent");
+  assert.equal(result.find((item) => item.agentId === "developer").decision, "silent");
   assert.equal(result.find((item) => item.agentId === "reviewer").decision, "speak");
   assert.equal(result.find((item) => item.agentId === "researcher").decision, "silent");
+  assert.equal(result.find((item) => item.agentId === "reviewer").lane, "fast");
 });
 
 test("multiple Chinese member mentions override each member's normal silent strategy", () => {
@@ -26,7 +28,7 @@ test("multiple Chinese member mentions override each member's normal silent stra
 
   assert.equal(result.length, agents.length);
   assert.ok(result.every((item) => item.decision === "speak"));
-  assert.ok(result.every((item) => item.reason === "收到直接提及或全体通知"));
+  assert.ok(result.every((item) => item.reason === "快速线收到明确提及或全体通知"));
 });
 
 test("full-width Chinese at-signs and compact multi-mentions are recognized", () => {
@@ -42,6 +44,20 @@ test("whole-team requests wake every member, including the recognition phrase", 
     const result = decideParticipation(text, DEFAULT_AGENTS);
     assert.ok(result.every((item) => item.decision === "speak"), text);
   }
+});
+
+test("complex discussion requests start only the coordinator on the collaboration route", () => {
+  const result = decideParticipation("大家先讨论并比较两个方案，确定更优解", DEFAULT_AGENTS);
+  assert.equal(result.find((item) => item.agentId === "coordinator").decision, "speak");
+  assert.ok(result.filter((item) => item.agentId !== "coordinator").every((item) => item.decision === "silent"));
+  assert.ok(result.every((item) => item.lane === "collaboration"));
+});
+
+test("ordinary task keywords wait for coordinator planning instead of pre-activating developer", () => {
+  const result = decideParticipation("修复这个问题并做必要测试", DEFAULT_AGENTS);
+  assert.equal(result.find((item) => item.agentId === "coordinator").decision, "speak");
+  assert.equal(result.find((item) => item.agentId === "developer").decision, "silent");
+  assert.ok(result.every((item) => item.lane === "collaboration"));
 });
 
 test("custom members participate through their configured strategy and role", () => {

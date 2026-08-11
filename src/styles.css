@@ -1022,6 +1022,16 @@ select:focus-visible {
   font-size: 11px;
 }
 
+.agent-status--working {
+  color: #5e58dd;
+  font-weight: 600;
+}
+
+.agent-work-spinner {
+  flex: 0 0 auto;
+  color: #6c65e8;
+}
+
 .agent-model {
   margin-top: 6px;
   color: #747887;

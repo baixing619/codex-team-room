@@ -182,6 +182,7 @@ function safeApprovalRequestId(value) {
 }
 
 export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
+  const assignmentPhase = ["analysis", "execution"].includes(event.assignmentPhase) ? event.assignmentPhase : null;
   const common = {
     sequence: event.sequence,
     createdAt: event.createdAt,
@@ -216,6 +217,7 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
     turnId: event.turnId,
     turnKind: event.turnKind || null,
     assignmentId: event.assignmentId || null,
+    assignmentPhase,
     stage: event.stage,
     itemType: event.itemType || null,
     public: event.public !== false,
@@ -248,8 +250,8 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
   if (event.type === "approvalResolved") return { ...common, requestId: event.requestId, approvalKey: event.approvalKey, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, decision: event.decision, requiresWriteLock: event.requiresWriteLock };
   if (event.type === "approvalFailed") return { ...common, requestId: event.requestId, approvalKey: event.approvalKey, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, error: safeRemoteTaskError(event.error || "approval_failed") };
   if (event.type === "agentThreadBound") return { ...common, threadId: event.threadId, model: event.model, bindingMode: event.bindingMode };
-  if (event.type === "turnStarted") return { ...common, threadId: event.threadId, turnId: event.turnId, messageId: event.messageId, turnKind: event.turnKind || null, assignmentId: event.assignmentId || null, contextCursorUpdate: sanitizeContextCursorUpdate(event.contextCursorUpdate), public: event.public !== false };
-  if (event.type === "turnCompleted") return { ...common, threadId: event.threadId, turnId: event.turnId, status: event.turn?.status || event.status || "completed" };
+  if (event.type === "turnStarted") return { ...common, threadId: event.threadId, turnId: event.turnId, messageId: event.messageId, turnKind: event.turnKind || null, assignmentId: event.assignmentId || null, assignmentPhase, contextCursorUpdate: sanitizeContextCursorUpdate(event.contextCursorUpdate), public: event.public !== false };
+  if (event.type === "turnCompleted") return { ...common, threadId: event.threadId, turnId: event.turnId, status: event.turn?.status || event.status || "completed", assignmentPhase };
   if (event.type === "writeItemCompleted") return { ...common, threadId: event.threadId, item: { type: event.item?.type, status: event.item?.status } };
   return common;
 }

@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { getCodexRuntimeStatus, spawnCodexAppServer } from "./codexAppServerRuntime.mjs";
-import { decideParticipation, isAgentMentioned, isBroadcastRequest } from "../src/lib/participation.js";
+import { decideParticipation } from "../src/lib/participation.js";
 import { selectSharedContextForAgent } from "./sharedContext.mjs";
 import { approvalIdentity, classifyApprovalRequest } from "../src/lib/approvalLifecycle.js";
 import { formatTaskResult, isCoordinatorOnlyRequest, parseTaskAssignments, sanitizeTaskText, stripTaskAssignmentBlocks, TASK_ASSIGNMENT_START, validateTaskAssignment } from "../src/lib/taskAssignments.js";
@@ -25,9 +25,16 @@ function coordinatorInitialProtocol(record, agents) {
     const agent = (agents || []).find((item) => item?.id === agentId);
     return `${agentId}/${agent?.name || agent?.role || "成员"}`;
   }).join(", ");
-  return `[TEAM_ROOM_COORDINATOR_PROTOCOL_V1] 你是纯协调总控：只做澄清、分析、拆解、规划、委派和汇总，严禁亲自调用命令、读取项目文件、修改文件或执行本机工具。需要证据时委派成员。真实委派只能输出最多4个严格 TEAM_ROOM_TASK_ASSIGNMENT_V1 块；本轮 parentTaskId=${record?.id || ""}，depth=${Number(record?.depth || 0) + 1}，可分派 targetAgentId=${targets || "无"}。本轮已经由房间直接启动的成员=${direct || "无"}；不要再次委派这些成员，只在确实需要新增分工时委派其他成员。普通房间任务的 visibility 使用 room，让成员回复进入团队消息并形成后续共享上下文；只有用户明确只让总控回复或其他人不要发言时才使用 coordinator-only。每个 assignmentId 必须在本轮唯一。任务块内部推荐使用单个合法 JSON 对象，例如 {"assignmentId":"唯一ID","parentTaskId":"${record?.id || ""}","targetAgentId":"成员ID","objective":"目标","acceptanceCriteria":["验收条件"],"visibility":"room","depth":${Number(record?.depth || 0) + 1}}；也兼容逐行 key=value，但不得使用表格或遗漏字段。普通 @文字或承诺不算委派。`;
+  return `[TEAM_ROOM_COORDINATOR_PROTOCOL_V2] 你是双轨流程的纯协调总控：必须先公开说明你对目标的分析和所选线路，再输出机器任务块。严禁亲自调用命令、读取项目文件、修改文件或执行本机工具。快速线适合简单任务：能直接回答就回答；需要一个成员处理时只输出1个 phase=execution 的任务块。协作线适合复杂、多方案或跨职责任务：输出2至3个 phase=analysis 的任务块，运行时会让成员按顺序看到前序结论并继续讨论；分析阶段不得执行写入。真实委派只能使用严格 TEAM_ROOM_TASK_ASSIGNMENT_V1 块；本轮 parentTaskId=${record?.id || ""}，depth=${Number(record?.depth || 0) + 1}，可分派 targetAgentId=${targets || "无"}。本轮已直接启动的成员=${direct || "无"}，不要重复委派。普通房间任务 visibility=room；只有用户明确只让总控回复时才用 coordinator-only。每个 assignmentId 必须唯一。合法 JSON 示例：{"assignmentId":"唯一ID","parentTaskId":"${record?.id || ""}","targetAgentId":"成员ID","objective":"目标","acceptanceCriteria":["验收条件"],"visibility":"room","depth":${Number(record?.depth || 0) + 1},"phase":"analysis"}。普通 @文字或承诺不算委派。`;
 }
-const COORDINATOR_FINAL_SUMMARY_PROTOCOL = "[TEAM_ROOM_FINAL_SUMMARY_PROTOCOL_V1] 只汇总已回流的委派结果，严禁调用工具、读写文件或再次输出 TEAM_ROOM_TASK_ASSIGNMENT_V1。";
+
+function coordinatorFinalSummaryProtocol(record, agents) {
+  if (record?.executionRoundStarted || record?.executionMode === false) {
+    return "[TEAM_ROOM_FINAL_SUMMARY_PROTOCOL_V2] 讨论或执行结果已经回流。请做最终判断、验收和总结；严禁调用工具、读写文件或再次输出 TEAM_ROOM_TASK_ASSIGNMENT_V1。";
+  }
+  const targets = (agents || []).filter((agent) => agent?.id && agent.id !== record?.coordinatorAgentId).map((agent) => `${agent.id}/${agent.name || agent.role || "成员"}`).join(", ");
+  return `[TEAM_ROOM_FINAL_SUMMARY_PROTOCOL_V2] 请比较成员结论、明确选择的更优方案并说明理由。若不需要执行，直接给出最终判断，不输出任务块；若需要执行，只能输出1个 phase=execution 的 TEAM_ROOM_TASK_ASSIGNMENT_V1 块，parentTaskId=${record?.id || ""}，depth=${Number(record?.depth || 0) + 1}，可选 targetAgentId=${targets || "无"}。严禁亲自调用工具或读写文件。`;
+}
 
 function normalizedPath(value) {
   return String(value || "").trim().replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
@@ -191,6 +198,7 @@ export class TeamRoomRuntimeManager {
       turnId: context.turnId,
       turnKind: context.kind,
       assignmentId: context.assignment?.assignmentId || null,
+      assignmentPhase: context.assignment?.phase || null,
       stage,
       itemType: itemType || null,
       public: true,
@@ -219,7 +227,7 @@ export class TeamRoomRuntimeManager {
 
   appendAgentStream(turnId, itemId, delta, context) {
     if (!turnId || !context || context.public === false || context.internal === true) return;
-    if (context.kind === "initial" && context.agentId === this.coordinatorAgent()?.id) return;
+    if (["initial", "finalSummary"].includes(context.kind) && context.agentId === this.coordinatorAgent()?.id) return;
     const value = String(delta || "");
     if (!value) return;
     let stream = this.agentStreamByTurnId.get(turnId);
@@ -284,9 +292,14 @@ export class TeamRoomRuntimeManager {
       assignmentFailureReasons: new Map(),
       assignmentById: new Map(),
       assignmentSourceTargets: new Set(),
+      assignmentQueue: [],
       directAgentIds: new Set(),
+      taskLane: "fast",
+      discussionMode: false,
+      executionRoundStarted: false,
       finalSummaryStarted: false,
       finalSummaryCompleted: false,
+      summaryRound: 0,
       delegationCount: 0,
       terminalError: null,
       sharedContext: null,
@@ -349,6 +362,7 @@ export class TeamRoomRuntimeManager {
       this.interruptAndReleaseCancelledTurn(context.threadId, turnId, protocol);
     }
     record.pendingAssignments.clear();
+    record.assignmentQueue.length = 0;
     const finished = this.finishTask(record, "failed", error);
     if (finished) {
       record.assignmentById.clear();
@@ -368,7 +382,7 @@ export class TeamRoomRuntimeManager {
   }
 
   maybeFinishTask(record) {
-    if (!record || !record.dispatchStarted || record.pendingTurnIds.size || record.pendingAssignments.size) return;
+    if (!record || !record.dispatchStarted || record.pendingTurnIds.size || record.pendingAssignments.size || record.assignmentQueue.length) return;
     if (record.assignmentResults.size && !record.finalSummaryStarted) {
       void this.startFinalSummary(record);
       return;
@@ -382,6 +396,7 @@ export class TeamRoomRuntimeManager {
     record.assignmentResults.set(assignmentId, {
       assignmentId,
       targetAgentId: optionalId(assignment?.targetAgentId) || null,
+      phase: assignment?.phase || "analysis",
       status: "failed",
       summary: safeTaskError(reason),
       sourceTurnId,
@@ -494,7 +509,9 @@ export class TeamRoomRuntimeManager {
       : agent;
     let turnText = descriptor.text;
     if (agent.id === descriptor.taskRecord?.coordinatorAgentId && descriptor.kind === "initial") turnText = `${turnText}\n\n${coordinatorInitialProtocol(descriptor.taskRecord, [...this.agentById.values()])}`;
-    if (agent.id === descriptor.taskRecord?.coordinatorAgentId && descriptor.kind === "finalSummary") turnText = `${turnText}\n\n${COORDINATOR_FINAL_SUMMARY_PROTOCOL}`;
+    if (agent.id === descriptor.taskRecord?.coordinatorAgentId && descriptor.kind === "finalSummary") {
+      turnText = `${turnText}\n\n${coordinatorFinalSummaryProtocol(descriptor.taskRecord, [...this.agentById.values()])}`;
+    }
     const turn = await this.connection.protocol.startAgentTurn({
       threadId,
       agent: turnAgent,
@@ -556,6 +573,7 @@ export class TeamRoomRuntimeManager {
       internal: descriptor.internal === true,
       turnKind: descriptor.kind || "initial",
       assignmentId: descriptor.assignment?.assignmentId || null,
+      assignmentPhase: descriptor.assignment?.phase || null,
       contextCursorUpdate: contextCursorUpdateForAgent(descriptor.sharedContext, agent.id, threadId),
     });
     return { agentId: agent.id, threadId, turnId: turn.id, taskId: descriptor.taskRecord?.id || this.taskId };
@@ -597,6 +615,7 @@ export class TeamRoomRuntimeManager {
       status,
       summary,
       acceptanceCriteria: assignment.acceptanceCriteria,
+      phase: assignment.phase,
     });
     try {
       await this.startTurnForAgent({
@@ -620,12 +639,25 @@ export class TeamRoomRuntimeManager {
     }
   }
 
+  async startNextQueuedAssignment(record) {
+    if (!record || ["succeeded", "failed"].includes(record.state)) return false;
+    while (record.assignmentQueue.length) {
+      const queued = record.assignmentQueue.shift();
+      const started = await this.spawnAssignment(record, queued.assignment, queued.sourceTurnId, queued.sourceThreadId);
+      if (started) return true;
+    }
+    return false;
+  }
+
   async startFinalSummary(record) {
-    if (!record || record.finalSummaryStarted || record.pendingAssignments.size || !record.assignmentResults.size) return false;
+    if (!record || record.finalSummaryStarted || record.assignmentQueue.length || record.pendingAssignments.size || !record.assignmentResults.size) return false;
     record.finalSummaryStarted = true;
+    record.finalSummaryCompleted = false;
+    record.summaryRound += 1;
     const results = [...record.assignmentResults.values()].map((result) => ({
       assignmentId: result.assignmentId,
       targetAgentId: result.targetAgentId,
+      phase: result.phase || "analysis",
       status: result.status,
       summary: result.summary,
       sourceTurnId: result.sourceTurnId,
@@ -635,8 +667,8 @@ export class TeamRoomRuntimeManager {
       await this.startTurnForAgent({
         taskRecord: record,
         agentId: record.coordinatorAgentId,
-        text: `以下是本轮真实委派的全部结果。只做最终汇总，不得执行命令、读写文件或创建新的 TEAM_ROOM_TASK_ASSIGNMENT_V1：\n${resultText}`,
-        messageId: `summary-${record.id}`,
+        text: `以下是当前任务的真实成员结果。请根据协议判断是给出最终结论，还是在首轮判断后委派一次执行：\n${resultText}`,
+        messageId: `summary-${record.id}-${record.summaryRound}`,
         sharedContext: followupSharedContext(record),
         executionMode: record.executionMode,
         forceReadOnly: true,
@@ -677,7 +709,7 @@ export class TeamRoomRuntimeManager {
         stage: "already_running",
         public: true,
       });
-      return true;
+      return false;
     }
     if (target.threadBinding === "existing" && !optionalId(target.boundThreadId)) {
       this.emitRoomEvent("taskAssignmentRejected", { taskId: record.id, reason: "assignment_thread_mismatch", assignmentId: assignment.assignmentId, public: true });
@@ -688,6 +720,7 @@ export class TeamRoomRuntimeManager {
     record.assignmentSourceTargets.add(`${sourceTurnId}:${assignment.targetAgentId}`);
     record.delegationCount += 1;
     record.pendingAssignments.add(assignment.assignmentId);
+    if (assignment.phase === "execution") record.executionRoundStarted = true;
     const child = {
       ...record,
       id: assignment.assignmentId,
@@ -701,15 +734,25 @@ export class TeamRoomRuntimeManager {
       delegationCount: 0,
     };
     const criteriaText = assignment.acceptanceCriteria.map((item) => `- ${item}`).join("\n");
+    const priorDiscussion = assignment.phase === "analysis"
+      ? [...record.assignmentResults.values()]
+        .filter((result) => result.phase === "analysis")
+        .slice(-3)
+        .map((result) => `- ${result.targetAgentId}：${sanitizeTaskText(result.summary, 2000)}`)
+        .join("\n")
+      : "";
+    const phaseText = assignment.phase === "analysis"
+      ? `你收到当前项目总控的讨论任务。你处于只读分析阶段，不得修改文件或执行写入。${priorDiscussion ? `\n前序成员结论：\n${priorDiscussion}\n请明确说明同意、反对或改进之处。` : ""}`
+      : "你收到当前项目总控已经裁决后的执行任务。按目标完成实际工作，并报告可核验结果；不要再创建委派块。";
     try {
       await this.startTurnForAgent({
         taskRecord: record,
         agentId: target.id,
-        text: `你收到当前项目总控的真实委派。\n目标：${assignment.objective}\n验收标准：\n${criteriaText}\n完成后直接报告结果；不要创建新的委派块。`,
+        text: `${phaseText}\n目标：${assignment.objective}\n验收标准：\n${criteriaText}\n完成后直接报告结果；不要创建新的委派块。`,
         messageId: `assignment-${assignment.assignmentId}`,
         sharedContext: record.sharedContext,
         executionMode: record.executionMode,
-        forceReadOnly: record.executionMode === false,
+        forceReadOnly: assignment.phase !== "execution" || record.executionMode === false,
         kind: "delegatedTarget",
         public: assignment.visibility === "room" && record.visibility !== "coordinator-only",
         internal: assignment.visibility !== "room" || record.visibility === "coordinator-only",
@@ -722,8 +765,8 @@ export class TeamRoomRuntimeManager {
       record.failedAssignments.add(assignment.assignmentId);
       record.assignmentFailureReasons.set(assignment.assignmentId, `delegated_target_start_failed:${failure}`);
       this.emitRoomEvent("taskDelegationFailed", { taskId: record.id, assignmentId: assignment.assignmentId, targetAgentId: target.id, error: failure, public: true });
-      void this.createResultReturn(record, assignment, "failed", failure, sourceTurnId);
-      return false;
+      await this.createResultReturn(record, assignment, "failed", failure, sourceTurnId);
+      return true;
     }
   }
 
@@ -842,22 +885,11 @@ export class TeamRoomRuntimeManager {
     this.taskId = optionalId(taskId) || this.taskId;
     const taskRecord = this.ensureTaskRecord({ taskId: this.taskId || messageId, roomId: this.roomId, text, executionMode });
     if (taskRecord.sharedContext == null && sharedContext != null) taskRecord.sharedContext = sharedContext;
-    // Re-apply explicit mentions at the runtime boundary. This protects remote
-    // tasks and older clients from a stale participation decision: a named
-    // member must be dispatched on its own bound thread even when its normal
-    // strategy would be silent. Unmentioned members retain the supplied
-    // participation decisions.
-    const broadcast = isBroadcastRequest(text);
-    const explicitDecisions = decideParticipation(text, [...this.agentById.values()])
-      .filter((decision) => decision.decision === "speak" && (broadcast || isAgentMentioned(text, this.agentById.get(decision.agentId))));
-    const explicitByAgentId = new Map(explicitDecisions.map((decision) => [decision.agentId, decision]));
-    const suppliedDecisions = Array.isArray(decisions) ? decisions : [];
-    const effectiveDecisions = suppliedDecisions.map((decision) => explicitByAgentId.has(decision.agentId)
-      ? { ...decision, ...explicitByAgentId.get(decision.agentId), decision: "speak" }
-      : decision);
-    for (const decision of explicitDecisions) {
-      if (!effectiveDecisions.some((item) => item.agentId === decision.agentId)) effectiveDecisions.push(decision);
-    }
+    // The runtime is authoritative. Older clients may still pre-activate role
+    // matches from keywords such as “修复/测试”; never trust those guesses.
+    // The shared classifier chooses either the fast direct route or the
+    // coordinator-first collaboration route from the current message.
+    const effectiveDecisions = decideParticipation(text, [...this.agentById.values()]);
     const speakers = [];
     const seen = new Set();
     for (const decision of effectiveDecisions) {
@@ -867,6 +899,8 @@ export class TeamRoomRuntimeManager {
     }
     const coordinatorId = taskRecord.coordinatorAgentId;
     const coordinatorSelected = Boolean(coordinatorId && speakers.some((decision) => decision.agentId === coordinatorId));
+    taskRecord.taskLane = speakers.find((decision) => decision.decision === "speak")?.lane || "fast";
+    taskRecord.discussionMode = taskRecord.taskLane === "collaboration";
     taskRecord.directAgentIds = new Set(coordinatorSelected
       ? speakers.filter((decision) => decision.agentId !== coordinatorId).map((decision) => decision.agentId)
       : []);
@@ -919,13 +953,13 @@ export class TeamRoomRuntimeManager {
 
     if (context.kind === "delegatedTarget" && context.assignment) {
       if (succeeded) {
-        void this.createResultReturn(record, context.assignment, "succeeded", finalText, turnId);
+        await this.createResultReturn(record, context.assignment, "succeeded", finalText, turnId);
       } else {
         const failure = safeTaskError(turn?.error || turn?.status || "target_turn_failed");
         record.failedAssignments.add(context.assignment.assignmentId);
         record.assignmentFailureReasons.set(context.assignment.assignmentId, `delegated_target_failed:${failure}`);
         this.emitRoomEvent("taskDelegationFailed", { taskId: record.id, assignmentId: context.assignment.assignmentId, targetAgentId: context.agentId, error: failure, public: true });
-        void this.createResultReturn(record, context.assignment, "failed", failure, turnId);
+        await this.createResultReturn(record, context.assignment, "failed", failure, turnId);
       }
     } else if (context.kind === "resultReturn" && context.assignment) {
       record.pendingAssignments.delete(context.assignment.assignmentId);
@@ -934,6 +968,7 @@ export class TeamRoomRuntimeManager {
       record.assignmentResults.set(context.assignment.assignmentId, {
         assignmentId: context.assignment.assignmentId,
         targetAgentId: context.assignment.targetAgentId,
+        phase: context.assignment.phase || "analysis",
         status: resultStatus,
         summary: resultSummary,
         sourceTurnId: context.resultSourceTurnId || turnId,
@@ -944,27 +979,59 @@ export class TeamRoomRuntimeManager {
           record.assignmentFailureReasons.set(context.assignment.assignmentId, `delegated_target_failed:${safeTaskError(resultSummary)}`);
         }
       }
-      await this.startFinalSummary(record);
-      if (!succeeded && !record.finalSummaryStarted) this.failTask(record, safeTaskError(turn?.error || turn?.status || "result_return_failed"));
-    } else if (!succeeded) {
-      this.failTask(record, safeTaskError(turn?.error || turn?.status || "turn_failed"));
+      if (!succeeded) {
+        this.failTask(record, safeTaskError(turn?.error || turn?.status || "result_return_failed"));
+      } else {
+        const nextStarted = await this.startNextQueuedAssignment(record);
+        if (!nextStarted) await this.startFinalSummary(record);
+      }
     } else if (context.agentId === record.coordinatorAgentId && context.kind === "initial") {
+      if (!succeeded) {
+        this.failTask(record, safeTaskError(turn?.error || turn?.status || "coordinator_turn_failed"));
+      } else {
       const hasAssignmentBlock = finalText.includes(TASK_ASSIGNMENT_START);
       const assignments = parseTaskAssignments(finalText);
-      if (assignments.length) await Promise.all(assignments.map((assignment) => this.spawnAssignment(record, assignment, turnId, context.threadId)));
-      if (hasAssignmentBlock && !assignments.length) {
+      const analysisBatch = assignments.length > 0 && assignments.length <= 3 && assignments.every((assignment) => assignment.phase === "analysis");
+      const executionBatch = assignments.length === 1 && assignments[0].phase === "execution";
+      if (assignments.length && (analysisBatch || executionBatch)) {
+        record.discussionMode = analysisBatch;
+        record.taskLane = analysisBatch ? "collaboration" : "fast";
+        record.assignmentQueue.push(...assignments.map((assignment) => ({ assignment, sourceTurnId: turnId, sourceThreadId: context.threadId })));
+        const started = await this.startNextQueuedAssignment(record);
+        if (!started && record.assignmentResults.size) await this.startFinalSummary(record);
+      } else if (hasAssignmentBlock) {
         this.emitRoomEvent("taskAssignmentRejected", { taskId: record.id, reason: "invalid_or_excess_assignment_blocks", public: true });
         if (!record.directAgentIds.size) this.recordAssignmentFailure(record, null, "invalid_or_excess_assignment_blocks", turnId);
       }
-    } else if (context.kind === "finalSummary" && !succeeded) {
-      this.failTask(record, safeTaskError(turn?.error || turn?.status || "final_summary_failed"));
-    }
-    if (context.kind === "finalSummary") {
-      record.finalSummaryCompleted = true;
-      if (succeeded && record.failedAssignments.size) {
-        const reasons = [...record.failedAssignments].map((assignmentId) => record.assignmentFailureReasons.get(assignmentId)).filter(Boolean);
-        this.failTask(record, reasons[0] || "delegated_target_failed");
       }
+    } else if (context.kind === "finalSummary") {
+      if (!succeeded) {
+        this.failTask(record, safeTaskError(turn?.error || turn?.status || "final_summary_failed"));
+      } else {
+        const hasAssignmentBlock = finalText.includes(TASK_ASSIGNMENT_START);
+        const assignments = parseTaskAssignments(finalText);
+        const executionAssignment = !record.executionRoundStarted && record.executionMode !== false
+          && assignments.length === 1 && assignments[0].phase === "execution"
+          ? assignments[0]
+          : null;
+        if (executionAssignment) {
+          record.executionRoundStarted = true;
+          record.finalSummaryStarted = false;
+          record.finalSummaryCompleted = false;
+          record.assignmentQueue.push({ assignment: executionAssignment, sourceTurnId: turnId, sourceThreadId: context.threadId });
+          const started = await this.startNextQueuedAssignment(record);
+          if (!started) await this.startFinalSummary(record);
+        } else if (hasAssignmentBlock) {
+          this.emitRoomEvent("taskAssignmentRejected", { taskId: record.id, reason: "final_summary_execution_assignment_invalid", public: true });
+          this.failTask(record, "final_summary_execution_assignment_invalid");
+        } else {
+          record.finalSummaryCompleted = true;
+          const executionFailure = [...record.assignmentResults.values()].find((result) => result.phase === "execution" && result.status === "failed");
+          if (executionFailure) this.failTask(record, record.assignmentFailureReasons.get(executionFailure.assignmentId) || "delegated_target_failed");
+        }
+      }
+    } else if (!succeeded) {
+      this.failTask(record, safeTaskError(turn?.error || turn?.status || "turn_failed"));
     }
     this.maybeFinishTask(record);
   }
@@ -1031,7 +1098,7 @@ export class TeamRoomRuntimeManager {
       const messages = this.turnMessagesById.get(turnId) || [];
       messages.push(messageText);
       this.turnMessagesById.set(turnId, messages.slice(-20));
-      const publicText = turnContext?.kind === "initial" && turnContext?.agentId === this.coordinatorAgent()?.id
+      const publicText = ["initial", "finalSummary"].includes(turnContext?.kind) && turnContext?.agentId === this.coordinatorAgent()?.id
         ? stripTaskAssignmentBlocks(messageText)
         : messageText;
       if (!publicText && turnContext?.public !== false) return;
@@ -1061,6 +1128,7 @@ export class TeamRoomRuntimeManager {
         public: turnContext?.public !== false,
         internal: turnContext?.internal === true,
         assignmentId: turnContext?.assignment?.assignmentId || null,
+        assignmentPhase: turnContext?.assignment?.phase || null,
       });
     } else if (event.method === "turn/completed") {
       this.flushAgentStream(turnId);
@@ -1078,6 +1146,7 @@ export class TeamRoomRuntimeManager {
         public: turnContext?.public !== false,
         internal: turnContext?.internal === true,
         assignmentId: turnContext?.assignment?.assignmentId || null,
+        assignmentPhase: turnContext?.assignment?.phase || null,
       });
       const finalText = this.turnMessagesById.get(turnId)?.at(-1) || "";
       void this.processCompletedTurn(turnId, params.turn || {}, turnContext, finalText);

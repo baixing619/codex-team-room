@@ -10,6 +10,7 @@ import {
   ChatsCircle,
   Check,
   CheckCircle,
+  CircleNotch,
   Code,
   Database,
   Eye,
@@ -32,6 +33,7 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { DEFAULT_THREADS, MODEL_OPTIONS } from "./data/defaults.js";
+import { reduceAgentActivity } from "./lib/agentActivity.js";
 import { decideParticipation } from "./lib/participation.js";
 import { addRoomMember, createProjectMember, createRoomAgents, createSafeMemberPrompt, removeRoomMember, replaceRoomMember, sanitizeRoomMessages } from "./lib/roomAgents.js";
 import { loadState, resetState, saveState } from "./lib/storage.js";
@@ -112,15 +114,24 @@ function applyTurnStartedContextReceipt(cursors, contextCursorUpdate, agentId, t
   return applyContextCursorUpdates(cursors, { receipt: contextCursorUpdate }, { [agentId]: threadId });
 }
 
-function taskProgressText(stage, memberName, turnKind) {
+function taskProgressText(stage, memberName, turnKind, assignmentPhase = null) {
   if (turnKind === "finalSummary") {
-    if (stage === "completed") return `${memberName}：汇总已完成`;
-    if (stage === "response_started") return `${memberName}：已开始生成最终汇总`;
-    if (stage === "responding" || stage === "response_received") return `${memberName}：正在回传最终汇总`;
-    return `${memberName}：已收到成员结果，正在汇总`;
+    if (stage === "completed") return `${memberName}：判断与汇总已完成`;
+    if (["responding", "response_received"].includes(stage)) return `${memberName}：正在回传判断结果`;
+    return `${memberName}：正在比较方案并作出判断`;
   }
-  if (stage === "delivered") return `${memberName}：已送达（真实 Codex 回合已启动）`;
-  if (stage === "working") return `${memberName}：成员处理中（收到真实运行活动）`;
+  if (turnKind === "delegatedTarget" && assignmentPhase === "analysis") {
+    if (stage === "completed") return `${memberName}：讨论结论已回流`;
+    if (["responding", "response_received"].includes(stage)) return `${memberName}：正在回传讨论结论`;
+    return `${memberName}：已收到，正在参与方案讨论`;
+  }
+  if (turnKind === "delegatedTarget" && assignmentPhase === "execution") {
+    if (stage === "completed") return `${memberName}：执行任务已完成`;
+    if (["responding", "response_received"].includes(stage)) return `${memberName}：正在回传执行结果`;
+    return `${memberName}：已收到，正在执行总控裁决后的任务`;
+  }
+  if (stage === "delivered") return `${memberName}：已收到，真实 Codex 回合已启动`;
+  if (stage === "working") return `${memberName}：正在处理`;
   if (stage === "response_started") return `${memberName}：已开始生成回复`;
   if (stage === "responding") return `${memberName}：正在回传（收到真实文字增量）`;
   if (stage === "response_received") return `${memberName}：已收到完整回复，正在结束本轮`;
@@ -129,7 +140,7 @@ function taskProgressText(stage, memberName, turnKind) {
   return `${memberName}：状态已更新`;
 }
 
-function applyTaskProgressEvent(state, { roomId, taskId, agentId, turnId, turnKind = "initial", stage, sequence = 0 } = {}) {
+function applyTaskProgressEvent(state, { roomId, taskId, agentId, turnId, turnKind = "initial", assignmentPhase = null, stage, sequence = 0 } = {}) {
   if (!roomId || !taskId || !agentId || !stage) return state;
   const agents = state.agentsByRoom?.[roomId] || [];
   const memberName = agents.find((agent) => agent.id === agentId)?.name || "成员";
@@ -148,7 +159,7 @@ function applyTaskProgressEvent(state, { roomId, taskId, agentId, turnId, turnKi
     agentId,
     turnId: turnId || null,
     time: nowLabel(),
-    text: taskProgressText(stage, memberName, turnKind),
+    text: taskProgressText(stage, memberName, turnKind, assignmentPhase),
   };
   const nextMessages = index >= 0
     ? messages.map((message, itemIndex) => itemIndex === index ? { ...message, ...nextMessage } : message)
@@ -743,7 +754,12 @@ function AgentRoster({ agents, onOpenAgent }) {
                 <span className={classNames("role-tag", `role-tag--${agent.color}`)}>{agent.name}</span>
               </div>
               <p>{agent.description}</p>
-              <div className="agent-status"><span className={classNames("status-dot", agent.status === "silent" ? "status-dot--gray" : "status-dot--green")} />{agent.statusLabel}</div>
+              <div className={classNames("agent-status", agent.activity?.active && "agent-status--working")}>
+                {agent.activity?.active
+                  ? <CircleNotch className="spin agent-work-spinner" size={15} weight="bold" />
+                  : <span className={classNames("status-dot", agent.activity?.status === "completed" ? "status-dot--green" : "status-dot--gray")} />}
+                {agent.activity?.label || "等待任务"}
+              </div>
               <div className="agent-model">模型：{MODEL_OPTIONS.find((item) => item.value === agent.model)?.label || agent.model}</div>
             </div>
           </button>
@@ -751,7 +767,7 @@ function AgentRoster({ agents, onOpenAgent }) {
       </div>
       <div className="silence-rule">
         <Sparkle size={18} />
-        <span><strong>自动静默规则</strong><small>职责无关或无新增信息时不发言</small></span>
+        <span><strong>双路线协作</strong><small>简单任务直接处理；复杂任务讨论后由总控裁决执行</small></span>
       </div>
     </aside>
   );
@@ -966,6 +982,7 @@ function Toast({ message }) {
 
 export function App() {
   const [state, setState] = useState(loadState);
+  const [agentActivityByRoom, setAgentActivityByRoom] = useState({});
   const [activeView, setActiveView] = useState("chat");
   const [activeThreadId, setActiveThreadId] = useState("global");
   const [draft, setDraft] = useState("");
@@ -1003,6 +1020,7 @@ export function App() {
   const activeRoom = state.rooms.find((room) => room.id === state.activeRoomId) || state.rooms[0];
   const threads = state.threadCache[activeRoom.id] || DEFAULT_THREADS;
   const agents = state.agentsByRoom?.[activeRoom.id] || [];
+  const rosterAgents = useMemo(() => agents.map((agent) => ({ ...agent, activity: agentActivityByRoom?.[activeRoom.id]?.[agent.id] || null })), [agents, agentActivityByRoom, activeRoom.id]);
   const writeLock = state.writeLocksByRoom?.[activeRoom.id] || null;
   const activeThread = threads.find((thread) => thread.id === activeThreadId) || threads[0];
   const messages = state.messagesByRoom[activeRoom.id] || [];
@@ -1199,6 +1217,10 @@ export function App() {
         const data = await response.json();
         if (cancelled || !data.events?.length) return;
         runtimeEventCursor.current = data.events.at(-1).sequence;
+        setAgentActivityByRoom((current) => data.events.reduce((next, event) => {
+          const roomId = event.roomId && stateRef.current.rooms.some((room) => room.id === event.roomId) ? event.roomId : null;
+          return roomId ? reduceAgentActivity(next, { ...event, roomId }) : next;
+        }, current));
         setState((current) => {
           let next = current;
           for (const event of data.events) {
@@ -1222,10 +1244,10 @@ export function App() {
                 contextCursorsByRoom: { ...next.contextCursorsByRoom, [roomId]: applyTurnStartedContextReceipt(acknowledged.cursors, event.contextCursorUpdate, event.agentId, event.threadId) },
                 pendingContextCursorsByRoom: { ...next.pendingContextCursorsByRoom, [roomId]: acknowledged.pending },
               };
-              next = applyTaskProgressEvent(next, { roomId, taskId: event.taskId, agentId: event.agentId, turnId: event.turnId, turnKind: event.turnKind, stage: "delivered", sequence: event.sequence });
+              next = applyTaskProgressEvent(next, { roomId, taskId: event.taskId, agentId: event.agentId, turnId: event.turnId, turnKind: event.turnKind, assignmentPhase: event.assignmentPhase, stage: "delivered", sequence: event.sequence });
             }
             if (event.type === "turnProgress") {
-              next = applyTaskProgressEvent(next, { roomId, taskId: event.taskId, agentId: event.agentId, turnId: event.turnId, turnKind: event.turnKind, stage: event.stage, sequence: event.sequence });
+              next = applyTaskProgressEvent(next, { roomId, taskId: event.taskId, agentId: event.agentId, turnId: event.turnId, turnKind: event.turnKind, assignmentPhase: event.assignmentPhase, stage: event.stage, sequence: event.sequence });
             }
             if (event.type === "agentMessageDelta" && event.public !== false && event.text) {
               next = applyAgentDeltaEvent(next, { roomId, taskId: event.taskId, agentId: event.agentId, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, text: event.text, sequence: event.sequence });
@@ -1278,6 +1300,11 @@ export function App() {
         const data = await response.json();
         if (cancelled || !data.events?.length) return;
         remoteEventCursor.current = data.events.at(-1).sequence;
+        setAgentActivityByRoom((current) => data.events.reduce((next, event) => {
+          const payload = event.payload || {};
+          const roomId = payload.roomId && stateRef.current.rooms.some((room) => room.id === payload.roomId) ? payload.roomId : null;
+          return roomId ? reduceAgentActivity(next, { ...payload, type: event.event_type, roomId, taskId: payload.taskId || event.task_id }) : next;
+        }, current));
         setState((current) => {
           let next = current;
           for (const event of data.events) {
@@ -1302,10 +1329,10 @@ export function App() {
                 contextCursorsByRoom: { ...next.contextCursorsByRoom, [roomId]: applyTurnStartedContextReceipt(acknowledged.cursors, payload.contextCursorUpdate, payload.agentId, payload.threadId) },
                 pendingContextCursorsByRoom: { ...next.pendingContextCursorsByRoom, [roomId]: acknowledged.pending },
               };
-              next = applyTaskProgressEvent(next, { roomId, taskId: event.task_id || payload.taskId, agentId: payload.agentId, turnId: payload.turnId, turnKind: payload.turnKind, stage: "delivered", sequence: event.sequence });
+              next = applyTaskProgressEvent(next, { roomId, taskId: event.task_id || payload.taskId, agentId: payload.agentId, turnId: payload.turnId, turnKind: payload.turnKind, assignmentPhase: payload.assignmentPhase, stage: "delivered", sequence: event.sequence });
             }
             if (event.event_type === "turnProgress") {
-              next = applyTaskProgressEvent(next, { roomId, taskId: event.task_id || payload.taskId, agentId: payload.agentId, turnId: payload.turnId, turnKind: payload.turnKind, stage: payload.stage, sequence: event.sequence });
+              next = applyTaskProgressEvent(next, { roomId, taskId: event.task_id || payload.taskId, agentId: payload.agentId, turnId: payload.turnId, turnKind: payload.turnKind, assignmentPhase: payload.assignmentPhase, stage: payload.stage, sequence: event.sequence });
             }
             if (event.event_type === "agentMessageDelta" && payload.public !== false && payload.text) {
               next = applyAgentDeltaEvent(next, { roomId, taskId: event.task_id || payload.taskId, agentId: payload.agentId, threadId: payload.threadId, turnId: payload.turnId, itemId: payload.itemId, text: payload.text, sequence: event.sequence });
@@ -1576,6 +1603,7 @@ export function App() {
     try {
       const status = await postJson("/api/runtime/disconnect", {});
       setRuntime(status);
+      setAgentActivityByRoom((current) => reduceAgentActivity(current, { type: "runtimeDisconnected", roomId: activeRoom.id }));
       setState((current) => reconcileApprovalState(applyApprovalLifecycleEvent(current, {
         roomId: activeRoom.id,
         source: "runtime",
@@ -1666,6 +1694,7 @@ export function App() {
         currentMessage: userMessage,
       });
       const silentNames = decisions.filter((item) => item.decision === "silent").map((item) => agents.find((agent) => agent.id === item.agentId)?.name).filter(Boolean);
+      const taskLane = decisions.find((item) => item.decision === "speak")?.lane || "fast";
       let dispatchLabel;
       let remoteTask = null;
       let localTurns = [];
@@ -1708,13 +1737,13 @@ export function App() {
           agentsByRoom: { ...current.agentsByRoom, [activeRoom.id]: (current.agentsByRoom?.[activeRoom.id] || []).map((agent) => ({
             ...agent,
             ...(localThreadIdsByAgentId[agent.id] ? { boundThreadId: localThreadIdsByAgentId[agent.id], threadBinding: agent.threadBinding || "auto" } : {}),
-            status: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "thinking" : "silent",
-            statusLabel: decisions.find((item) => item.agentId === agent.id)?.decision === "speak" ? "真实处理中" : "本轮静默",
           })) },
           messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [
             ...(current.messagesByRoom[activeRoom.id] || []),
             userMessage,
-            ...(silentNames.length ? [{ id: `silent-${Date.now()}`, kind: "system", time: nowLabel(), text: `${silentNames.join("、")}按当前项目发言策略保持静默` }] : []),
+            ...(silentNames.length ? [{ id: `silent-${Date.now()}`, kind: "system", time: nowLabel(), text: taskLane === "collaboration"
+              ? `${silentNames.join("、")}正在等待总控分析；只有收到真实任务单后才会激活`
+              : `${silentNames.join("、")}未被本次快速路线点名` }] : []),
             { id: `task-status-${taskId}`, kind: "system", taskId, taskStatus, time: nowLabel(), text: dispatchLabel },
           ] },
         };
@@ -1995,7 +2024,7 @@ export function App() {
         <RoomHeader room={activeRoom} rooms={state.rooms} activeView={activeView} activeThread={activeThread} onSelectRoom={selectRoom} />
         <div className="main-content">{renderCenter()}</div>
       </main>
-      {activeView === "chat" && activeThreadId === "global" ? <AgentRoster agents={agents} onOpenAgent={openAgentEditor} /> : null}
+      {activeView === "chat" && activeThreadId === "global" ? <AgentRoster agents={rosterAgents} onOpenAgent={openAgentEditor} /> : null}
 
       {importOpen ? <ImportProjectModal projects={projects} loading={projectsLoading} error={projectsError} connectedPaths={connectedPaths} onClose={() => setImportOpen(false)} onRefresh={loadProjects} onAttach={attachProject} /> : null}
       {openAgent ? <AgentDrawer agent={openAgent} bindingThreads={threads.filter((thread) => thread.kind === "codex")} isNew={Boolean(newMember)} onClose={() => { setOpenAgentId(null); setNewMember(null); }} onSave={saveAgent} /> : null}

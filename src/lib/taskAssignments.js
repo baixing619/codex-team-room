@@ -13,8 +13,10 @@ const ASSIGNMENT_FIELDS = new Set([
   "acceptanceCriteria",
   "visibility",
   "depth",
+  "phase",
 ]);
 const VISIBILITIES = new Set(["coordinator-only", "room"]);
+const ASSIGNMENT_PHASES = new Set(["analysis", "execution"]);
 
 function text(value, max = 4000) {
   return String(value ?? "").trim().slice(0, max);
@@ -36,6 +38,7 @@ function normalizeAssignment(raw) {
   if (Object.keys(raw).some((key) => !ASSIGNMENT_FIELDS.has(key))) return null;
   const depth = Number(raw.depth);
   const visibility = text(raw.visibility, 40) || "room";
+  const phase = text(raw.phase, 40) || "analysis";
   const assignment = {
     assignmentId: requiredText(raw.assignmentId, 160),
     parentTaskId: requiredText(raw.parentTaskId, 160),
@@ -44,9 +47,10 @@ function normalizeAssignment(raw) {
     acceptanceCriteria: criteria(raw.acceptanceCriteria),
     visibility: VISIBILITIES.has(visibility) ? visibility : null,
     depth: Number.isInteger(depth) ? depth : null,
+    phase: ASSIGNMENT_PHASES.has(phase) ? phase : null,
   };
   if (!assignment.assignmentId || !assignment.parentTaskId || !assignment.targetAgentId || !assignment.objective
-    || !assignment.acceptanceCriteria.length || !assignment.visibility || assignment.depth === null) return null;
+    || !assignment.acceptanceCriteria.length || !assignment.visibility || assignment.depth === null || !assignment.phase) return null;
   return assignment;
 }
 
@@ -120,7 +124,7 @@ export function formatTaskAssignment(value) {
   return `${TASK_ASSIGNMENT_START}\n${JSON.stringify(assignment)}\n${TASK_ASSIGNMENT_END}`;
 }
 
-export function formatTaskResult({ assignmentId, parentTaskId, targetAgentId, sourceTurnId, status, summary, acceptanceCriteria = [] } = {}) {
+export function formatTaskResult({ assignmentId, parentTaskId, targetAgentId, sourceTurnId, status, summary, acceptanceCriteria = [], phase = "analysis" } = {}) {
   const safeStatus = status === "succeeded" ? "succeeded" : "failed";
   const safeSummary = sanitizeTaskText(summary, 8000) || (safeStatus === "succeeded" ? "目标成员未提供摘要" : "目标成员任务失败");
   const body = {
@@ -131,6 +135,7 @@ export function formatTaskResult({ assignmentId, parentTaskId, targetAgentId, so
     status: safeStatus,
     summary: safeSummary,
     acceptanceCriteria: criteria(acceptanceCriteria),
+    phase: ASSIGNMENT_PHASES.has(phase) ? phase : "analysis",
   };
   return `${TASK_RESULT_START}\n${JSON.stringify(body)}\n${TASK_RESULT_END}`;
 }
@@ -148,6 +153,7 @@ export function parseTaskResult(value) {
     status,
     summary: sanitizeTaskText(raw.summary, 8000),
     acceptanceCriteria: criteria(raw.acceptanceCriteria),
+    phase: ASSIGNMENT_PHASES.has(raw.phase) ? raw.phase : "analysis",
   };
 }
 
