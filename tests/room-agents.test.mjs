@@ -61,7 +61,7 @@ test("migration removes only cached thread titles corrupted into question marks"
     },
   });
 
-  assert.deepEqual(migrated.threadCache["room-a"].map((thread) => thread.id), ["global", "valid"]);
+  assert.deepEqual(migrated.threadCache["room-a"].map((thread) => thread.id), ["global", "internal", "valid"]);
   assert.equal(isCorruptedThreadTitle("?? ??"), true);
   assert.equal(isCorruptedThreadTitle("问题？"), false);
   assert.equal(isCorruptedThreadTitle("?"), false);

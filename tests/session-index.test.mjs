@@ -164,7 +164,7 @@ test("hides every spawned subagent session from the standard conversation index"
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test("hides Team Room managed member sessions from normal project history", async () => {
+test("keeps Team Room managed standard conversations visible while subagents stay separate", async () => {
   const previousHome = process.env.CODEX_HOME;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-team-room-internal-thread-test-"));
   const sessions = path.join(home, "sessions", "2026", "08", "01");
@@ -179,8 +179,9 @@ test("hides Team Room managed member sessions from normal project history", asyn
   process.env.CODEX_HOME = home;
   const indexModule = await import(`../server/codexSessionIndex.mjs?internal-thread-test=${Date.now()}`);
 
-  assert.equal(indexModule.listThreads(projectPath).length, 0);
-  assert.equal(indexModule.listProjects().length, 0);
+  assert.equal(indexModule.listThreads(projectPath).length, 1);
+  assert.match(indexModule.listThreads(projectPath)[0].title, /^\[TEAM_ROOM_SHARED_CONTEXT_V1\]/);
+  assert.equal(indexModule.listProjects().length, 1);
 
   if (previousHome === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = previousHome;
