@@ -150,6 +150,7 @@ function createApprovalDb() {
 function createAttachmentTaskEnv() {
   const objects = new Map();
   const tasks = new Map();
+  const events = [];
   const deletedObjects = [];
   const attachments = {
     async put(key, value, options) {
@@ -166,6 +167,7 @@ function createAttachmentTaskEnv() {
       const object = objects.get(key);
       if (!object) return null;
       return {
+        size: object.bytes.byteLength,
         customMetadata: { ...object.customMetadata },
         arrayBuffer: async () => object.bytes.slice().buffer,
       };
@@ -176,12 +178,17 @@ function createAttachmentTaskEnv() {
     },
   };
   const db = {
-    batch: async () => [],
+    batch: async (items) => Promise.all((items || []).map((item) => item.run())),
     prepare(sql) {
       let values = [];
       return {
         bind(...next) { values = next; return this; },
         async run() {
+          if (sql.startsWith("INSERT OR IGNORE INTO remote_events")) {
+            const [user_id, device_id, task_id, event_id, event_type, payload_json] = values;
+            if (!events.some((event) => event.event_id === event_id)) events.push({ sequence: events.length + 1, user_id, device_id, task_id, event_id, event_type, payload_json, created_at: "2026-08-01 00:00:02" });
+            return { meta: { changes: 1 } };
+          }
           if (sql.startsWith("INSERT INTO remote_tasks")) {
             const [id, user_id, room_id, message_id, cwd, text, decisions_json, agents_json, attachments_json, shared_context_json] = values;
             tasks.set(id, { id, user_id, room_id, message_id, cwd, text, decisions_json, agents_json, attachments_json, shared_context_json, status: "pending", created_at: "2026-08-01 00:00:00" });
@@ -202,6 +209,10 @@ function createAttachmentTaskEnv() {
           return { meta: { changes: 0 } };
         },
         async first() {
+          if (sql.startsWith("SELECT user_id FROM remote_tasks WHERE id = ?")) {
+            const task = tasks.get(values[0]);
+            return task ? { user_id: task.user_id } : null;
+          }
           if (sql.includes("FROM remote_tasks WHERE status = 'pending'")) {
             return Array.from(tasks.values()).find((task) => task.status === "pending") || null;
           }
@@ -214,6 +225,10 @@ function createAttachmentTaskEnv() {
           }
           return null;
         },
+        async all() {
+          if (sql.includes("FROM remote_events WHERE user_id = ?")) return { results: events.filter((event) => event.user_id === values[0] && event.sequence > Number(values[1] || 0)) };
+          return { results: [] };
+        },
       };
     },
   };
@@ -221,6 +236,7 @@ function createAttachmentTaskEnv() {
     env: { DB: db, ATTACHMENTS: attachments, TEAM_ROOM_DEVICE_SECRET: "device-secret" },
     objects,
     tasks,
+    events,
     deletedObjects,
   };
 }
@@ -697,6 +713,48 @@ test("stores uploaded R2 attachments and shared context with a task, serves them
   assert.equal(objects.has(`site-owner/${attachment.id}`), false);
   assert.deepEqual(deletedObjects, [`site-owner/${attachment.id}`]);
   assert.equal(tasks.get(taskId).status, "succeeded");
+});
+
+test("stores member output files privately and exposes only safe preview metadata to the owner", async () => {
+  const { env } = createAttachmentTaskEnv();
+  const created = await worker.fetch(new Request("https://example.test/api/remote/tasks", {
+    method: "POST",
+    headers: { origin: "https://example.test", "content-type": "application/json" },
+    body: JSON.stringify({
+      roomId: "room-output",
+      messageId: "message-output",
+      cwd: "G:\\output-project",
+      text: "生成预览",
+      decisions: [{ agentId: "developer", decision: "speak" }],
+      agents: [{ id: "developer" }],
+    }),
+  }), env);
+  const taskId = (await created.json()).task.id;
+  const artifactId = "output-8b83a7a0-44fb-4d31-8cb3-055a6317edb2";
+  const bytes = Buffer.from("private-image-bytes");
+  const uploaded = await worker.fetch(new Request("https://example.test/api/device/output-attachments", {
+    method: "POST",
+    headers: { "x-team-room-device-secret": "device-secret", "content-type": "application/json" },
+    body: JSON.stringify({ taskId, agentId: "developer", artifactId, name: "效果图.png", type: "text/html", size: bytes.length, dataBase64: bytes.toString("base64") }),
+  }), env);
+  assert.equal(uploaded.status, 201);
+  assert.equal((await uploaded.json()).attachment.type, "image/png");
+
+  const eventUpload = await worker.fetch(new Request("https://example.test/api/device/events", {
+    method: "POST",
+    headers: { "x-team-room-device-secret": "device-secret", "content-type": "application/json" },
+    body: JSON.stringify({ deviceId: "device-1", events: [{ taskId, type: "agentMessage", eventId: "output-event", payload: { taskId, roomId: "room-output", agentId: "developer", text: "已交付图片：效果图", attachments: [{ id: artifactId, name: "效果图.png", type: "text/html", size: bytes.length, url: "javascript:alert(1)" }] } }] }),
+  }), env);
+  assert.equal(eventUpload.status, 200);
+  const eventsResponse = await worker.fetch(new Request("https://example.test/api/remote/events?after=0", { headers: { origin: "https://example.test" } }), env);
+  const storedPayload = (await eventsResponse.json()).events[0].payload;
+  assert.deepEqual(storedPayload.attachments, [{ id: artifactId, name: "效果图.png", type: "image/png", size: bytes.length, kind: "output", url: `/api/output-attachments/${artifactId}` }]);
+
+  const preview = await worker.fetch(new Request(`https://example.test/api/output-attachments/${artifactId}`, { headers: { origin: "https://example.test" } }), env);
+  assert.equal(preview.status, 200);
+  assert.equal(preview.headers.get("content-type"), "image/png");
+  assert.match(preview.headers.get("content-disposition"), /^inline/);
+  assert.equal(Buffer.from(await preview.arrayBuffer()).toString("utf8"), "private-image-bytes");
 });
 
 test("keeps every source input required by Sites packaging", async () => {

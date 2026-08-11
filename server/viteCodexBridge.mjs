@@ -1,8 +1,11 @@
+import fs from "node:fs";
 import { listProjects, listThreads, localBridgeStatus, readVisibleMessages } from "./codexSessionIndex.mjs";
 import { getCodexRuntimeStatus } from "./codexAppServerRuntime.mjs";
 import { teamRoomRuntime } from "./teamRoomRuntimeManager.mjs";
 import { RemotePairingBridge } from "./remotePairingBridge.mjs";
 import { LocalAttachmentStore, MAX_ATTACHMENT_BYTES } from "./localAttachmentStore.mjs";
+import { OutputArtifactStore } from "./outputArtifactStore.mjs";
+import { sanitizeTaskText } from "../src/lib/taskAssignments.js";
 
 function sendJson(response, status, value) {
   response.statusCode = status;
@@ -39,9 +42,11 @@ export function codexBridgePlugin() {
     name: "codex-team-room-local-bridge",
     configureServer(server) {
       const attachmentStore = new LocalAttachmentStore();
+      const outputArtifactStore = new OutputArtifactStore();
       const remotePairing = new RemotePairingBridge({
         runtime: teamRoomRuntime,
         indexProvider: { listProjects, listThreads, readVisibleMessages },
+        outputArtifactStore,
       });
       remotePairing.start();
       server.httpServer?.once("close", () => remotePairing.stop());
@@ -74,7 +79,29 @@ export function codexBridgePlugin() {
               .catch((error) => sendJson(response, error.message === "sync_conflict" ? 409 : 503, { error: error.message === "sync_conflict" ? "sync_conflict" : "sync_unavailable", message: error.message }));
           }
           if (request.method === "GET" && url.pathname === "/api/runtime/events") {
-            return sendJson(response, 200, { events: teamRoomRuntime.listEvents(Number(url.searchParams.get("after") || 0)) });
+            const events = teamRoomRuntime.listEvents(Number(url.searchParams.get("after") || 0)).map((event) => {
+              if (event.type === "agentMessage") {
+                const resolved = outputArtifactStore.resolveMessage(event.text, teamRoomRuntime.cwd);
+                return { ...event, text: sanitizeTaskText(resolved.text, 12_000), attachments: resolved.attachments };
+              }
+              if (event.type === "agentMessageDelta") return { ...event, text: sanitizeTaskText(event.text, 12_000) };
+              return event;
+            });
+            return sendJson(response, 200, { events });
+          }
+          const outputAttachment = url.pathname.match(/^\/api\/output-attachments\/([^/]+)$/);
+          if (request.method === "GET" && outputAttachment) {
+            const artifact = outputArtifactStore.get(decodeURIComponent(outputAttachment[1]));
+            if (!artifact) return sendJson(response, 404, { error: "output_attachment_not_found" });
+            const inline = artifact.type.startsWith("image/") || artifact.type === "application/pdf";
+            response.statusCode = 200;
+            response.setHeader("content-type", artifact.type);
+            response.setHeader("content-length", artifact.size);
+            response.setHeader("content-disposition", `${inline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(artifact.name)}`);
+            response.setHeader("cache-control", "private, max-age=60");
+            response.setHeader("x-content-type-options", "nosniff");
+            response.setHeader("content-security-policy", "sandbox; default-src 'none'");
+            return fs.createReadStream(artifact.path).pipe(response);
           }
           if (request.method === "POST" && url.pathname === "/api/attachments") {
             return readBinaryBody(request)

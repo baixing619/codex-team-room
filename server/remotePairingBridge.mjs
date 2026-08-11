@@ -197,7 +197,7 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
   if (event.type === "coordinatorDecisionLocked") return { ...common, turnId: event.turnId || null, status: "locked", public: true };
   if (event.type === "agentMessage") return {
     ...common,
-    text: event.text || "",
+    text: sanitizeTaskText(event.text || "", 12_000),
     threadId: event.threadId,
     turnId: event.turnId,
     ...(event.public !== undefined ? { public: event.public !== false } : {}),
@@ -258,9 +258,10 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
 }
 
 export class RemotePairingBridge {
-  constructor({ runtime, indexProvider = null, configPath = path.resolve(".team-room", "pairing.json"), fetchImpl = fetch, nativeRequestImpl = windowsNativeRequest, timers = globalThis, requestTimeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+  constructor({ runtime, indexProvider = null, outputArtifactStore = null, configPath = path.resolve(".team-room", "pairing.json"), fetchImpl = fetch, nativeRequestImpl = windowsNativeRequest, timers = globalThis, requestTimeoutMs = REQUEST_TIMEOUT_MS } = {}) {
     this.runtime = runtime;
     this.indexProvider = indexProvider;
+    this.outputArtifactStore = outputArtifactStore;
     this.configPath = configPath;
     this.fetchImpl = fetchImpl;
     this.nativeRequestImpl = nativeRequestImpl;
@@ -276,6 +277,7 @@ export class RemotePairingBridge {
     this.lastTaskId = null;
     this.activeTasks = new Map();
     this.finishedTasks = new Map();
+    this.taskCwds = new Map();
     this.lastError = null;
     this.nativePreferred = false;
     this.requestTimeoutMs = Math.max(1, Number(requestTimeoutMs) || REQUEST_TIMEOUT_MS);
@@ -417,6 +419,8 @@ export class RemotePairingBridge {
     this.lastTaskId = task.id;
     try {
       const cwd = task.cwd || this.config.cwd;
+      this.taskCwds.set(task.id, cwd);
+      if (this.taskCwds.size > 50) this.taskCwds.delete(this.taskCwds.keys().next().value);
       const projects = this.indexProvider?.listProjects?.() || [];
       const knownProject = cwd.toLowerCase() === this.config.cwd.toLowerCase()
         || projects.some((project) => project.exists !== false && String(project.path).toLowerCase() === cwd.toLowerCase());
@@ -507,16 +511,13 @@ export class RemotePairingBridge {
         const events = this.runtime.listEvents(this.eventCursor)
           .filter((event) => Number(event?.sequence) > this.eventCursor);
         if (!events.length) return;
+        const serializedEvents = [];
+        for (const event of events) serializedEvents.push(await this.serializeRuntimeEvent(event));
         await this.request("/api/device/events", {
           method: "POST",
           body: JSON.stringify({
             deviceId: this.config.deviceId,
-            events: events.map((event) => ({
-              taskId: event.taskId || this.lastTaskId,
-              type: event.type,
-              ...(event.eventId ? { eventId: event.eventId } : {}),
-              payload: sanitizeRuntimeEvent(event),
-            })),
+            events: serializedEvents,
           }),
         });
         const nextCursor = Math.max(...events.map((event) => Number(event.sequence)));
@@ -527,6 +528,45 @@ export class RemotePairingBridge {
       this.eventUploadPromise = null;
     });
     return this.eventUploadPromise;
+  }
+
+  async uploadOutputArtifact(artifact, event) {
+    const buffer = fs.readFileSync(artifact.path);
+    if (!buffer.length || buffer.length > MAX_ATTACHMENT_BYTES) throw new Error("invalid_output_attachment_size");
+    const value = await this.request("/api/device/output-attachments", {
+      method: "POST",
+      requestTimeoutMs: 45_000,
+      body: JSON.stringify({
+        taskId: event.taskId || this.lastTaskId,
+        agentId: event.agentId || null,
+        artifactId: artifact.id,
+        name: artifact.name,
+        type: artifact.type,
+        size: buffer.length,
+        dataBase64: buffer.toString("base64"),
+      }),
+    });
+    if (!value.attachment?.id) throw new Error("output_attachment_upload_failed");
+    return { ...value.attachment, kind: "output", url: `/api/output-attachments/${encodeURIComponent(value.attachment.id)}` };
+  }
+
+  async serializeRuntimeEvent(event) {
+    const payload = sanitizeRuntimeEvent(event);
+    if (event.type === "agentMessage" && this.outputArtifactStore) {
+      const cwd = this.taskCwds.get(event.taskId) || this.runtime?.cwd || this.config?.cwd;
+      const resolved = this.outputArtifactStore.resolveMessage(event.text, cwd, { urlFor: () => null });
+      if (resolved.artifacts.length) {
+        payload.text = sanitizeTaskText(resolved.text, 12_000);
+        payload.attachments = [];
+        for (const artifact of resolved.artifacts) payload.attachments.push(await this.uploadOutputArtifact(artifact, event));
+      }
+    }
+    return {
+      taskId: event.taskId || this.lastTaskId,
+      type: event.type,
+      ...(event.eventId ? { eventId: event.eventId } : {}),
+      payload,
+    };
   }
 
   async processApproval(approval) {

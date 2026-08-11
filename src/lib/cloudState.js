@@ -45,7 +45,7 @@ export function createCloudSnapshot(state) {
       systemPrompt: text(agent.systemPrompt, 12_000), boundThreadId: agent.boundThreadId ? text(agent.boundThreadId, 200) : null,
     }))])),
     messagesByRoom: mapRooms(rooms, state.messagesByRoom, (message) => ({
-      ...message, id: text(message.id, 160), text: text(message.text, 6_000), attachments: (message.attachments || []).slice(0, 4).map(({ id, name, type, size }) => ({ id, name, type, size })),
+      ...message, id: text(message.id, 160), text: text(message.text, 6_000), attachments: (message.attachments || []).slice(0, 4).map(({ id, name, type, size, kind }) => ({ id, name, type, size, ...(kind === "output" ? { kind: "output" } : {}) })),
     }), MAX_MESSAGES_PER_ROOM),
     commandsByRoom,
     knowledgeByRoom: Object.fromEntries(rooms.map((room) => [room.id, (state.knowledgeByRoom?.[room.id] || []).slice(0, MAX_KNOWLEDGE_PER_ROOM).map((entry) => ({

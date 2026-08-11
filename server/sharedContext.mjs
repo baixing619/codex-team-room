@@ -154,7 +154,7 @@ function inlineAttachmentText(attachment) {
 export function buildTurnInput({ text, sharedContext, attachments = [] }) {
   const input = [{
     type: "text",
-    text: `${formatSharedContext(sharedContext)}\n\n用户当前请求：\n${limitedText(text, 20_000)}`,
+    text: `${formatSharedContext(sharedContext)}\n\n交付规则：网页使用完整的 https:// 地址；需要把当前项目内已经生成的文件交付到房间时，用 Markdown 链接 [说明](项目内相对路径)，图片用 ![说明](项目内相对路径)。只链接你确实要交付、真实存在且位于当前项目目录内的文件，不要输出本机绝对路径。\n\n用户当前请求：\n${limitedText(text, 20_000)}`,
   }];
   for (const attachment of Array.isArray(attachments) ? attachments.slice(0, 4) : []) {
     const attachmentPath = typeof attachment?.path === "string" ? attachment.path : "";

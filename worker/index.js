@@ -6,6 +6,7 @@ const MAX_BODY_BYTES = 256 * 1024;
 const MAX_INDEX_RESULT_BYTES = 1024 * 1024;
 const MAX_SYNC_STATE_BYTES = 1536 * 1024;
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_OUTPUT_ATTACHMENT_JSON_BYTES = 14 * 1024 * 1024;
 const MAX_ATTACHMENTS = 4;
 const ONLINE_WINDOW_MS = 30_000;
 const CLAIM_LEASE_SECONDS = 30;
@@ -15,6 +16,30 @@ const ALLOWED_APPROVAL_DECISIONS = new Set(["accept", "decline"]);
 const ALLOWED_INDEX_REQUESTS = new Set(["projects", "threads", "messages"]);
 const TASK_RUNNING_STATUS = "running";
 const TASK_TERMINAL_STATUSES = new Set(["succeeded", "failed"]);
+const OUTPUT_ATTACHMENT_ID = /^output-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const OUTPUT_MIME_BY_EXTENSION = new Map([
+  ["png", "image/png"], ["jpg", "image/jpeg"], ["jpeg", "image/jpeg"], ["gif", "image/gif"], ["webp", "image/webp"], ["avif", "image/avif"], ["bmp", "image/bmp"],
+  ["pdf", "application/pdf"], ["docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"], ["xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"], ["pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"], ["zip", "application/zip"],
+  ["html", "text/html; charset=utf-8"], ["css", "text/css; charset=utf-8"], ["json", "application/json; charset=utf-8"], ["xml", "application/xml; charset=utf-8"], ["csv", "text/csv; charset=utf-8"],
+]);
+
+function safeOutputName(value) {
+  return (String(value || "attachment").split(/[\\/]/).at(-1).replace(/[<>:"|?*\u0000-\u001f]/g, "_").trim().slice(0, 180) || "attachment");
+}
+
+function safeOutputType(name, requested = "") {
+  const extension = safeOutputName(name).toLowerCase().split(".").at(-1);
+  if (OUTPUT_MIME_BY_EXTENSION.has(extension)) return OUTPUT_MIME_BY_EXTENSION.get(extension);
+  if (["txt", "md", "mdx", "tsv", "log", "yaml", "yml", "ini", "toml", "sql", "js", "jsx", "mjs", "cjs", "ts", "tsx", "py", "java", "go", "rs", "c", "h", "cpp", "hpp", "cs", "php", "rb", "swift", "kt", "gradle"].includes(extension)) return "text/plain; charset=utf-8";
+  return String(requested || "") === "application/octet-stream" ? "application/octet-stream" : "application/octet-stream";
+}
+
+function decodeBase64Bytes(value) {
+  const binary = atob(String(value || ""));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
 
 function sanitizeTaskError(value) {
   return String(value || "remote_task_failed")
@@ -169,6 +194,14 @@ function sanitizeRemoteEventPayload(type, payload) {
     if (result.reason != null) result.reason = sanitizeTaskError(result.reason);
     delete result.cwd;
   }
+  if (type === "agentMessage") {
+    result.attachments = (Array.isArray(result.attachments) ? result.attachments : []).slice(0, MAX_ATTACHMENTS).flatMap((attachment) => {
+      const id = String(attachment?.id || "");
+      if (!OUTPUT_ATTACHMENT_ID.test(id)) return [];
+      const name = safeOutputName(attachment?.name);
+      return [{ id, name, type: safeOutputType(name, attachment?.type), size: Math.max(0, Number(attachment?.size) || 0), kind: "output", url: `/api/output-attachments/${encodeURIComponent(id)}` }];
+    });
+  }
   return result;
 }
 
@@ -232,6 +265,27 @@ async function handleOwnerApi(request, env, url) {
   if (request.method === "DELETE" && ownerAttachment) {
     if (env.ATTACHMENTS) await env.ATTACHMENTS.delete(`${userId}/${decodeURIComponent(ownerAttachment[1])}`);
     return json({ ok: true });
+  }
+
+  const ownerOutputAttachment = url.pathname.match(/^\/api\/output-attachments\/([^/]+)$/);
+  if (request.method === "GET" && ownerOutputAttachment) {
+    if (!env.ATTACHMENTS) return json({ error: "attachment_storage_unavailable" }, 503);
+    const id = decodeURIComponent(ownerOutputAttachment[1]);
+    if (!OUTPUT_ATTACHMENT_ID.test(id)) return json({ error: "output_attachment_not_found" }, 404);
+    const object = await env.ATTACHMENTS.get(`${userId}/outputs/${id}`);
+    if (!object || object.customMetadata?.userId !== userId) return json({ error: "output_attachment_not_found" }, 404);
+    const name = safeOutputName(object.customMetadata?.name);
+    const type = safeOutputType(name, object.customMetadata?.type);
+    const inline = type.startsWith("image/") || type === "application/pdf";
+    const headers = new Headers({
+      "content-type": type,
+      "content-disposition": `${inline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(name)}`,
+      "cache-control": "private, max-age=300",
+      "x-content-type-options": "nosniff",
+      "content-security-policy": "sandbox; default-src 'none'",
+    });
+    if (object.size) headers.set("content-length", String(object.size));
+    return new Response(object.body || await object.arrayBuffer(), { status: 200, headers });
   }
 
   if (request.method === "GET" && url.pathname === "/api/pair/status") {
@@ -440,6 +494,28 @@ async function handleDeviceApi(request, env, url) {
 
   if (request.method === "GET" && url.pathname === "/api/device/state") return json(await readOwnerState(env));
   if (request.method === "PUT" && url.pathname === "/api/device/state") return writeOwnerState(request, env);
+
+  if (request.method === "POST" && url.pathname === "/api/device/output-attachments") {
+    if (!env.ATTACHMENTS) return json({ error: "attachment_storage_unavailable" }, 503);
+    const body = await readJson(request, MAX_OUTPUT_ATTACHMENT_JSON_BYTES);
+    const taskId = String(body.taskId || "").slice(0, 160);
+    const artifactId = String(body.artifactId || "");
+    if (!taskId || !OUTPUT_ATTACHMENT_ID.test(artifactId)) return json({ error: "invalid_output_attachment" }, 400);
+    const task = await env.DB.prepare("SELECT user_id FROM remote_tasks WHERE id = ?").bind(taskId).first();
+    if (!task?.user_id) return json({ error: "event_task_not_found" }, 409);
+    const key = `${task.user_id}/outputs/${artifactId}`;
+    const existing = await env.ATTACHMENTS.head(key);
+    if (existing) {
+      return json({ attachment: { id: artifactId, name: existing.customMetadata?.name || "attachment", type: existing.customMetadata?.type || "application/octet-stream", size: Number(existing.customMetadata?.size || existing.size || 0) }, reused: true });
+    }
+    let bytes;
+    try { bytes = decodeBase64Bytes(body.dataBase64); } catch { return json({ error: "invalid_output_attachment_data" }, 400); }
+    if (!bytes.length || bytes.length > MAX_ATTACHMENT_BYTES || (Number(body.size) || 0) !== bytes.length) return json({ error: "invalid_output_attachment_size" }, 400);
+    const name = safeOutputName(body.name);
+    const type = safeOutputType(name, body.type);
+    await env.ATTACHMENTS.put(key, bytes, { httpMetadata: { contentType: type }, customMetadata: { userId: task.user_id, taskId, agentId: String(body.agentId || "").slice(0, 160), name, type, size: String(bytes.length) } });
+    return json({ attachment: { id: artifactId, name, type, size: bytes.length } }, 201);
+  }
 
   const deviceAttachment = url.pathname.match(/^\/api\/device\/attachments\/([^/]+)$/);
   if (request.method === "GET" && deviceAttachment) {
