@@ -194,6 +194,7 @@ export function sanitizeRuntimeEvent(event, projectLabel = "已配对项目") {
   if (["taskStarted", "taskWaitingApproval", "taskCompleted", "taskFailed"].includes(event.type)) {
     return { ...common, status: event.status, error: event.error ? safeRemoteTaskError(event.error) : null };
   }
+  if (event.type === "coordinatorDecisionLocked") return { ...common, turnId: event.turnId || null, status: "locked", public: true };
   if (event.type === "agentMessage") return {
     ...common,
     text: event.text || "",

@@ -104,7 +104,8 @@ test("collaboration route discusses sequentially, coordinator judges, then one e
   assert.ok(firstTarget);
   assert.equal(started(manager, (event) => event.assignmentId === "analysis-reviewer"), undefined);
   assert.equal(firstTarget.assignmentPhase, "analysis");
-  await complete(protocol, firstTarget, "方案A：改运行时边界，优点是不会误激活。" );
+  const completeFirstOutput = `方案A：改运行时边界。${"完整细节".repeat(600)}结论尾标记`;
+  await complete(protocol, firstTarget, completeFirstOutput);
 
   const firstReturn = started(manager, (event) => event.turnKind === "resultReturn" && event.assignmentId === "analysis-developer");
   await complete(protocol, firstReturn, "已接收方案A");
@@ -112,20 +113,29 @@ test("collaboration route discusses sequentially, coordinator judges, then one e
   assert.ok(secondTarget);
   const secondInput = protocol.startedTurns.find((turn) => turn.clientUserMessageId === "assignment-analysis-reviewer");
   assert.match(secondInput.text, /方案A/);
+  assert.match(secondInput.text, /结论尾标记/);
+  assert.match(secondInput.text, /异议：/);
+  assert.match(secondInput.text, /不得为了异议而异议/);
   assert.equal(secondTarget.assignmentPhase, "analysis");
-  await complete(protocol, secondTarget, "同意运行时边界，并建议加真实事件状态。" );
+  await complete(protocol, secondTarget, "异议：方案A没有说明迟到完成事件的幂等处理。建议用 turnId 拒绝旧事件。" );
 
   const secondReturn = started(manager, (event) => event.turnKind === "resultReturn" && event.assignmentId === "analysis-reviewer");
   await complete(protocol, secondReturn, "已接收审核结论");
   const firstSummary = started(manager, (event) => event.turnKind === "finalSummary");
   assert.ok(firstSummary);
+  const firstSummaryInput = protocol.startedTurns.find((turn) => turn.clientUserMessageId === "summary-task-collab-1");
+  assert.match(firstSummaryInput.text, /异议：方案A没有说明/);
+  assert.match(firstSummaryInput.text, /逐条判断所有以“异议：”开头/);
 
   const execution = formatTaskAssignment({ assignmentId: "execute-developer", parentTaskId: "task-collab", targetAgentId: "developer", objective: "按裁决实现方案", acceptanceCriteria: ["完成必要验证"], visibility: "room", depth: 1, phase: "execution" });
   await complete(protocol, firstSummary, `采用方案A。\n${execution}`);
+  assert.equal(manager.listEvents().filter((event) => event.type === "coordinatorDecisionLocked").length, 1);
   const executionTarget = started(manager, (event) => event.turnKind === "delegatedTarget" && event.assignmentId === "execute-developer");
   assert.ok(executionTarget);
   assert.equal(executionTarget.assignmentPhase, "execution");
-  assert.equal(protocol.startedTurns.find((turn) => turn.clientUserMessageId === "assignment-execute-developer").agent.permission, "request-write");
+  const executionInput = protocol.startedTurns.find((turn) => turn.clientUserMessageId === "assignment-execute-developer");
+  assert.equal(executionInput.agent.permission, "request-write");
+  assert.match(executionInput.text, /异议窗口已经关闭/);
   await complete(protocol, executionTarget, "实现和必要验证已完成");
 
   const executionReturn = started(manager, (event) => event.turnKind === "resultReturn" && event.assignmentId === "execute-developer");

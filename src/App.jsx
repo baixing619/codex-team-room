@@ -130,7 +130,7 @@ function taskProgressText(stage, memberName, turnKind, assignmentPhase = null) {
     if (["responding", "response_received"].includes(stage)) return `${memberName}：正在回传执行结果`;
     return `${memberName}：已收到，正在执行总控裁决后的任务`;
   }
-  if (stage === "delivered") return `${memberName}：已收到，真实 Codex 回合已启动`;
+  if (stage === "delivered") return `${memberName}：已收到`;
   if (stage === "working") return `${memberName}：正在处理`;
   if (stage === "response_started") return `${memberName}：已开始生成回复`;
   if (stage === "responding") return `${memberName}：正在回传（收到真实文字增量）`;
@@ -209,6 +209,20 @@ function applyCoordinatorActionBlocked(state, { roomId, taskId, sequence = "now"
   const messageId = `coordinator-action-blocked-${taskId || sequence}`;
   if (messages.some((message) => message.id === messageId)) return state;
   return { ...state, messagesByRoom: { ...state.messagesByRoom, [roomId]: [...messages, { id: messageId, kind: "system", taskId: taskId || null, time: nowLabel(), text: "总控的本机操作已自动取消，正在转为分析与委派。" }] } };
+}
+
+function applyCoordinatorDecisionLocked(state, { roomId, taskId, sequence = "now" } = {}) {
+  if (!roomId || !taskId) return state;
+  const messages = state.messagesByRoom?.[roomId] || [];
+  const messageId = `coordinator-decision-locked-${taskId}`;
+  if (messages.some((message) => message.id === messageId)) return state;
+  return {
+    ...state,
+    messagesByRoom: {
+      ...state.messagesByRoom,
+      [roomId]: [...messages, { id: messageId, kind: "system", taskId, progressSequence: Number(sequence || 0), time: nowLabel(), text: "总控已拍板，异议窗口已关闭；后续只允许执行既定方案或结束任务。" }],
+    },
+  };
 }
 
 async function postJson(url, body) {
@@ -667,15 +681,31 @@ function ChatView({
   canSend,
   connectionLabel,
 }) {
-  const endRef = useRef(null);
+  const scrollRef = useRef(null);
   const visibleCommands = visibleApprovalCommands(commands);
+  const messageScrollTrigger = messages.map((message) => [
+    message.id,
+    String(message.text || "").length,
+    message.progressSequence || 0,
+    message.streaming === true ? 1 : 0,
+    message.taskStatus || "",
+    message.taskProgress || "",
+  ].join(":")).join("|");
+  const approvalScrollTrigger = [
+    ...visibleCommands.map((command) => [command.id, command.status, command.error || "", command.updatedAt || ""].join(":")),
+    `lock:${writeLock?.agentId || ""}:${writeLock?.commandId || writeLock?.itemId || ""}`,
+  ].join("|");
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, [messages.length, visibleCommands.length]);
+    const frame = window.requestAnimationFrame(() => {
+      const scroller = scrollRef.current;
+      if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [messageScrollTrigger, approvalScrollTrigger]);
 
   return (
     <div className="chat-layout">
-      <div className="message-scroll">
+      <div className="message-scroll" ref={scrollRef}>
         {messages.map((message) => <MessageItem key={message.id} message={message} agents={agents} />)}
         {visibleCommands.map((command) => {
           const agent = agents.find((item) => item.id === command.agentId) || { id: command.agentId, name: "已移除成员", avatar: "/assets/agents/agent-researcher.png" };
@@ -691,7 +721,6 @@ function ChatView({
             />
           );
         })}
-        <div ref={endRef} />
       </div>
       <Composer
         value={draft}
@@ -1268,6 +1297,7 @@ export function App() {
               next = applyTaskWarningEvent(next, { roomId, taskId: event.taskId, type: event.type, reason: event.reason || event.error || "委派失败", sequence: event.sequence });
             }
             if (event.type === "coordinatorActionBlocked") next = applyCoordinatorActionBlocked(next, { roomId, taskId: event.taskId, sequence: event.sequence });
+            if (event.type === "coordinatorDecisionLocked") next = applyCoordinatorDecisionLocked(next, { roomId, taskId: event.taskId, sequence: event.sequence });
             if (event.type === "agentMessage" && event.public !== false && event.text) {
               const stableEventId = event.eventId ? String(event.eventId).slice(0, 180) : null;
               const messageId = stableEventId ? `agent-message-${stableEventId}` : `runtime-message-${event.sequence}`;
@@ -1353,6 +1383,7 @@ export function App() {
               next = applyTaskWarningEvent(next, { roomId, taskId: payload.taskId || event.task_id, type: event.event_type, reason: payload.reason || payload.error || "委派失败", sequence: event.sequence });
             }
             if (event.event_type === "coordinatorActionBlocked") next = applyCoordinatorActionBlocked(next, { roomId, taskId: payload.taskId || event.task_id, sequence: event.sequence });
+            if (event.event_type === "coordinatorDecisionLocked") next = applyCoordinatorDecisionLocked(next, { roomId, taskId: payload.taskId || event.task_id, sequence: event.sequence });
             if (event.event_type === "agentMessage" && payload.public !== false && payload.text) {
               const stableEventId = String(event.event_id || event.eventId || payload.eventId || "").slice(0, 180) || null;
               const messageId = stableEventId ? `agent-message-${stableEventId}` : `remote-message-${event.sequence}`;
