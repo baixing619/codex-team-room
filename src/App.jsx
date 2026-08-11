@@ -1353,11 +1353,11 @@ export function App() {
     setState((current) => ({ ...current, threadCache: { ...current.threadCache, [roomId]: nextThreads } }));
   };
 
-  const fetchThreads = async (room, { notifyOnError = false } = {}) => {
+  const fetchThreads = async (room, { notifyOnError = false, force = false } = {}) => {
     try {
       let data;
       if (privateCloud) {
-        data = await requestRemoteIndex("threads", { projectPath: room.path });
+        data = await requestRemoteIndex("threads", { projectPath: room.path, force });
       } else {
         const response = await fetch(`/api/threads?project=${encodeURIComponent(room.path)}`);
         if (!response.ok) throw new Error("无法读取对话索引");
@@ -1393,7 +1393,7 @@ export function App() {
     let cancelled = false;
     let retryTimer = null;
     const load = async () => {
-      const loaded = await fetchThreads(activeRoom);
+      const loaded = await fetchThreads(activeRoom, { force: true });
       if (!cancelled && !loaded) retryTimer = window.setTimeout(load, 3_000);
     };
     load();
