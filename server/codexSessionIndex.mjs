@@ -545,6 +545,7 @@ export function localBridgeStatus() {
   return {
     ok: true,
     mode: "local-index",
+    serviceRoot: workingDirectory,
     codexHomeExists: fs.existsSync(home),
     sessionsPathExists: fs.existsSync(path.join(home, "sessions")),
     indexedThreads: getThreadIndex().length,

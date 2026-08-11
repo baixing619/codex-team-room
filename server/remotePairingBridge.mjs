@@ -164,10 +164,18 @@ export function windowsNativeRequest(url, options = {}) {
 function readConfig(configPath) {
   try {
     const parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    if (!parsed.siteUrl || !parsed.deviceSecret || !parsed.siwcBypassToken || !parsed.cwd) return null;
+    const siteUrl = String(parsed.siteUrl || "").replace(/\/$/, "");
+    const cwd = path.resolve(String(parsed.cwd || ""));
+    if (!siteUrl.startsWith("https://")
+      || String(parsed.deviceSecret || "").length < 24
+      || String(parsed.siwcBypassToken || "").length < 24
+      || !String(parsed.cwd || "").trim()
+      || !fs.existsSync(cwd)
+      || !fs.statSync(cwd).isDirectory()) return null;
     return {
       ...parsed,
-      siteUrl: String(parsed.siteUrl).replace(/\/$/, ""),
+      siteUrl,
+      cwd,
       deviceId: parsed.deviceId || `device-${os.hostname().toLowerCase().replace(/[^a-z0-9-]/g, "-")}`,
       deviceLabel: parsed.deviceLabel || os.hostname(),
     };
@@ -291,6 +299,7 @@ export class RemotePairingBridge {
       deviceId: this.config?.deviceId || null,
       deviceLabel: this.config?.deviceLabel || null,
       cwd: this.config?.cwd || null,
+      activeTaskId: this.activeTasks.keys().next().value || null,
       lastError: this.lastError,
     };
   }
@@ -668,8 +677,16 @@ export class RemotePairingBridge {
     this.busy = true;
     try {
       if (Date.now() - this.lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) await this.heartbeat();
+      // One App Server connection can belong to only one project room at a
+      // time.  Keep polling approvals, index work, heartbeats and events while
+      // a task is active, but do not claim another room until it reaches a
+      // terminal state.  Otherwise the second connect can steal the runtime
+      // scope from the first task and produce a false room-mismatch failure.
+      const taskRequest = this.activeTasks.size
+        ? Promise.resolve({ task: null })
+        : this.request("/api/device/tasks");
       const [{ task }, { approval }, { indexRequest }] = await Promise.all([
-        this.request("/api/device/tasks"),
+        taskRequest,
         this.request("/api/device/approvals"),
         this.optionalRequest("/api/device/index-requests", { indexRequest: null }),
       ]);

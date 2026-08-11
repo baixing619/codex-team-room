@@ -16,8 +16,9 @@ const input = await new Promise((resolve, reject) => {
 
 const siteUrl = String(input.siteUrl || "").replace(/\/$/, "");
 const siwcBypassToken = String(input.siwcBypassToken || "");
-const cwd = path.resolve(String(input.cwd || ""));
-if (!siteUrl.startsWith("https://") || siwcBypassToken.length < 24 || !fs.existsSync(cwd)) {
+const rawCwd = String(input.cwd || "").trim();
+const cwd = rawCwd ? path.resolve(rawCwd) : "";
+if (!siteUrl.startsWith("https://") || siwcBypassToken.length < 24 || !cwd || !fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
   throw new Error("siteUrl, siwcBypassToken, and an existing cwd are required");
 }
 

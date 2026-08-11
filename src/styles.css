@@ -1719,6 +1719,79 @@ select:focus-visible {
   margin-bottom: 22px;
 }
 
+.tutorial-backdrop {
+  z-index: 80;
+}
+
+.tutorial-modal {
+  width: min(650px, 100%);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.tutorial-list {
+  display: grid;
+  gap: 10px;
+  padding: 20px 24px 14px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.tutorial-step {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 13px;
+  align-items: flex-start;
+  padding: 13px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fbfbfe;
+}
+
+.tutorial-step__number {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-weight: 700;
+}
+
+.tutorial-step h3 {
+  margin: 1px 0 5px;
+  font-size: 14px;
+}
+
+.tutorial-step p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.tutorial-guide-link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 42px;
+  border-radius: 9px;
+  color: var(--primary);
+  background: var(--primary-soft);
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.tutorial-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 14px 24px 20px;
+  border-top: 1px solid var(--line);
+}
+
 .toast {
   position: fixed;
   z-index: 90;
@@ -1782,4 +1855,10 @@ select:focus-visible {
   .content-toolbar-actions { justify-content: flex-start; }
   .message-image-preview img,
   .output-image-card img { max-height: 55dvh; }
+  .modal-backdrop { padding: 12px; }
+  .tutorial-modal { max-height: calc(100dvh - 24px); }
+  .tutorial-list { padding: 14px; }
+  .tutorial-step { padding: 11px; }
+  .tutorial-actions { padding: 12px 14px 16px; }
+  .settings-actions { flex-wrap: wrap; }
 }
