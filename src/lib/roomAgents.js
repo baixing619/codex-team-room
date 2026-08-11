@@ -1,7 +1,7 @@
 import { DEFAULT_AGENTS, DEFAULT_ROOM } from "../data/defaults.js";
 import { sanitizeContextCursorsByRoom, sanitizeContextDeliverySequences, sanitizePendingContextCursorsByRoom } from "./contextCursors.js";
 import { mergeApprovalCommands, reconcileApprovalState } from "./approvalLifecycle.js";
-import { isInternalTeamRoomThreadTitle, isSubagentThreadSource } from "./internalThreads.js";
+import { isSubagentThreadSource } from "./internalThreads.js";
 
 export const STATE_SCHEMA_VERSION = 8;
 
@@ -18,7 +18,7 @@ export function sanitizeThreadCache(value) {
   return Object.fromEntries(Object.entries(value).map(([roomId, threads]) => [
     roomId,
     Array.isArray(threads)
-      ? threads.filter((thread) => thread?.kind !== "demo" && !isCorruptedThreadTitle(thread?.title) && !isInternalTeamRoomThreadTitle(thread?.title) && !isSubagentThreadSource(thread?.source))
+      ? threads.filter((thread) => thread?.kind !== "demo" && !isCorruptedThreadTitle(thread?.title) && !isSubagentThreadSource(thread?.source))
       : [],
   ]));
 }

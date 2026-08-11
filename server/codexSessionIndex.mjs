@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isInternalTeamRoomThreadTitle, isSubagentThreadSource } from "../src/lib/internalThreads.js";
+import { isSubagentThreadSource } from "../src/lib/internalThreads.js";
 
 const MAX_ROLLOUTS = 2500;
 const META_CHUNK_BYTES = 16 * 1024;
@@ -315,9 +315,7 @@ function parseMeta(filePath, names) {
     if (isGuardianSource(source)) return null;
     const cwd = recentTurnContextCwd(filePath) || item.payload.cwd || "";
     const indexedTitle = known?.title || threadSpawnTitle(source);
-    if (isInternalTeamRoomThreadTitle(indexedTitle)) return null;
     const fallbackTitle = indexedTitle ? null : fallbackTitleForRollout(filePath);
-    if (isInternalTeamRoomThreadTitle(fallbackTitle)) return null;
     const title = indexedTitle || fallbackTitle || "历史对话";
     return {
       id: item.payload.id,
