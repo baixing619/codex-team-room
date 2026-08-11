@@ -124,7 +124,7 @@ test("derives a short Chinese title from the first visible user message in a lar
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test("hides guardian sessions and gives unindexed spawned agents an identifiable title", async () => {
+test("hides every spawned subagent session from the standard conversation index", async () => {
   const previousHome = process.env.CODEX_HOME;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-team-room-subagent-index-test-"));
   const sessions = path.join(home, "sessions", "2026", "08", "01");
@@ -156,8 +156,8 @@ test("hides guardian sessions and gives unindexed spawned agents an identifiable
   const projects = indexModule.listProjects();
   const threads = indexModule.listThreads(projectPath);
 
-  assert.equal(projects[0].threadCount, 1);
-  assert.deepEqual(threads.map((thread) => thread.title), ["Jason · terra_review"]);
+  assert.deepEqual(projects, []);
+  assert.deepEqual(threads, []);
 
   if (previousHome === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = previousHome;
@@ -187,7 +187,7 @@ test("hides Team Room managed member sessions from normal project history", asyn
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test("includes visible spawned-agent ancestors in the child project without including guardians", async () => {
+test("shows only the standard root conversation for a project reached through hidden subagent descendants", async () => {
   const previousHome = process.env.CODEX_HOME;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-team-room-ancestor-project-test-"));
   const sessions = path.join(home, "sessions", "2026", "08", "01");
@@ -235,10 +235,10 @@ test("includes visible spawned-agent ancestors in the child project without incl
   const titlesById = new Map(threads.map((thread) => [thread.id, thread.title]));
   const project = indexModule.listProjects().find((item) => item.path === projectPath);
 
-  assert.equal(project.threadCount, 3);
-  assert.equal(titlesById.get("child-thread"), "Worker · worker");
-  assert.equal(titlesById.get("intermediate-thread"), "主对话 · Planner · planner");
-  assert.equal(titlesById.get("root-thread"), "主对话 · 规划 Codex 持久化改动");
+  assert.equal(project.threadCount, 1);
+  assert.equal(titlesById.has("child-thread"), false);
+  assert.equal(titlesById.has("intermediate-thread"), false);
+  assert.equal(titlesById.get("root-thread"), "规划 Codex 持久化改动");
   assert.equal(titlesById.has("guardian-thread"), false);
 
   if (previousHome === undefined) delete process.env.CODEX_HOME;

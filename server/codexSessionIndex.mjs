@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isInternalTeamRoomThreadTitle } from "../src/lib/internalThreads.js";
+import { isInternalTeamRoomThreadTitle, isSubagentThreadSource } from "../src/lib/internalThreads.js";
 
 const MAX_ROLLOUTS = 2500;
 const META_CHUNK_BYTES = 16 * 1024;
@@ -359,6 +359,7 @@ export function listProjects() {
   const projects = new Map();
 
   for (const thread of threads) {
+    if (isSubagentThreadSource(thread.source)) continue;
     for (const projectPath of projectPathsForThread(thread)) {
       const existing = projects.get(projectPath) || {
         path: projectPath,
@@ -383,6 +384,7 @@ export function listProjects() {
 
 export function listThreads(projectPath) {
   return getThreadIndex()
+    .filter((thread) => !isSubagentThreadSource(thread.source))
     .flatMap((thread) => {
       const directMatch = !projectPath || projectPathKey(thread.cwd) === projectPathKey(projectPath);
       const relatedMatch = !directMatch && (thread.relatedProjectPaths || [])
@@ -392,8 +394,7 @@ export function listThreads(projectPath) {
       const { rolloutPath, relatedProjectPaths, ...visibleThread } = thread;
       return [{
         ...visibleThread,
-        title: relatedMatch ? `主对话 · ${thread.title}` : thread.title,
-        relation: relatedMatch ? "subagent-parent" : null,
+        title: thread.title,
       }];
     });
 }
