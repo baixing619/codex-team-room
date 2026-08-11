@@ -21,7 +21,11 @@ function coordinatorInitialProtocol(record, agents) {
     .filter((agent) => agent?.id && agent.id !== record?.coordinatorAgentId)
     .map((agent) => `${agent.id}/${agent.name || agent.role || "成员"}`)
     .join(", ");
-  return `[TEAM_ROOM_COORDINATOR_PROTOCOL_V1] 你是纯协调总控：只做澄清、分析、拆解、规划、委派和汇总，严禁亲自调用命令、读取项目文件、修改文件或执行本机工具。需要证据时委派成员。真实委派只能输出最多4个严格 TEAM_ROOM_TASK_ASSIGNMENT_V1 块；本轮 parentTaskId=${record?.id || ""}，depth=${Number(record?.depth || 0) + 1}，可分派 targetAgentId=${targets || "无"}。普通房间任务的 visibility 使用 room，让成员回复进入团队消息并形成后续共享上下文；只有用户明确只让总控回复或其他人不要发言时才使用 coordinator-only。每个 assignmentId 必须在本轮唯一，并且每个块必须包含 assignmentId、parentTaskId、targetAgentId、objective、acceptanceCriteria、visibility、depth；普通 @文字或承诺不算委派。`;
+  const direct = [...(record?.directAgentIds || [])].map((agentId) => {
+    const agent = (agents || []).find((item) => item?.id === agentId);
+    return `${agentId}/${agent?.name || agent?.role || "成员"}`;
+  }).join(", ");
+  return `[TEAM_ROOM_COORDINATOR_PROTOCOL_V1] 你是纯协调总控：只做澄清、分析、拆解、规划、委派和汇总，严禁亲自调用命令、读取项目文件、修改文件或执行本机工具。需要证据时委派成员。真实委派只能输出最多4个严格 TEAM_ROOM_TASK_ASSIGNMENT_V1 块；本轮 parentTaskId=${record?.id || ""}，depth=${Number(record?.depth || 0) + 1}，可分派 targetAgentId=${targets || "无"}。本轮已经由房间直接启动的成员=${direct || "无"}；不要再次委派这些成员，只在确实需要新增分工时委派其他成员。普通房间任务的 visibility 使用 room，让成员回复进入团队消息并形成后续共享上下文；只有用户明确只让总控回复或其他人不要发言时才使用 coordinator-only。每个 assignmentId 必须在本轮唯一。任务块内部推荐使用单个合法 JSON 对象，例如 {"assignmentId":"唯一ID","parentTaskId":"${record?.id || ""}","targetAgentId":"成员ID","objective":"目标","acceptanceCriteria":["验收条件"],"visibility":"room","depth":${Number(record?.depth || 0) + 1}}；也兼容逐行 key=value，但不得使用表格或遗漏字段。普通 @文字或承诺不算委派。`;
 }
 const COORDINATOR_FINAL_SUMMARY_PROTOCOL = "[TEAM_ROOM_FINAL_SUMMARY_PROTOCOL_V1] 只汇总已回流的委派结果，严禁调用工具、读写文件或再次输出 TEAM_ROOM_TASK_ASSIGNMENT_V1。";
 
@@ -88,8 +92,22 @@ function followupSharedContext(record) {
   };
 }
 
+function contextCursorUpdateForAgent(sharedContext, agentId, threadId) {
+  const updates = sharedContext?.cursorUpdates;
+  if (!updates || typeof updates !== "object") return null;
+  const source = Object.values(updates).find((cursor) => cursor?.agentId === agentId);
+  if (!source || typeof source !== "object") return null;
+  return {
+    ...source,
+    agentId,
+    threadId,
+    messageFingerprints: { ...(source.messageFingerprints || {}) },
+    knowledgeFingerprints: { ...(source.knowledgeFingerprints || {}) },
+  };
+}
+
 export class TeamRoomRuntimeManager {
-  constructor({ statusProvider = getCodexRuntimeStatus, runtimeFactory = spawnCodexAppServer, approvalTimeoutMs = 120_000, interruptReleaseTimeoutMs = 5_000 } = {}) {
+  constructor({ statusProvider = getCodexRuntimeStatus, runtimeFactory = spawnCodexAppServer, approvalTimeoutMs = 120_000, interruptReleaseTimeoutMs = 5_000, streamFlushIntervalMs = 220 } = {}) {
     this.statusProvider = statusProvider;
     this.runtimeFactory = runtimeFactory;
     this.connection = null;
@@ -110,9 +128,12 @@ export class TeamRoomRuntimeManager {
     this.approvalTimers = new Map();
     this.approvalTimeoutMs = Math.max(1_000, Number(approvalTimeoutMs) || 120_000);
     this.interruptReleaseTimeoutMs = Math.max(10, Number(interruptReleaseTimeoutMs) || 5_000);
+    this.streamFlushIntervalMs = Math.max(50, Number(streamFlushIntervalMs) || 220);
     this.writeLock = null;
     this.agentMessageEventIds = new Set();
     this.agentMessageEventIdOrder = [];
+    this.agentStreamByTurnId = new Map();
+    this.eventSubscribers = new Set();
     this.events = [];
     this.sequence = 0;
     this.cwd = null;
@@ -147,7 +168,74 @@ export class TeamRoomRuntimeManager {
     };
     this.events.push(event);
     if (this.events.length > MAX_EVENTS) this.events.splice(0, this.events.length - MAX_EVENTS);
+    for (const subscriber of this.eventSubscribers) {
+      try { subscriber(event); } catch {}
+    }
     return event;
+  }
+
+  subscribe(listener) {
+    if (typeof listener !== "function") return () => {};
+    this.eventSubscribers.add(listener);
+    return () => this.eventSubscribers.delete(listener);
+  }
+
+  publishTurnProgress(context, stage, itemType = null, itemId = null) {
+    if (!context || !["initial", "delegatedTarget", "finalSummary"].includes(context.kind)) return;
+    this.emitRoomEvent("turnProgress", {
+      eventId: `${context.taskId}:turnProgress:${context.turnId || "turn"}:${stage}:${itemId || itemType || "none"}`,
+      taskId: context.taskId,
+      roomId: context.roomId,
+      agentId: context.agentId,
+      threadId: context.threadId,
+      turnId: context.turnId,
+      turnKind: context.kind,
+      assignmentId: context.assignment?.assignmentId || null,
+      stage,
+      itemType: itemType || null,
+      public: true,
+    });
+  }
+
+  flushAgentStream(turnId) {
+    const stream = this.agentStreamByTurnId.get(turnId);
+    if (!stream) return;
+    if (stream.timer) clearTimeout(stream.timer);
+    stream.timer = null;
+    if (!stream.text || stream.text === stream.lastPublishedText) return;
+    stream.lastPublishedText = stream.text;
+    this.emitRoomEvent("agentMessageDelta", {
+      eventId: `${stream.context.taskId}:agentMessageDelta:${turnId}:${stream.itemId || "message"}:${textFingerprint(stream.text)}`,
+      taskId: stream.context.taskId,
+      roomId: stream.context.roomId,
+      agentId: stream.context.agentId,
+      threadId: stream.context.threadId,
+      turnId,
+      itemId: stream.itemId || null,
+      text: stream.text,
+      public: true,
+    });
+  }
+
+  appendAgentStream(turnId, itemId, delta, context) {
+    if (!turnId || !context || context.public === false || context.internal === true) return;
+    if (context.kind === "initial" && context.agentId === this.coordinatorAgent()?.id) return;
+    const value = String(delta || "");
+    if (!value) return;
+    let stream = this.agentStreamByTurnId.get(turnId);
+    if (!stream || (itemId && stream.itemId && stream.itemId !== itemId)) {
+      if (stream) this.flushAgentStream(turnId);
+      stream = { context, itemId: itemId || null, text: "", lastPublishedText: "", timer: null };
+      this.agentStreamByTurnId.set(turnId, stream);
+    }
+    stream.text += value;
+    if (!stream.timer) stream.timer = setTimeout(() => this.flushAgentStream(turnId), this.streamFlushIntervalMs);
+  }
+
+  clearAgentStream(turnId) {
+    const stream = this.agentStreamByTurnId.get(turnId);
+    if (stream?.timer) clearTimeout(stream.timer);
+    this.agentStreamByTurnId.delete(turnId);
   }
 
   synchroniseAgents(agents) {
@@ -193,8 +281,10 @@ export class TeamRoomRuntimeManager {
       pendingAssignments: new Set(),
       assignmentResults: new Map(),
       failedAssignments: new Set(),
+      assignmentFailureReasons: new Map(),
       assignmentById: new Map(),
       assignmentSourceTargets: new Set(),
+      directAgentIds: new Set(),
       finalSummaryStarted: false,
       finalSummaryCompleted: false,
       delegationCount: 0,
@@ -297,13 +387,14 @@ export class TeamRoomRuntimeManager {
       sourceTurnId,
     });
     record.failedAssignments.add(assignmentId);
+    record.assignmentFailureReasons.set(assignmentId, safeTaskError(reason));
   }
 
   registerTurn(record, turn, context) {
     if (!record || !turn?.id) return;
     record.pendingTurnIds.add(turn.id);
     record.turnIds.add(turn.id);
-    this.turnContextById.set(turn.id, { roomId: record.roomId, taskId: record.id, ...context });
+    this.turnContextById.set(turn.id, { roomId: record.roomId, taskId: record.id, turnId: turn.id, ...context });
     this.turnMessagesById.set(turn.id, []);
   }
 
@@ -465,6 +556,7 @@ export class TeamRoomRuntimeManager {
       internal: descriptor.internal === true,
       turnKind: descriptor.kind || "initial",
       assignmentId: descriptor.assignment?.assignmentId || null,
+      contextCursorUpdate: contextCursorUpdateForAgent(descriptor.sharedContext, agent.id, threadId),
     });
     return { agentId: agent.id, threadId, turnId: turn.id, taskId: descriptor.taskRecord?.id || this.taskId };
   }
@@ -577,6 +669,16 @@ export class TeamRoomRuntimeManager {
       return false;
     }
     const target = validation.target;
+    if (record.directAgentIds.has(target.id)) {
+      this.emitRoomEvent("taskDelegationMerged", {
+        taskId: record.id,
+        assignmentId: assignment.assignmentId,
+        targetAgentId: target.id,
+        stage: "already_running",
+        public: true,
+      });
+      return true;
+    }
     if (target.threadBinding === "existing" && !optionalId(target.boundThreadId)) {
       this.emitRoomEvent("taskAssignmentRejected", { taskId: record.id, reason: "assignment_thread_mismatch", assignmentId: assignment.assignmentId, public: true });
       this.recordAssignmentFailure(record, assignment, "assignment_thread_mismatch", sourceTurnId);
@@ -616,8 +718,11 @@ export class TeamRoomRuntimeManager {
       return true;
     } catch (error) {
       record.pendingAssignments.delete(assignment.assignmentId);
-      this.emitRoomEvent("taskDelegationFailed", { taskId: record.id, assignmentId: assignment.assignmentId, targetAgentId: target.id, error: safeTaskError(error), public: true });
-      void this.createResultReturn(record, assignment, "failed", safeTaskError(error), sourceTurnId);
+      const failure = safeTaskError(error);
+      record.failedAssignments.add(assignment.assignmentId);
+      record.assignmentFailureReasons.set(assignment.assignmentId, `delegated_target_start_failed:${failure}`);
+      this.emitRoomEvent("taskDelegationFailed", { taskId: record.id, assignmentId: assignment.assignmentId, targetAgentId: target.id, error: failure, public: true });
+      void this.createResultReturn(record, assignment, "failed", failure, sourceTurnId);
       return false;
     }
   }
@@ -679,6 +784,10 @@ export class TeamRoomRuntimeManager {
     this.cancelledTurnReleaseTimers.clear();
     this.quarantinedThreadIds.clear();
     this.threadStartPromises.clear();
+    for (const stream of this.agentStreamByTurnId.values()) {
+      if (stream.timer) clearTimeout(stream.timer);
+    }
+    this.agentStreamByTurnId.clear();
     this.pendingApprovals.clear();
     for (const timer of this.approvalTimers.values()) clearTimeout(timer);
     this.approvalTimers.clear();
@@ -756,6 +865,11 @@ export class TeamRoomRuntimeManager {
       seen.add(decision.agentId);
       speakers.push(decision);
     }
+    const coordinatorId = taskRecord.coordinatorAgentId;
+    const coordinatorSelected = Boolean(coordinatorId && speakers.some((decision) => decision.agentId === coordinatorId));
+    taskRecord.directAgentIds = new Set(coordinatorSelected
+      ? speakers.filter((decision) => decision.agentId !== coordinatorId).map((decision) => decision.agentId)
+      : []);
     taskRecord.dispatchStarted = true;
     const turns = await Promise.all(speakers.map((decision) => {
       if (!this.agentById.has(decision.agentId)) return Promise.reject(new Error(`Unknown agent: ${decision.agentId}`));
@@ -807,8 +921,11 @@ export class TeamRoomRuntimeManager {
       if (succeeded) {
         void this.createResultReturn(record, context.assignment, "succeeded", finalText, turnId);
       } else {
-        this.emitRoomEvent("taskDelegationFailed", { taskId: record.id, assignmentId: context.assignment.assignmentId, targetAgentId: context.agentId, error: safeTaskError(turn?.error || turn?.status || "target_turn_failed"), public: true });
-        void this.createResultReturn(record, context.assignment, "failed", safeTaskError(turn?.error || turn?.status || "target_turn_failed"), turnId);
+        const failure = safeTaskError(turn?.error || turn?.status || "target_turn_failed");
+        record.failedAssignments.add(context.assignment.assignmentId);
+        record.assignmentFailureReasons.set(context.assignment.assignmentId, `delegated_target_failed:${failure}`);
+        this.emitRoomEvent("taskDelegationFailed", { taskId: record.id, assignmentId: context.assignment.assignmentId, targetAgentId: context.agentId, error: failure, public: true });
+        void this.createResultReturn(record, context.assignment, "failed", failure, turnId);
       }
     } else if (context.kind === "resultReturn" && context.assignment) {
       record.pendingAssignments.delete(context.assignment.assignmentId);
@@ -821,7 +938,12 @@ export class TeamRoomRuntimeManager {
         summary: resultSummary,
         sourceTurnId: context.resultSourceTurnId || turnId,
       });
-      if (resultStatus === "failed") record.failedAssignments.add(context.assignment.assignmentId);
+      if (resultStatus === "failed") {
+        record.failedAssignments.add(context.assignment.assignmentId);
+        if (!record.assignmentFailureReasons.has(context.assignment.assignmentId)) {
+          record.assignmentFailureReasons.set(context.assignment.assignmentId, `delegated_target_failed:${safeTaskError(resultSummary)}`);
+        }
+      }
       await this.startFinalSummary(record);
       if (!succeeded && !record.finalSummaryStarted) this.failTask(record, safeTaskError(turn?.error || turn?.status || "result_return_failed"));
     } else if (!succeeded) {
@@ -830,16 +952,19 @@ export class TeamRoomRuntimeManager {
       const hasAssignmentBlock = finalText.includes(TASK_ASSIGNMENT_START);
       const assignments = parseTaskAssignments(finalText);
       if (assignments.length) await Promise.all(assignments.map((assignment) => this.spawnAssignment(record, assignment, turnId, context.threadId)));
-      else if (hasAssignmentBlock) {
+      if (hasAssignmentBlock && !assignments.length) {
         this.emitRoomEvent("taskAssignmentRejected", { taskId: record.id, reason: "invalid_or_excess_assignment_blocks", public: true });
-        this.recordAssignmentFailure(record, null, "invalid_or_excess_assignment_blocks", turnId);
+        if (!record.directAgentIds.size) this.recordAssignmentFailure(record, null, "invalid_or_excess_assignment_blocks", turnId);
       }
     } else if (context.kind === "finalSummary" && !succeeded) {
       this.failTask(record, safeTaskError(turn?.error || turn?.status || "final_summary_failed"));
     }
     if (context.kind === "finalSummary") {
       record.finalSummaryCompleted = true;
-      if (succeeded && record.failedAssignments.size) this.failTask(record, "delegated_target_failed");
+      if (succeeded && record.failedAssignments.size) {
+        const reasons = [...record.failedAssignments].map((assignmentId) => record.assignmentFailureReasons.get(assignmentId)).filter(Boolean);
+        this.failTask(record, reasons[0] || "delegated_target_failed");
+      }
     }
     this.maybeFinishTask(record);
   }
@@ -882,6 +1007,12 @@ export class TeamRoomRuntimeManager {
     const roomId = turnContext?.roomId ?? this.roomByThreadId.get(params.threadId) ?? this.roomId;
     const taskId = turnContext?.taskId ?? this.taskId;
     const itemType = params.item?.type || null;
+    if (event.method === "item/agentMessage/delta") {
+      const firstDelta = !this.agentStreamByTurnId.has(turnId);
+      this.appendAgentStream(turnId, params.itemId || null, params.delta, turnContext);
+      if (firstDelta) this.publishTurnProgress(turnContext, "responding", "agentMessage", params.itemId || null);
+      return;
+    }
     if (["item/started", "item/completed"].includes(event.method) && itemType
       && (turnContext?.toolsForbidden === true || this.agentById.get(agentId)?.permission === "coordinate")
       && !COORDINATOR_PASSIVE_ITEM_TYPES.has(itemType)) {
@@ -889,7 +1020,13 @@ export class TeamRoomRuntimeManager {
       return;
     }
     if (turnContext?.coordinatorActionBlocked && event.method === "item/completed" && itemType === "agentMessage") return;
+    if (event.method === "item/started" && itemType) {
+      this.publishTurnProgress(turnContext, itemType === "agentMessage" ? "response_started" : "working", itemType, params.item?.id || null);
+    }
     if (event.method === "item/completed" && params.item?.type === "agentMessage") {
+      this.flushAgentStream(turnId);
+      this.clearAgentStream(turnId);
+      this.publishTurnProgress(turnContext, "response_received", "agentMessage", params.item?.id || null);
       const messageText = params.item.text || "";
       const messages = this.turnMessagesById.get(turnId) || [];
       messages.push(messageText);
@@ -926,6 +1063,9 @@ export class TeamRoomRuntimeManager {
         assignmentId: turnContext?.assignment?.assignmentId || null,
       });
     } else if (event.method === "turn/completed") {
+      this.flushAgentStream(turnId);
+      this.clearAgentStream(turnId);
+      this.publishTurnProgress(turnContext, isTurnSuccessful(params.turn) ? "completed" : "failed");
       this.expireApprovalsFor({ agentId, threadId: params.threadId, turnId }, "turn_completed");
       if (this.writeLock?.agentId === agentId && (!this.writeLock.threadId || this.writeLock.threadId === params.threadId)) this.writeLock = null;
       this.emitRoomEvent("turnCompleted", {

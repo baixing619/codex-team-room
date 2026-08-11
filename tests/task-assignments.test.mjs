@@ -40,6 +40,22 @@ test("strict parser accepts up to four assignments and strips protocol blocks fr
   assert.deepEqual(parseTaskAssignments(five), []);
 });
 
+test("strict parser accepts the coordinator key-value block emitted by Codex", () => {
+  const block = `[TEAM_ROOM_TASK_ASSIGNMENT_V1]
+assignmentId=assignment-pro-1
+parentTaskId=task-root
+targetAgentId=developer
+objective=撰写一条项目介绍
+acceptanceCriteria=提供可直接发布的成品；不得夸大；包含项目链接
+visibility=room
+depth=1
+[/TEAM_ROOM_TASK_ASSIGNMENT_V1]`;
+  const parsed = parseTaskAssignment(block);
+  assert.equal(parsed.assignmentId, "assignment-pro-1");
+  assert.deepEqual(parsed.acceptanceCriteria, ["提供可直接发布的成品", "不得夸大", "包含项目链接"]);
+  assert.equal(parsed.visibility, "room");
+});
+
 test("assignment validation binds source turn, target member, depth, cycle, and idempotency", () => {
   const parentTask = {
     id: "task-root",

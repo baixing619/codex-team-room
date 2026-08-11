@@ -119,6 +119,54 @@ test("runtime dispatch upgrades explicitly mentioned silent members and preserve
   assert.ok(!result.turns.some((turn) => turn.agentId === "researcher"));
 });
 
+test("a directly running member is not duplicated by coordinator delegation and streams real progress", async () => {
+  const { manager, protocol, agents } = createManager({ streamFlushIntervalMs: 50 });
+  agents[0] = { ...agents[0], name: "总控", participation: "always" };
+  agents[1] = { ...agents[1], name: "开发", participation: "relevant" };
+  await manager.connect({ cwd: "G:\\project", roomId: "room-direct-merge", agents, confirmed: true });
+  await manager.dispatch({
+    text: "@开发 请完成这项任务",
+    decisions: [
+      { agentId: "coordinator", decision: "speak" },
+      { agentId: "developer", decision: "speak" },
+      { agentId: "reviewer", decision: "silent" },
+    ],
+    messageId: "message-direct-merge",
+    taskId: "task-direct-merge",
+    roomId: "room-direct-merge",
+  });
+
+  const coordinator = manager.listEvents().find((event) => event.type === "turnStarted" && event.agentId === "coordinator");
+  const developer = manager.listEvents().find((event) => event.type === "turnStarted" && event.agentId === "developer");
+  const assignment = `[TEAM_ROOM_TASK_ASSIGNMENT_V1]
+assignmentId=assignment-direct-merge
+parentTaskId=task-direct-merge
+targetAgentId=developer
+objective=完成用户任务
+acceptanceCriteria=给出结果；可核对
+visibility=room
+depth=1
+[/TEAM_ROOM_TASK_ASSIGNMENT_V1]`;
+  await completeTurn(protocol, coordinator, { text: assignment });
+
+  assert.equal(manager.listEvents().some((event) => event.type === "taskDelegationMerged" && event.targetAgentId === "developer"), true);
+  assert.equal(manager.listEvents().some((event) => event.type === "turnStarted" && event.turnKind === "delegatedTarget"), false);
+
+  protocol.emit("notification", { method: "item/started", params: { threadId: developer.threadId, turnId: developer.turnId, item: { id: "message-item", type: "agentMessage", text: "" } } });
+  protocol.emit("notification", { method: "item/agentMessage/delta", params: { threadId: developer.threadId, turnId: developer.turnId, itemId: "message-item", delta: "真实" } });
+  protocol.emit("notification", { method: "item/agentMessage/delta", params: { threadId: developer.threadId, turnId: developer.turnId, itemId: "message-item", delta: "回传" } });
+  await completeTurn(protocol, developer, { text: "真实回传完成" });
+
+  const progressStages = manager.listEvents().filter((event) => event.type === "turnProgress" && event.agentId === "developer").map((event) => event.stage);
+  assert.ok(progressStages.includes("response_started"));
+  assert.ok(progressStages.includes("responding"));
+  assert.ok(progressStages.includes("response_received"));
+  assert.ok(progressStages.includes("completed"));
+  assert.equal(manager.listEvents().some((event) => event.type === "agentMessageDelta" && event.text === "真实回传"), true);
+  assert.equal((await manager.waitForTask("task-direct-merge")).status, "succeeded");
+  assert.equal(manager.listEvents().some((event) => event.type === "taskFailed"), false);
+});
+
 test("runtime-side explicit promotion never gives a deferred member an empty context", async () => {
   const { manager, protocol, agents } = createManager();
   agents[1] = { ...agents[1], name: "开发", participation: "relevant" };
@@ -280,6 +328,10 @@ test("independent member conversations receive the same context id and execution
     roomId: "room-proof",
     roomName: "真实项目",
     recentMessages: [{ role: "agent", agentName: "审核", sourceThreadId: "thread-reviewer", text: "发现一个风险" }],
+    cursorUpdates: {
+      coordinator: { version: 1, initialized: true, agentId: "coordinator", deliverySequence: 2, messageFingerprints: { "message-old": "fnv1a:1" }, knowledgeFingerprints: {}, lastContextId: "context-shared-proof" },
+      developer: { version: 1, initialized: true, agentId: "developer", deliverySequence: 2, messageFingerprints: { "message-old": "fnv1a:1" }, knowledgeFingerprints: {}, lastContextId: "context-shared-proof" },
+    },
   };
   const result = await manager.dispatch({
     text: "请共同确认",
@@ -295,6 +347,9 @@ test("independent member conversations receive the same context id and execution
   assert.ok(protocol.startedTurns.every((turn) => turn.sharedContext.id === "context-shared-proof"));
   assert.equal(protocol.startedTurns.find((turn) => turn.agent.id === "developer").agent.permission, "read-only");
   assert.equal(protocol.startedTurns.find((turn) => turn.agent.id === "coordinator").agent.permission, "coordinate");
+  const developerStarted = manager.listEvents().find((event) => event.type === "turnStarted" && event.agentId === "developer");
+  assert.equal(developerStarted.contextCursorUpdate.threadId, "thread-developer");
+  assert.equal(developerStarted.contextCursorUpdate.deliverySequence, 2);
 });
 
 test("an explicit current-project binding is resumed, while an automatic member gets its own thread", async () => {

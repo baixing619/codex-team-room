@@ -36,7 +36,7 @@ import { decideParticipation } from "./lib/participation.js";
 import { addRoomMember, createProjectMember, createRoomAgents, createSafeMemberPrompt, removeRoomMember, replaceRoomMember, sanitizeRoomMessages } from "./lib/roomAgents.js";
 import { loadState, resetState, saveState } from "./lib/storage.js";
 import { buildRoomSharedContext, formatAttachmentSize, validateSelectedFiles } from "./lib/taskPayload.js";
-import { acknowledgeContextDelivery, bindContextCursorToThread, discardPendingContextDelivery } from "./lib/contextCursors.js";
+import { acknowledgeContextDelivery, applyContextCursorUpdates, bindContextCursorToThread, discardPendingContextDelivery } from "./lib/contextCursors.js";
 import { applyCloudSnapshot, createCloudSnapshot } from "./lib/cloudState.js";
 import { applyApprovalLifecycleEvent, approvalRoute, classifyApprovalRequest, isApprovalTerminal, mergeApprovalCommands, normalizeApprovalCommand, reconcileApprovalState, visibleApprovalCommands } from "./lib/approvalLifecycle.js";
 
@@ -96,9 +96,94 @@ function applyTaskStatusEvent(state, { roomId, taskId, status, error = null, typ
   const messages = state.messagesByRoom?.[roomId] || [];
   const messageId = `task-status-${taskId}`;
   const nextMessage = { id: messageId, kind: "system", taskId, taskStatus: status, time: nowLabel(), text: taskStatusText(status, error) };
-  const index = messages.findIndex((message) => message.id === messageId || (message.taskId === taskId && message.kind === "system"));
+  const index = messages.findIndex((message) => message.id === messageId || (message.taskId === taskId && message.kind === "system" && message.taskStatus));
   const nextMessages = index >= 0 ? messages.map((message, itemIndex) => itemIndex === index ? { ...message, ...nextMessage } : message) : [...messages, nextMessage];
   return { ...state, messagesByRoom: { ...state.messagesByRoom, [roomId]: nextMessages } };
+}
+
+function applyTurnStartedContextReceipt(cursors, contextCursorUpdate, agentId, threadId) {
+  if (!contextCursorUpdate || contextCursorUpdate.agentId !== agentId || !threadId) return cursors;
+  return applyContextCursorUpdates(cursors, { receipt: contextCursorUpdate }, { [agentId]: threadId });
+}
+
+function taskProgressText(stage, memberName, turnKind) {
+  if (turnKind === "finalSummary") {
+    if (stage === "completed") return `${memberName}：汇总已完成`;
+    if (stage === "response_started") return `${memberName}：已开始生成最终汇总`;
+    if (stage === "responding" || stage === "response_received") return `${memberName}：正在回传最终汇总`;
+    return `${memberName}：已收到成员结果，正在汇总`;
+  }
+  if (stage === "delivered") return `${memberName}：已送达（真实 Codex 回合已启动）`;
+  if (stage === "working") return `${memberName}：成员处理中（收到真实运行活动）`;
+  if (stage === "response_started") return `${memberName}：已开始生成回复`;
+  if (stage === "responding") return `${memberName}：正在回传（收到真实文字增量）`;
+  if (stage === "response_received") return `${memberName}：已收到完整回复，正在结束本轮`;
+  if (stage === "completed") return `${memberName}：本轮已完成`;
+  if (stage === "failed") return `${memberName}：本轮明确失败`;
+  return `${memberName}：状态已更新`;
+}
+
+function applyTaskProgressEvent(state, { roomId, taskId, agentId, turnId, turnKind = "initial", stage, sequence = 0 } = {}) {
+  if (!roomId || !taskId || !agentId || !stage) return state;
+  const agents = state.agentsByRoom?.[roomId] || [];
+  const memberName = agents.find((agent) => agent.id === agentId)?.name || "成员";
+  const progressKey = turnKind === "finalSummary" ? "summary" : agentId;
+  const messageId = `task-progress-${taskId}-${progressKey}`;
+  const messages = state.messagesByRoom?.[roomId] || [];
+  const index = messages.findIndex((message) => message.id === messageId);
+  const current = index >= 0 ? messages[index] : null;
+  if (current && Number(current.progressSequence || 0) > Number(sequence || 0)) return state;
+  const nextMessage = {
+    id: messageId,
+    kind: "system",
+    taskId,
+    taskProgress: stage,
+    progressSequence: Number(sequence || 0),
+    agentId,
+    turnId: turnId || null,
+    time: nowLabel(),
+    text: taskProgressText(stage, memberName, turnKind),
+  };
+  const nextMessages = index >= 0
+    ? messages.map((message, itemIndex) => itemIndex === index ? { ...message, ...nextMessage } : message)
+    : [...messages, nextMessage];
+  return { ...state, messagesByRoom: { ...state.messagesByRoom, [roomId]: nextMessages } };
+}
+
+function applyTaskWarningEvent(state, { roomId, taskId, type, reason, sequence = 0 } = {}) {
+  if (!roomId || !taskId) return state;
+  const messages = state.messagesByRoom?.[roomId] || [];
+  const messageId = `task-warning-${taskId}-${type || "warning"}`;
+  const text = type === "taskAssignmentRejected"
+    ? `总控委派格式未通过校验：${String(reason || "格式无效").slice(0, 180)}；仍以真实成员事件和最终任务状态为准。`
+    : `成员委派出现明确错误：${String(reason || "委派失败").slice(0, 180)}；等待总控汇总最终状态。`;
+  const nextMessage = { id: messageId, kind: "system", taskId, taskWarning: true, progressSequence: Number(sequence || 0), time: nowLabel(), text };
+  const index = messages.findIndex((message) => message.id === messageId);
+  const nextMessages = index >= 0 ? messages.map((message, itemIndex) => itemIndex === index ? { ...message, ...nextMessage } : message) : [...messages, nextMessage];
+  return { ...state, messagesByRoom: { ...state.messagesByRoom, [roomId]: nextMessages } };
+}
+
+function applyAgentDeltaEvent(state, { roomId, taskId, agentId, threadId, turnId, itemId, text, sequence = 0 } = {}) {
+  if (!roomId || !agentId || !turnId || !text) return state;
+  const messages = state.messagesByRoom?.[roomId] || [];
+  const messageId = `agent-stream-${taskId || "task"}-${turnId}-${itemId || "message"}`;
+  const candidate = { id: messageId, kind: "agent", agentId, threadId: threadId || null, taskId: taskId || null, turnId, itemId: itemId || null, streaming: true, progressSequence: Number(sequence || 0), time: nowLabel(), text };
+  const index = messages.findIndex((message) => message.id === messageId || (message.streaming && message.turnId === turnId));
+  if (index >= 0 && Number(messages[index].progressSequence || 0) > Number(sequence || 0)) return state;
+  const nextMessages = index >= 0 ? messages.map((message, itemIndex) => itemIndex === index ? { ...message, ...candidate } : message) : [...messages, candidate];
+  return { ...state, messagesByRoom: { ...state.messagesByRoom, [roomId]: sanitizeRoomMessages(nextMessages) } };
+}
+
+function applyAgentFinalEvent(state, { roomId, messageId, agentId, threadId, taskId, turnId, eventId, text } = {}) {
+  if (!roomId || !messageId || !agentId || !text) return state;
+  const messages = state.messagesByRoom?.[roomId] || [];
+  const withoutStream = messages.filter((message) => !(message.streaming && turnId && message.turnId === turnId));
+  if (withoutStream.some((message) => message.id === messageId)) {
+    if (withoutStream.length === messages.length) return state;
+    return { ...state, messagesByRoom: { ...state.messagesByRoom, [roomId]: withoutStream } };
+  }
+  const candidate = { id: messageId, kind: "agent", agentId, threadId: threadId || null, taskId: taskId || null, turnId: turnId || null, eventId: eventId || null, streaming: false, time: nowLabel(), text };
+  return { ...state, messagesByRoom: { ...state.messagesByRoom, [roomId]: sanitizeRoomMessages([...withoutStream, candidate]) } };
 }
 
 function applyCoordinatorActionBlocked(state, { roomId, taskId, sequence = "now" } = {}) {
@@ -376,6 +461,7 @@ function MessageItem({ message, agents }) {
       <div className="message-body">
         <div className="message-meta">
           <strong>{agent.name}</strong>
+          {message.streaming ? <span className="streaming-label"><span />真实回传中</span> : null}
           <time>{message.time}</time>
         </div>
         <p>{message.text}</p>
@@ -1121,9 +1207,16 @@ export function App() {
               });
               next = {
                 ...next,
-                contextCursorsByRoom: { ...next.contextCursorsByRoom, [roomId]: acknowledged.cursors },
+                contextCursorsByRoom: { ...next.contextCursorsByRoom, [roomId]: applyTurnStartedContextReceipt(acknowledged.cursors, event.contextCursorUpdate, event.agentId, event.threadId) },
                 pendingContextCursorsByRoom: { ...next.pendingContextCursorsByRoom, [roomId]: acknowledged.pending },
               };
+              next = applyTaskProgressEvent(next, { roomId, taskId: event.taskId, agentId: event.agentId, turnId: event.turnId, turnKind: event.turnKind, stage: "delivered", sequence: event.sequence });
+            }
+            if (event.type === "turnProgress") {
+              next = applyTaskProgressEvent(next, { roomId, taskId: event.taskId, agentId: event.agentId, turnId: event.turnId, turnKind: event.turnKind, stage: event.stage, sequence: event.sequence });
+            }
+            if (event.type === "agentMessageDelta" && event.public !== false && event.text) {
+              next = applyAgentDeltaEvent(next, { roomId, taskId: event.taskId, agentId: event.agentId, threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, text: event.text, sequence: event.sequence });
             }
             if (["taskStarted", "taskWaitingApproval", "taskCompleted", "taskFailed"].includes(event.type)) {
               next = applyTaskStatusEvent(next, { roomId, taskId: event.taskId, status: event.status, error: event.error, type: event.type });
@@ -1138,17 +1231,13 @@ export function App() {
               }
             }
             if (event.type === "taskAssignmentRejected" || event.type === "taskDelegationFailed") {
-              next = applyTaskStatusEvent(next, { roomId, taskId: event.taskId, status: "failed", error: event.reason || event.error || "委派失败", type: event.type });
+              next = applyTaskWarningEvent(next, { roomId, taskId: event.taskId, type: event.type, reason: event.reason || event.error || "委派失败", sequence: event.sequence });
             }
             if (event.type === "coordinatorActionBlocked") next = applyCoordinatorActionBlocked(next, { roomId, taskId: event.taskId, sequence: event.sequence });
             if (event.type === "agentMessage" && event.public !== false && event.text) {
               const stableEventId = event.eventId ? String(event.eventId).slice(0, 180) : null;
               const messageId = stableEventId ? `agent-message-${stableEventId}` : `runtime-message-${event.sequence}`;
-              const existingMessages = next.messagesByRoom[roomId] || [];
-              if (!existingMessages.some((message) => message.id === messageId)) {
-                const candidate = { id: messageId, kind: "agent", agentId: event.agentId, threadId: event.threadId || null, taskId: event.taskId || null, turnId: event.turnId || null, eventId: stableEventId, time: nowLabel(), text: event.text };
-                next = { ...next, messagesByRoom: { ...next.messagesByRoom, [roomId]: sanitizeRoomMessages([...existingMessages, candidate]) } };
-              }
+              next = applyAgentFinalEvent(next, { roomId, messageId, agentId: event.agentId, threadId: event.threadId, taskId: event.taskId, turnId: event.turnId, eventId: stableEventId, text: event.text });
             }
             if (event.type === "approvalRequested") {
               next = applyApprovalLifecycleEvent(next, { roomId, source: "runtime", event });
@@ -1198,9 +1287,16 @@ export function App() {
               });
               next = {
                 ...next,
-                contextCursorsByRoom: { ...next.contextCursorsByRoom, [roomId]: acknowledged.cursors },
+                contextCursorsByRoom: { ...next.contextCursorsByRoom, [roomId]: applyTurnStartedContextReceipt(acknowledged.cursors, payload.contextCursorUpdate, payload.agentId, payload.threadId) },
                 pendingContextCursorsByRoom: { ...next.pendingContextCursorsByRoom, [roomId]: acknowledged.pending },
               };
+              next = applyTaskProgressEvent(next, { roomId, taskId: event.task_id || payload.taskId, agentId: payload.agentId, turnId: payload.turnId, turnKind: payload.turnKind, stage: "delivered", sequence: event.sequence });
+            }
+            if (event.event_type === "turnProgress") {
+              next = applyTaskProgressEvent(next, { roomId, taskId: event.task_id || payload.taskId, agentId: payload.agentId, turnId: payload.turnId, turnKind: payload.turnKind, stage: payload.stage, sequence: event.sequence });
+            }
+            if (event.event_type === "agentMessageDelta" && payload.public !== false && payload.text) {
+              next = applyAgentDeltaEvent(next, { roomId, taskId: event.task_id || payload.taskId, agentId: payload.agentId, threadId: payload.threadId, turnId: payload.turnId, itemId: payload.itemId, text: payload.text, sequence: event.sequence });
             }
             if (["taskStarted", "taskWaitingApproval", "taskCompleted", "taskFailed"].includes(event.event_type)) {
               next = applyTaskStatusEvent(next, { roomId, taskId: payload.taskId || event.task_id, status: payload.status, error: payload.error, type: event.event_type });
@@ -1215,17 +1311,13 @@ export function App() {
               }
             }
             if (event.event_type === "taskAssignmentRejected" || event.event_type === "taskDelegationFailed") {
-              next = applyTaskStatusEvent(next, { roomId, taskId: payload.taskId || event.task_id, status: "failed", error: payload.reason || payload.error || "委派失败", type: event.event_type });
+              next = applyTaskWarningEvent(next, { roomId, taskId: payload.taskId || event.task_id, type: event.event_type, reason: payload.reason || payload.error || "委派失败", sequence: event.sequence });
             }
             if (event.event_type === "coordinatorActionBlocked") next = applyCoordinatorActionBlocked(next, { roomId, taskId: payload.taskId || event.task_id, sequence: event.sequence });
             if (event.event_type === "agentMessage" && payload.public !== false && payload.text) {
               const stableEventId = String(event.event_id || event.eventId || payload.eventId || "").slice(0, 180) || null;
               const messageId = stableEventId ? `agent-message-${stableEventId}` : `remote-message-${event.sequence}`;
-              const existingMessages = next.messagesByRoom[roomId] || [];
-              if (!existingMessages.some((message) => message.id === messageId)) {
-                const candidate = { id: messageId, kind: "agent", agentId: payload.agentId, threadId: payload.threadId || null, taskId: payload.taskId || event.task_id || null, turnId: payload.turnId || null, eventId: stableEventId, time: nowLabel(), text: payload.text };
-                next = { ...next, messagesByRoom: { ...next.messagesByRoom, [roomId]: sanitizeRoomMessages([...existingMessages, candidate]) } };
-              }
+              next = applyAgentFinalEvent(next, { roomId, messageId, agentId: payload.agentId, threadId: payload.threadId, taskId: payload.taskId || event.task_id, turnId: payload.turnId, eventId: stableEventId, text: payload.text });
             }
             if (event.event_type === "approvalRequested") {
               next = applyApprovalLifecycleEvent(next, { roomId, source: "remote", event: { ...payload, type: "approvalRequested" } });
