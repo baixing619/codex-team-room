@@ -41,6 +41,7 @@ import { buildRoomSharedContext, formatAttachmentSize, validateSelectedFiles } f
 import { acknowledgeContextDelivery, applyContextCursorUpdates, bindContextCursorToThread, discardPendingContextDelivery } from "./lib/contextCursors.js";
 import { applyCloudSnapshot, createCloudSnapshot } from "./lib/cloudState.js";
 import { applyApprovalLifecycleEvent, approvalRoute, classifyApprovalRequest, isApprovalTerminal, mergeApprovalCommands, normalizeApprovalCommand, reconcileApprovalState, visibleApprovalCommands } from "./lib/approvalLifecycle.js";
+import { MessageRichText } from "./components/MessageRichText.jsx";
 
 const VIEW_ITEMS = [
   { id: "knowledge", label: "知识库", icon: BookOpenText },
@@ -191,7 +192,7 @@ function applyAgentDeltaEvent(state, { roomId, taskId, agentId, threadId, turnId
   return { ...state, messagesByRoom: { ...state.messagesByRoom, [roomId]: sanitizeRoomMessages(nextMessages) } };
 }
 
-function applyAgentFinalEvent(state, { roomId, messageId, agentId, threadId, taskId, turnId, eventId, text } = {}) {
+function applyAgentFinalEvent(state, { roomId, messageId, agentId, threadId, taskId, turnId, eventId, text, attachments = [] } = {}) {
   if (!roomId || !messageId || !agentId || !text) return state;
   const messages = state.messagesByRoom?.[roomId] || [];
   const withoutStream = messages.filter((message) => !(message.streaming && turnId && message.turnId === turnId));
@@ -199,7 +200,7 @@ function applyAgentFinalEvent(state, { roomId, messageId, agentId, threadId, tas
     if (withoutStream.length === messages.length) return state;
     return { ...state, messagesByRoom: { ...state.messagesByRoom, [roomId]: withoutStream } };
   }
-  const candidate = { id: messageId, kind: "agent", agentId, threadId: threadId || null, taskId: taskId || null, turnId: turnId || null, eventId: eventId || null, streaming: false, time: nowLabel(), text };
+  const candidate = { id: messageId, kind: "agent", agentId, threadId: threadId || null, taskId: taskId || null, turnId: turnId || null, eventId: eventId || null, streaming: false, time: nowLabel(), text, attachments };
   return { ...state, messagesByRoom: { ...state.messagesByRoom, [roomId]: sanitizeRoomMessages([...withoutStream, candidate]) } };
 }
 
@@ -477,7 +478,7 @@ function MessageItem({ message, agents }) {
             <strong>你</strong>
             <time>{message.time}</time>
           </div>
-          {message.text ? <p>{message.text}</p> : null}
+          {message.text ? <MessageRichText text={message.text} /> : null}
           {message.attachments?.length ? (
             <div className="message-attachments">
               {message.attachments.map((attachment) => (
@@ -500,7 +501,28 @@ function MessageItem({ message, agents }) {
           {message.streaming ? <span className="streaming-label"><span />真实回传中</span> : null}
           <time>{message.time}</time>
         </div>
-        <p>{message.text}</p>
+        <MessageRichText text={message.text} />
+        {message.attachments?.length ? (
+          <div className="output-attachments" aria-label="成员交付物">
+            {message.attachments.map((attachment) => {
+              const safeId = /^output-[0-9a-f-]{36}$/i.test(String(attachment.id || "")) ? attachment.id : null;
+              if (!safeId) return null;
+              const url = `/api/output-attachments/${encodeURIComponent(safeId)}`;
+              const isImage = String(attachment.type || "").startsWith("image/");
+              return isImage ? (
+                <a className="output-image-card" key={safeId} href={url} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">
+                  <img src={url} alt={attachment.name || "成员交付的图片"} loading="lazy" decoding="async" />
+                  <span><strong>{attachment.name}</strong><small>{formatAttachmentSize(attachment.size)} · 点击查看原图</small></span>
+                </a>
+              ) : (
+                <a className="output-file-card" key={safeId} href={url} target="_blank" rel="noopener noreferrer">
+                  <FileIcon size={22} />
+                  <span><strong>{attachment.name}</strong><small>{formatAttachmentSize(attachment.size)} · 点击预览或下载</small></span>
+                </a>
+              );
+            })}
+          </div>
+        ) : null}
       </div>
     </article>
   );
@@ -1301,7 +1323,7 @@ export function App() {
             if (event.type === "agentMessage" && event.public !== false && event.text) {
               const stableEventId = event.eventId ? String(event.eventId).slice(0, 180) : null;
               const messageId = stableEventId ? `agent-message-${stableEventId}` : `runtime-message-${event.sequence}`;
-              next = applyAgentFinalEvent(next, { roomId, messageId, agentId: event.agentId, threadId: event.threadId, taskId: event.taskId, turnId: event.turnId, eventId: stableEventId, text: event.text });
+              next = applyAgentFinalEvent(next, { roomId, messageId, agentId: event.agentId, threadId: event.threadId, taskId: event.taskId, turnId: event.turnId, eventId: stableEventId, text: event.text, attachments: event.attachments || [] });
             }
             if (event.type === "approvalRequested") {
               next = applyApprovalLifecycleEvent(next, { roomId, source: "runtime", event });
@@ -1387,7 +1409,7 @@ export function App() {
             if (event.event_type === "agentMessage" && payload.public !== false && payload.text) {
               const stableEventId = String(event.event_id || event.eventId || payload.eventId || "").slice(0, 180) || null;
               const messageId = stableEventId ? `agent-message-${stableEventId}` : `remote-message-${event.sequence}`;
-              next = applyAgentFinalEvent(next, { roomId, messageId, agentId: payload.agentId, threadId: payload.threadId, taskId: payload.taskId || event.task_id, turnId: payload.turnId, eventId: stableEventId, text: payload.text });
+              next = applyAgentFinalEvent(next, { roomId, messageId, agentId: payload.agentId, threadId: payload.threadId, taskId: payload.taskId || event.task_id, turnId: payload.turnId, eventId: stableEventId, text: payload.text, attachments: payload.attachments || [] });
             }
             if (event.event_type === "approvalRequested") {
               next = applyApprovalLifecycleEvent(next, { roomId, source: "remote", event: { ...payload, type: "approvalRequested" } });
