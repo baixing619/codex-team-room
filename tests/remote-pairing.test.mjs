@@ -144,6 +144,29 @@ test("turn-start receipts retain only the context cursor needed for cross-browse
   });
 });
 
+test("coordinator decision lock is preserved for the private room without leaking extra data", () => {
+  const sanitized = sanitizeRuntimeEvent({
+    sequence: 13,
+    type: "coordinatorDecisionLocked",
+    roomId: "room-animation",
+    taskId: "task-decision",
+    turnId: "turn-summary",
+    status: "locked",
+    privateText: "must-not-pass",
+  });
+
+  assert.deepEqual(sanitized, {
+    sequence: 13,
+    createdAt: undefined,
+    roomId: "room-animation",
+    taskId: "task-decision",
+    agentId: null,
+    turnId: "turn-summary",
+    status: "locked",
+    public: true,
+  });
+});
+
 test("approval events sent to the private site sanitize command, reason, and failure details", () => {
   const requested = sanitizeRuntimeEvent({
     type: "approvalRequested",

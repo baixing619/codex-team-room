@@ -25,15 +25,15 @@ function coordinatorInitialProtocol(record, agents) {
     const agent = (agents || []).find((item) => item?.id === agentId);
     return `${agentId}/${agent?.name || agent?.role || "成员"}`;
   }).join(", ");
-  return `[TEAM_ROOM_COORDINATOR_PROTOCOL_V2] 你是双轨流程的纯协调总控：必须先公开说明你对目标的分析和所选线路，再输出机器任务块。严禁亲自调用命令、读取项目文件、修改文件或执行本机工具。快速线适合简单任务：能直接回答就回答；需要一个成员处理时只输出1个 phase=execution 的任务块。协作线适合复杂、多方案或跨职责任务：输出2至3个 phase=analysis 的任务块，运行时会让成员按顺序看到前序结论并继续讨论；分析阶段不得执行写入。真实委派只能使用严格 TEAM_ROOM_TASK_ASSIGNMENT_V1 块；本轮 parentTaskId=${record?.id || ""}，depth=${Number(record?.depth || 0) + 1}，可分派 targetAgentId=${targets || "无"}。本轮已直接启动的成员=${direct || "无"}，不要重复委派。普通房间任务 visibility=room；只有用户明确只让总控回复时才用 coordinator-only。每个 assignmentId 必须唯一。合法 JSON 示例：{"assignmentId":"唯一ID","parentTaskId":"${record?.id || ""}","targetAgentId":"成员ID","objective":"目标","acceptanceCriteria":["验收条件"],"visibility":"room","depth":${Number(record?.depth || 0) + 1},"phase":"analysis"}。普通 @文字或承诺不算委派。`;
+  return `[TEAM_ROOM_COORDINATOR_PROTOCOL_V3] 你是双轨流程的纯协调总控：必须先公开说明你对目标的分析和所选线路，再输出机器任务块。严禁亲自调用命令、读取项目文件、修改文件或执行本机工具。快速线适合简单任务：能直接回答就回答；需要一个成员处理时只输出1个 phase=execution 的任务块。协作线适合复杂、多方案或跨职责任务：输出2至3个 phase=analysis 的任务块，运行时会让成员按顺序看到前序成员的完整输出。后发言成员只有发现实质冲突、遗漏或风险时才可提出异议，异议必须以“异议：”开头；不得为了异议而异议。所有成员结果和异议回流后由你判断。一旦你在最终汇总回合拍板，异议窗口永久关闭，只能结束或委派一次 phase=execution，不能再委派分析成员。分析阶段不得执行写入。真实委派只能使用严格 TEAM_ROOM_TASK_ASSIGNMENT_V1 块；本轮 parentTaskId=${record?.id || ""}，depth=${Number(record?.depth || 0) + 1}，可分派 targetAgentId=${targets || "无"}。本轮已直接启动的成员=${direct || "无"}，不要重复委派。普通房间任务 visibility=room；只有用户明确只让总控回复时才用 coordinator-only。每个 assignmentId 必须唯一。合法 JSON 示例：{"assignmentId":"唯一ID","parentTaskId":"${record?.id || ""}","targetAgentId":"成员ID","objective":"目标","acceptanceCriteria":["验收条件"],"visibility":"room","depth":${Number(record?.depth || 0) + 1},"phase":"analysis"}。普通 @文字或承诺不算委派。`;
 }
 
 function coordinatorFinalSummaryProtocol(record, agents) {
   if (record?.executionRoundStarted || record?.executionMode === false) {
-    return "[TEAM_ROOM_FINAL_SUMMARY_PROTOCOL_V2] 讨论或执行结果已经回流。请做最终判断、验收和总结；严禁调用工具、读写文件或再次输出 TEAM_ROOM_TASK_ASSIGNMENT_V1。";
+    return "[TEAM_ROOM_FINAL_SUMMARY_PROTOCOL_V3] 总控已经拍板，异议窗口已关闭。请仅做最终验收和总结；严禁调用工具、读写文件、接受或提出新异议，也不得再次输出 TEAM_ROOM_TASK_ASSIGNMENT_V1。";
   }
   const targets = (agents || []).filter((agent) => agent?.id && agent.id !== record?.coordinatorAgentId).map((agent) => `${agent.id}/${agent.name || agent.role || "成员"}`).join(", ");
-  return `[TEAM_ROOM_FINAL_SUMMARY_PROTOCOL_V2] 请比较成员结论、明确选择的更优方案并说明理由。若不需要执行，直接给出最终判断，不输出任务块；若需要执行，只能输出1个 phase=execution 的 TEAM_ROOM_TASK_ASSIGNMENT_V1 块，parentTaskId=${record?.id || ""}，depth=${Number(record?.depth || 0) + 1}，可选 targetAgentId=${targets || "无"}。严禁亲自调用工具或读写文件。`;
+  return `[TEAM_ROOM_FINAL_SUMMARY_PROTOCOL_V3] 请完整比较成员结论，逐条判断所有以“异议：”开头的实质异议，说明采纳或驳回理由，然后明确拍板。你的本轮完成事件会永久关闭异议窗口。若不需要执行，直接给出最终判断，不输出任务块；若需要执行，只能输出1个 phase=execution 的 TEAM_ROOM_TASK_ASSIGNMENT_V1 块，parentTaskId=${record?.id || ""}，depth=${Number(record?.depth || 0) + 1}，可选 targetAgentId=${targets || "无"}。严禁亲自调用工具或读写文件，也不得再输出 phase=analysis。`;
 }
 
 function normalizedPath(value) {
@@ -296,6 +296,8 @@ export class TeamRoomRuntimeManager {
       directAgentIds: new Set(),
       taskLane: "fast",
       discussionMode: false,
+      decisionLocked: false,
+      decisionLockedTurnId: null,
       executionRoundStarted: false,
       finalSummaryStarted: false,
       finalSummaryCompleted: false,
@@ -403,6 +405,19 @@ export class TeamRoomRuntimeManager {
     });
     record.failedAssignments.add(assignmentId);
     record.assignmentFailureReasons.set(assignmentId, safeTaskError(reason));
+  }
+
+  lockCoordinatorDecision(record, turnId) {
+    if (!record || record.decisionLocked) return false;
+    record.decisionLocked = true;
+    record.decisionLockedTurnId = turnId || null;
+    this.emitRoomEvent("coordinatorDecisionLocked", {
+      taskId: record.id,
+      turnId: turnId || null,
+      status: "locked",
+      public: true,
+    });
+    return true;
   }
 
   registerTurn(record, turn, context) {
@@ -684,6 +699,11 @@ export class TeamRoomRuntimeManager {
   }
 
   async spawnAssignment(record, assignment, sourceTurnId, sourceThreadId) {
+    if (record?.decisionLocked && assignment?.phase === "analysis") {
+      this.emitRoomEvent("taskAssignmentRejected", { taskId: record.id, reason: "objection_window_closed", assignmentId: assignment.assignmentId || null, public: true });
+      this.recordAssignmentFailure(record, assignment, "objection_window_closed", sourceTurnId);
+      return false;
+    }
     const validation = validateTaskAssignment({
       assignment,
       coordinatorAgentId: record.coordinatorAgentId,
@@ -737,13 +757,12 @@ export class TeamRoomRuntimeManager {
     const priorDiscussion = assignment.phase === "analysis"
       ? [...record.assignmentResults.values()]
         .filter((result) => result.phase === "analysis")
-        .slice(-3)
-        .map((result) => `- ${result.targetAgentId}：${sanitizeTaskText(result.summary, 2000)}`)
+        .map((result) => `【${result.targetAgentId} 的完整输出】\n${sanitizeTaskText(result.summary, 8000)}`)
         .join("\n")
       : "";
     const phaseText = assignment.phase === "analysis"
-      ? `你收到当前项目总控的讨论任务。你处于只读分析阶段，不得修改文件或执行写入。${priorDiscussion ? `\n前序成员结论：\n${priorDiscussion}\n请明确说明同意、反对或改进之处。` : ""}`
-      : "你收到当前项目总控已经裁决后的执行任务。按目标完成实际工作，并报告可核验结果；不要再创建委派块。";
+      ? `你收到当前项目总控的讨论任务。你处于只读分析阶段，不得修改文件或执行写入。${priorDiscussion ? `\n以下是前序成员的完整输出：\n${priorDiscussion}\n请先完整理解再回应。只有发现实质冲突、遗漏或风险时才提交异议；提交异议时第一行必须以“异议：”开头，并说明异议对象、依据、影响和替代建议。若没有实质异议，直接确认或补充，不得为了异议而异议。` : "\n你是首位分析成员，请提出独立方案；当前没有前序输出，不要凭空提交异议。"}`
+      : "你收到当前项目总控已经拍板后的执行任务，异议窗口已经关闭。不得继续提出或接受异议；若遇到无法执行或安全冲突，请如实报告阻断原因。按目标完成实际工作，并报告可核验结果；不要再创建委派块。";
     try {
       await this.startTurnForAgent({
         taskRecord: record,
@@ -1010,6 +1029,7 @@ export class TeamRoomRuntimeManager {
       } else {
         const hasAssignmentBlock = finalText.includes(TASK_ASSIGNMENT_START);
         const assignments = parseTaskAssignments(finalText);
+        this.lockCoordinatorDecision(record, turnId);
         const executionAssignment = !record.executionRoundStarted && record.executionMode !== false
           && assignments.length === 1 && assignments[0].phase === "execution"
           ? assignments[0]
