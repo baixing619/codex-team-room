@@ -332,6 +332,19 @@ select:focus-visible {
   flex: 0 0 auto;
 }
 
+.thread-context-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border-radius: 999px;
+  background: #e9f7ef;
+  color: #288455;
+  font-size: 10px;
+  font-weight: 700;
+}
+
 .utility-nav {
   display: grid;
   gap: 4px;
@@ -1180,6 +1193,16 @@ select:focus-visible {
   font-weight: 600;
 }
 
+.knowledge-source-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  color: #288455;
+  font-size: 11px;
+  font-weight: 650;
+}
+
 .knowledge-row h3 {
   margin: 6px 0;
   font-size: 15px;
@@ -1316,6 +1339,12 @@ select:focus-visible {
   z-index: 2;
   background: #f5f7ff;
   border: 1px solid #dce3f7;
+}
+
+.history-banner--attached {
+  background: #f0faf4;
+  border-color: #cdebd9;
+  color: #327052;
 }
 
 .history-scroll {

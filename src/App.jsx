@@ -83,6 +83,12 @@ function recordAgentThreadBinding(state, roomId, agentId, threadId) {
   };
 }
 
+function attachedHistoryEntry(entries, thread) {
+  if (!thread?.id || thread.id === "global") return null;
+  return (Array.isArray(entries) ? entries : []).find((entry) => entry?.category === "历史对话"
+    && (entry.sourceThreadId === thread.id || (!entry.sourceThreadId && entry.title === thread.title))) || null;
+}
+
 function taskStatusText(status, error = null) {
   if (status === "succeeded" || status === "completed") return "任务已完成";
   if (status === "failed") return `任务失败：${String(error || "真实任务失败").slice(0, 220)}`;
@@ -243,6 +249,7 @@ function Sidebar({
   activeView,
   bridge,
   pairing,
+  knowledge,
   onSelectRoom,
   onSelectThread,
   onOpenImport,
@@ -305,18 +312,22 @@ function Sidebar({
           <MagnifyingGlass size={18} />
         </div>
         <div className="thread-list">
-          {threads.map((thread) => (
-            <button
-              key={thread.id}
-              className={classNames("thread-row", activeView === "chat" && activeThreadId === thread.id && "is-active")}
-              type="button"
-              onClick={() => onSelectThread(thread)}
-            >
-              {thread.id === "global" ? <Hash size={16} weight="bold" /> : <ChatCircle size={16} />}
-              <span className="thread-title">{thread.id === "global" ? "团队调度台" : thread.title}</span>
-              <span className="thread-time">{thread.time || formatRelativeDate(thread.updatedAt)}</span>
-            </button>
-          ))}
+          {threads.map((thread) => {
+            const attached = Boolean(attachedHistoryEntry(knowledge, thread));
+            return (
+              <button
+                key={thread.id}
+                className={classNames("thread-row", activeView === "chat" && activeThreadId === thread.id && "is-active")}
+                type="button"
+                onClick={() => onSelectThread(thread)}
+              >
+                {thread.id === "global" ? <Hash size={16} weight="bold" /> : <ChatCircle size={16} />}
+                <span className="thread-title">{thread.id === "global" ? "团队调度台" : thread.title}</span>
+                {attached ? <span className="thread-context-badge" title="已挂入当前房间公共上下文"><CheckCircle size={13} weight="fill" />已挂</span> : null}
+                <span className="thread-time">{thread.time || formatRelativeDate(thread.updatedAt)}</span>
+              </button>
+            );
+          })}
         </div>
       </section>
 
@@ -689,18 +700,18 @@ function ChatView({
   );
 }
 
-function HistoryView({ history, loading, error, onAttach, onRefresh }) {
+function HistoryView({ history, loading, error, attached, onAttach, onRefresh }) {
   if (loading) return <div className="center-state"><ArrowsClockwise className="spin" size={28} />正在读取公开消息…</div>;
   if (error) return <div className="center-state center-state--error"><WarningCircle size={28} />{error}</div>;
   if (!history) return <div className="center-state"><ChatCircle size={28} />选择一个历史对话查看。</div>;
 
   return (
     <div className="history-view">
-      <div className="history-banner">
-        <div><ShieldCheck size={20} /><span>只读历史：查看不会修改原对话；挂入后会复制可见正文到当前项目共享上下文</span></div>
+      <div className={classNames("history-banner", attached && "history-banner--attached")}>
+        <div>{attached ? <CheckCircle size={20} weight="fill" /> : <ShieldCheck size={20} />}<span>{attached ? "已挂入当前房间公共上下文；再次更新会替换旧副本，不会重复添加" : "只读历史：查看不会修改原对话；挂入后会复制可见正文到当前项目共享上下文"}</span></div>
         <div className="history-actions">
           <button className="secondary-button" type="button" onClick={onRefresh}><ArrowsClockwise size={17} />更新历史</button>
-          <button className="primary-button" type="button" onClick={onAttach}>挂入公共上下文</button>
+          <button className="primary-button" type="button" onClick={onAttach}>{attached ? "更新公共上下文" : "挂入公共上下文"}</button>
         </div>
       </div>
       <div className="history-scroll" tabIndex={0} aria-label="历史消息滚动区域">
@@ -785,6 +796,7 @@ function KnowledgeView({ entries, onAdd }) {
             <div className="knowledge-icon"><BookOpenText size={22} /></div>
             <div>
               <div className="knowledge-meta"><span>{entry.category}</span><time>{entry.updatedAt}</time></div>
+              {entry.category === "历史对话" ? <div className="knowledge-source-status"><CheckCircle size={14} weight="fill" />已挂入公共上下文</div> : null}
               <h3>{entry.title}</h3>
               <p>{entry.body}</p>
             </div>
@@ -1878,22 +1890,35 @@ export function App() {
 
   const attachHistory = () => {
     if (!history) return;
+    const wasAttached = Boolean(attachedHistoryEntry(knowledge, history.thread));
     const visibleTranscript = history.messages.slice(-120).map((message) => `${message.role === "user" ? "用户" : "Codex"}：${String(message.text || "").slice(0, 4_000)}`).join("\n\n").slice(0, 40_000);
     const entry = {
       id: `knowledge-history-${Date.now()}`,
       title: history.thread.title,
       category: "历史对话",
+      sourceThreadId: history.thread.id,
+      sourceThreadTitle: history.thread.title,
+      sourceMessageCount: Math.min(history.messages.length, 120),
       body: `来源对话：${history.thread.title}\n已复制 ${Math.min(history.messages.length, 120)} 条可见消息到当前项目共享上下文；原始对话保持不变。\n\n${visibleTranscript}`,
       updatedAt: `今天 ${nowLabel()}`,
     };
-    setState((current) => ({
-      ...current,
-      knowledgeByRoom: { ...current.knowledgeByRoom, [activeRoom.id]: [entry, ...(current.knowledgeByRoom[activeRoom.id] || [])] },
-      messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `history-${Date.now()}`, kind: "system", time: nowLabel(), text: `已将历史对话“${history.thread.title}”挂入公共上下文` }] },
-    }));
+    setState((current) => {
+      const entries = current.knowledgeByRoom[activeRoom.id] || [];
+      const index = entries.findIndex((item) => item?.category === "历史对话"
+        && (item.sourceThreadId === history.thread.id || (!item.sourceThreadId && item.title === history.thread.title)));
+      const nextEntry = index >= 0 ? { ...entry, id: entries[index].id } : entry;
+      const nextEntries = index >= 0
+        ? entries.map((item, itemIndex) => itemIndex === index ? nextEntry : item)
+        : [nextEntry, ...entries];
+      return {
+        ...current,
+        knowledgeByRoom: { ...current.knowledgeByRoom, [activeRoom.id]: nextEntries },
+        messagesByRoom: { ...current.messagesByRoom, [activeRoom.id]: [...(current.messagesByRoom[activeRoom.id] || []), { id: `history-${Date.now()}`, kind: "system", time: nowLabel(), text: `${index >= 0 ? "已更新" : "已将"}历史对话“${history.thread.title}”${index >= 0 ? "的公共上下文副本" : "挂入公共上下文"}` }] },
+      };
+    });
     setActiveThreadId("global");
     setHistory(null);
-    setToast("历史对话已挂入公共上下文");
+    setToast(wasAttached ? "公共上下文副本已更新" : "历史对话已挂入公共上下文");
   };
 
   const exportConfig = () => {
@@ -1923,7 +1948,7 @@ export function App() {
     if (activeView === "knowledge") return <KnowledgeView entries={knowledge} onAdd={addKnowledge} />;
     if (activeView === "agents") return <AgentSettingsView agents={agents} onOpenAgent={openAgentEditor} onAddMember={addMember} onRemoveAgent={removeAgent} />;
     if (activeView === "settings") return <SettingsView bridge={bridge} pairing={pairing} runtime={runtime} rooms={state.rooms} syncStatus={syncStatus} onConnectRuntime={connectRuntime} onDisconnectRuntime={disconnectRuntime} onExport={exportConfig} onReset={resetPrototype} />;
-    if (activeThreadId !== "global") return <HistoryView history={history} loading={historyLoading} error={historyError} onAttach={attachHistory} onRefresh={() => selectThread(activeThread, { force: true })} />;
+    if (activeThreadId !== "global") return <HistoryView history={history} loading={historyLoading} error={historyError} attached={Boolean(attachedHistoryEntry(knowledge, activeThread))} onAttach={attachHistory} onRefresh={() => selectThread(activeThread, { force: true })} />;
     return (
       <ChatView
         messages={messages}
@@ -1958,6 +1983,7 @@ export function App() {
         activeView={activeView}
         bridge={bridge}
         pairing={pairing}
+        knowledge={knowledge}
         onSelectRoom={selectRoom}
         onSelectThread={selectThread}
         onOpenImport={openImport}

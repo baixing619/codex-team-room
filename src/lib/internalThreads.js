@@ -3,3 +3,7 @@ const INTERNAL_TEAM_ROOM_TITLE = /^\[TEAM_ROOM_(?:SHARED_CONTEXT|COORDINATOR_PRO
 export function isInternalTeamRoomThreadTitle(value) {
   return INTERNAL_TEAM_ROOM_TITLE.test(String(value || "").trim());
 }
+
+export function isSubagentThreadSource(source) {
+  return Boolean(source?.subagent && typeof source.subagent === "object");
+}

@@ -55,6 +55,7 @@ test("migration removes only cached thread titles corrupted into question marks"
         { id: "global", title: "团队调度台", kind: "room" },
         { id: "broken", title: "??????", kind: "codex" },
         { id: "internal", title: "[TEAM_ROOM_SHARED_CONTEXT_V1] 上下文标识：internal", kind: "codex" },
+        { id: "subagent", title: "Jason · review", kind: "codex", source: { subagent: { thread_spawn: { parent_thread_id: "valid" } } } },
         { id: "valid", title: "是不是这样？", kind: "codex" },
       ],
     },

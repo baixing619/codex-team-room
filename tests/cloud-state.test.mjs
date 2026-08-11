@@ -33,7 +33,7 @@ test("applies a phone snapshot with new room data while retaining the computer a
     },
     knowledgeByRoom: {
       [desktopRoom.id]: [],
-      [mobileRoom.id]: [{ id: "mobile-knowledge", title: "手机知识", category: "资料", body: "手机新增的知识条目" }],
+      [mobileRoom.id]: [{ id: "mobile-knowledge", title: "手机知识", category: "历史对话", body: "手机新增的知识条目", sourceThreadId: "thread-history-1", sourceThreadTitle: "历史来源" }],
     },
   });
   const computerState = roomState({
@@ -56,6 +56,7 @@ test("applies a phone snapshot with new room data while retaining the computer a
   assert.ok(applied.rooms.some((room) => room.id === mobileRoom.id));
   assert.equal(applied.agentsByRoom[mobileRoom.id][0].name, "手机资料员");
   assert.equal(applied.knowledgeByRoom[mobileRoom.id][0].title, "手机知识");
+  assert.equal(applied.knowledgeByRoom[mobileRoom.id][0].sourceThreadId, "thread-history-1");
   assert.equal(applied.messagesByRoom[mobileRoom.id][0].text, "手机新增的消息");
   assert.equal(applied.messagesByRoom[mobileRoom.id][0].attachments[0].file, undefined);
   assert.equal(snapshot.historyCacheByThread, undefined);
