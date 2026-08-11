@@ -987,9 +987,9 @@ export function App() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
   const [toast, setToast] = useState("");
-  const autoLoadedRooms = useRef(new Set(Object.entries(state.threadCache || {})
-    .filter(([, cachedThreads]) => cachedThreads?.some((thread) => thread.kind === "codex"))
-    .map(([roomId]) => roomId)));
+  // Cached thread lists make the sidebar fast, but every page load still needs
+  // one real index refresh so conversations removed by an older client return.
+  const autoLoadedRooms = useRef(new Set());
   const attachmentUrls = useRef(new Set());
   const runtimeEventCursor = useRef(0);
   const remoteEventCursor = useRef(0);
@@ -1388,6 +1388,7 @@ export function App() {
 
   useEffect(() => {
     const localIndexReady = bridge?.ok || (privateCloud && pairing?.online);
+    if (privateCloud && syncStatus !== "已同步") return;
     if (!localIndexReady || !activeRoom || autoLoadedRooms.current.has(activeRoom.id)) return;
     let cancelled = false;
     let retryTimer = null;
@@ -1400,7 +1401,7 @@ export function App() {
       cancelled = true;
       if (retryTimer) window.clearTimeout(retryTimer);
     };
-  }, [bridge?.ok, privateCloud, pairing?.online, activeRoom?.id]);
+  }, [bridge?.ok, privateCloud, pairing?.online, syncStatus, activeRoom?.id]);
 
   const selectRoom = (roomId) => {
     const room = state.rooms.find((item) => item.id === roomId);
